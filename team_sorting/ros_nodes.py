@@ -1,0 +1,1483 @@
+"""三个 ROS2 节点入口和消息薄适配层。
+
+本文件只负责 ROS2 订阅/发布、消息与 dataclass 转换、时间缓存、普通 Python 模块组装、
+定时控制循环和官方控制话题发布；不实现 YOLO、三维几何、导航、IK、机械臂轨迹或 FSM
+具体判断。三个 console script 分别调用 ``main_team_client``、``main_perception`` 和
+``main_recorder``。输入输出为 ROS 消息和团队接口，时间统一为纳秒，坐标系沿用消息
+``header.frame_id``。
+
+``rclpy``、``vision_msgs``、``message_filters`` 和 ``cv_bridge`` 都在节点启动时延迟
+导入，因此没有比赛环境时仍可导入本模块并运行纯 Python 单元测试。
+TimestampedCache
+JointStateMapper
+OfficialCommandPublisher
+_create_team_client_node()
+    └── _TeamClientNode
+
+_create_perception_node()
+    └── _PerceptionNode
+
+_create_recorder_node()
+    └── _DatasetRecorderNode
+"""
+# 大量函数可以分为四组
+
+# 不要逐个函数孤立地看，可以按功能分组。
+
+# 第一组：三个启动入口
+# main_team_client()
+# main_perception()
+# main_recorder()
+
+# 作用是分别启动三个节点。
+
+# 第二组：ROS运行环境
+# _load_ros_dependencies()
+# _validate_vision_schema()
+# _load_config()
+# _resolve_config_path()
+# _spin()
+
+# 负责：
+
+# 加载ROS依赖；
+# 检查消息版本；
+# 找配置文件；
+# 初始化ROS；
+# spin节点；
+# 退出时销毁节点。
+
+# 这部分相当于“程序启动器”。
+
+# 第三组：节点工厂
+# _create_team_client_node()
+# _create_perception_node()
+# _create_recorder_node()
+
+# 它们根据已经加载好的ROS依赖，创建真正的ROS节点类。
+
+# 这部分相当于“组装三个ROS节点”。
+
+# 第四组：消息翻译工具
+# _stamp_to_ns()
+# _set_stamp()
+# _base_state_from_odom()
+# _estimates_to_vision()
+# _estimates_from_vision()
+# _validated_confidence()
+# _vision_result_pose()
+
+# 它们负责ROS消息和团队dataclass之间的转换。
+
+# 例如：
+
+# ROS Odometry
+# → BaseState
+# ObjectEstimate3D
+# → ROS Detection3DArray
+# ROS Detection3DArray
+# → ObjectEstimate3D
+
+# 这部分相当于“翻译器”。
+from __future__ import annotations
+
+from collections import deque
+import importlib
+import math
+import os
+from pathlib import Path
+import signal
+import subprocess
+from types import SimpleNamespace
+from typing import Any, Optional
+
+from .action_mux import ActionMux, ActionMuxConfig
+from .arm_execution import ArmExecutionController
+from .fsm import FSMEvent, GlobalFSM, InstructionParser
+from .interfaces import (
+    BaseCommand,
+    BaseState,
+    CameraIntrinsics,
+    DepthFrame,
+    FSMStatus,
+    FinalAction,
+    ManipulationCommand,
+    ObjectEstimate3D,
+    RGBFrame,
+    RobotJointState,
+    SensorSnapshot,
+    SlotType,
+    TaskSpec,
+    final_action_from_json,
+    final_action_to_json,
+    fsm_status_from_json,
+    fsm_status_to_json,
+)
+from .navigation import Bounds3D, classify_slot_type
+from .perception_2d import OfficialYoloAdapter
+from .perception_3d import CameraTransformProvider, Perception3DEstimator
+from .recorder import EpisodeRecorder
+
+
+class TimestampedCache:
+    """按纳秒时间保存并查找最近状态的有界缓存。
+
+    参数：``max_items`` 为最大对象数。``put`` 输入时间戳和任意状态；``nearest`` 返回
+    与目标时间最接近且不超过容差的对象。时间单位纳秒，空间坐标系由被缓存对象自身
+    声明。空缓存或时间差过大时返回 ``None``，不伪造同步状态。
+    """
+
+    def __init__(self, max_items: int = 100) -> None:
+        if max_items <= 0:
+            raise ValueError("时间缓存容量必须大于 0")
+        self._items: deque[tuple[int, Any]] = deque(maxlen=int(max_items))
+
+    def put(self, timestamp_ns: int, value: Any) -> None:
+        """插入一个带时间戳状态。
+
+        参数：纳秒时间和状态对象；返回：无。对象单位/坐标系保持不变。失败：时间戳
+        无法转为整数时抛出 ``TypeError``/``ValueError``；超过容量会自动丢弃最旧项。
+        """
+
+        self._items.append((int(timestamp_ns), value))
+
+    def nearest(self, timestamp_ns: int, max_delta_ns: int) -> Optional[Any]:
+        """寻找目标时间附近的最近状态。
+
+        参数：目标纳秒和最大允许时间差纳秒。返回：最近对象或 ``None``；不改变对象的
+        坐标系/单位。失败：容差为负时抛出 ``ValueError``。
+        """
+
+        if max_delta_ns < 0:
+            raise ValueError("最大时间差不能为负数")
+        if not self._items:
+            return None
+        best_time, best_value = min(self._items, key=lambda item: abs(item[0] - timestamp_ns))
+        if abs(best_time - timestamp_ns) > max_delta_ns:
+            return None
+        return best_value
+
+    def clear(self) -> None:
+        """清空缓存；新消息已确认无效时，旧反馈不能继续冒充当前状态。"""
+
+        self._items.clear()
+
+
+class JointStateMapper:
+    """ROS JointState 到团队固定 17 维顺序的映射器。
+
+    参数：可选名称别名表。输入 ROS JointState，输出 ``RobotJointState``；slide 单位米、
+    旋转关节弧度、夹爪沿用官方 0～1，时间来自消息 header。缺少必需关节、位置非有限
+    或名称重复时抛出清晰 ``ValueError``，不会用零值冒充实际反馈。
+    """
+
+    def __init__(self, aliases: Optional[dict[str, str]] = None) -> None:
+        from .interfaces import JOINT_NAMES
+
+        self.joint_names = JOINT_NAMES
+        self.aliases = dict(aliases or {})
+
+    def map_message(self, message: Any) -> RobotJointState:
+        """按名称重排一个 ROS ``sensor_msgs/JointState``。
+
+        参数：含 name/position/velocity/effort/header 的消息。返回固定 17 维实际反馈，
+        单位沿用 ROS/官方关节定义，坐标系不适用。失败：时间戳、必需名称、数组长度或
+        数值不合法时抛出 ``ValueError``。
+        """
+
+        names = [self.aliases.get(str(name), str(name)) for name in message.name]
+        if len(names) != len(set(names)):
+            raise ValueError("JointState 经别名映射后出现重复关节名")
+        index_by_name = {name: index for index, name in enumerate(names)}
+        missing = [name for name in self.joint_names if name not in index_by_name]
+        if missing:
+            raise ValueError(f"JointState 缺少团队必需关节：{missing}")
+        if len(message.position) < len(message.name):
+            raise ValueError("JointState.position 长度小于 name 长度")
+
+        def _optional_array(field_name: str) -> tuple[float, ...]:
+            values = getattr(message, field_name, ())
+            if len(values) == 0:
+                return (0.0,) * 17
+            if len(values) < len(message.name):
+                raise ValueError(f"JointState.{field_name} 长度小于 name 长度")
+            return tuple(float(values[index_by_name[name]]) for name in self.joint_names)
+
+        position = tuple(float(message.position[index_by_name[name]]) for name in self.joint_names)
+        return RobotJointState(
+            position=position,
+            velocity=_optional_array("velocity"),
+            effort=_optional_array("effort"),
+            timestamp_ns=_stamp_to_ns(message.header.stamp),
+        )
+
+
+class OfficialCommandPublisher:
+    """唯一允许发布五组官方机器人控制话题的适配器。
+
+    参数：ROS2 node、话题配置和已加载依赖。输入同一个 ``FinalAction`` 对象；输出依次
+    为底盘 Twist、slide 1 项、head 2 项、左臂含夹爪 7 项、右臂含夹爪 7 项。底盘单位
+    m/s、rad/s，slide 米、臂关节弧度、夹爪 0～1。消息创建/发布失败会抛出
+    ``RuntimeError``，本类不重建第二份动作或执行控制算法。
+    """
+
+    def __init__(self, node: Any, topics: dict[str, str], ros: Optional[SimpleNamespace] = None) -> None:
+        self._ros = ros or _load_ros_dependencies(require_vision=False, require_filters=False)
+        required = ("cmd_vel", "slide", "head", "left_arm", "right_arm")
+        missing = [name for name in required if not topics.get(name)]
+        if missing:
+            raise RuntimeError(f"官方控制话题配置缺失：{missing}")
+        self._base = node.create_publisher(self._ros.Twist, topics["cmd_vel"], 10)
+        self._slide = node.create_publisher(self._ros.Float64MultiArray, topics["slide"], 10)
+        self._head = node.create_publisher(self._ros.Float64MultiArray, topics["head"], 10)
+        self._left = node.create_publisher(self._ros.Float64MultiArray, topics["left_arm"], 10)
+        self._right = node.create_publisher(self._ros.Float64MultiArray, topics["right_arm"], 10)
+
+    def publish(self, action: FinalAction) -> None:
+        """把唯一 FinalAction 拆分并发布到五组官方话题。
+
+        参数：严格 19 维且有限的动作对象；返回：无。第 0/1 项为 base_link 速度，随后
+        是 slide、head、左臂+夹爪、右臂+夹爪。失败：动作无效或 ROS 发布异常时抛出
+        ``RuntimeError``；调用方必须把同一对象用于 ``/team/final_action`` 遥测。
+        """
+
+        if not action.valid:
+            raise RuntimeError(f"拒绝发布无效 FinalAction：{action.failure_reason}")
+        values = action.values
+        base = self._ros.Twist()
+        base.linear.x = values[0]
+        base.angular.z = values[1]
+
+        # 19 维动作只在此处拆分：2 个底盘量 + 1 slide + 2 head + 左右各 7 项。
+        slide = self._ros.Float64MultiArray()
+        slide.data = list(values[2:3])
+        head = self._ros.Float64MultiArray()
+        head.data = list(values[3:5])
+        left = self._ros.Float64MultiArray()
+        left.data = list(values[5:12])
+        right = self._ros.Float64MultiArray()
+        right.data = list(values[12:19])
+        try:
+            self._base.publish(base)
+            self._slide.publish(slide)
+            self._head.publish(head)
+            self._left.publish(left)
+            self._right.publish(right)
+        except Exception as exc:  # noqa: BLE001 - ROS 中间件异常统一说明
+            raise RuntimeError(f"发布官方控制话题失败：{exc}") from exc
+
+    def publish_emergency_base_stop(self) -> None:
+        """仅在状态失联或节点退出时尽力发布底盘零速度。
+
+        正常控制仍必须经过 ActionMux 和完整 ``FinalAction``。当可靠 JointState 已经
+        不可用时，不能伪造 17 维全零关节目标；这个窄接口只停止底盘，不发布机械臂
+        目标，也不能证明 Server 已接收或机器人已经停止。
+        """
+
+        base = self._ros.Twist()
+        base.linear.x = 0.0
+        base.angular.z = 0.0
+        try:
+            self._base.publish(base)
+        except Exception as exc:  # noqa: BLE001 - 转成边界错误并由生命周期调用方记录
+            raise RuntimeError(f"紧急发布底盘零速度失败：{exc}") from exc
+
+
+def main_team_client(args: Optional[list[str]] = None) -> None:
+    """启动任务决策与控制客户端节点。
+
+    参数：可选 ROS2 命令行参数；返回：正常关闭时无返回。节点处理消息各自的米/弧度和
+    frame_id。失败：缺少 rclpy/vision_msgs/配置时抛出清晰 ``RuntimeError``；
+    完整业务算法未实现时只输出安全保持，不伪造任务完成。
+    """
+
+    ros = _load_ros_dependencies(require_vision=True, require_filters=False)
+    config = _load_config()
+    node_class = _create_team_client_node(ros)
+    _spin(ros, node_class, config, args)
+
+
+def main_perception(args: Optional[list[str]] = None) -> None:
+    """启动独立二维/三维感知节点。
+
+    参数：可选 ROS2 命令行参数；返回：正常关闭时无返回。RGB/Depth 近似同步，状态按
+    纳秒选最近值，三维输出位于配置 frame、单位米。失败：缺少 ROS、vision_msgs、
+    cv_bridge、官方 YOLO/MMK2FK 或资源时启动即清晰报错，不启用伪检测。
+    """
+
+    ros = _load_ros_dependencies(require_vision=True, require_filters=True)
+    config = _load_config()
+    node_class = _create_perception_node(ros)
+    _spin(ros, node_class, config, args)
+
+
+def main_recorder(args: Optional[list[str]] = None) -> None:
+    """启动独立数据记录节点。
+
+    参数：可选 ROS2 命令行参数；返回：正常关闭时无返回。节点保存任务、裁判和团队
+    遥测元数据，并用外部 ``ros2 bag record`` 原样保存高带宽消息及其单位/frame。
+    失败：未显式启用、ROS 缺失、目录不可写或 bag 子进程启动失败时清晰报错，不实现
+    伪 ``rosbag2_py`` 写入。
+    """
+
+    ros = _load_ros_dependencies(require_vision=False, require_filters=False)
+    config = _load_config()
+    node_class = _create_recorder_node(ros)
+    _spin(ros, node_class, config, args)
+
+
+def _load_ros_dependencies(require_vision: bool, require_filters: bool) -> SimpleNamespace:
+    modules: dict[str, Any] = {}
+    required = {
+        "rclpy": "rclpy",
+        "Node": "rclpy.node",
+        "Image": "sensor_msgs.msg",
+        "CameraInfo": "sensor_msgs.msg",
+        "JointState": "sensor_msgs.msg",
+        "Odometry": "nav_msgs.msg",
+        "String": "std_msgs.msg",
+        "Int32": "std_msgs.msg",
+        "Float64MultiArray": "std_msgs.msg",
+        "Twist": "geometry_msgs.msg",
+    }
+    errors: list[str] = []
+    for key, module_name in required.items():
+        try:
+            module = importlib.import_module(module_name)
+            if key == "rclpy":
+                modules[key] = module
+            else:
+                modules[key] = getattr(module, key)
+        except Exception as exc:  # noqa: BLE001 - 汇总未 source 和缺包问题
+            errors.append(f"{module_name}.{key}: {exc}")
+    if errors:
+        raise RuntimeError(
+            "ROS2 基础依赖不可用；搜索了当前 PYTHONPATH/AMENT_PREFIX_PATH；"
+            f"错误={errors}。请 source 评测环境 ROS2 setup.bash，并检查 ROS_DISTRO。"
+        )
+
+    if require_vision:
+        vision_names = ("Detection3DArray", "Detection3D", "ObjectHypothesisWithPose")
+        try:
+            vision_module = importlib.import_module("vision_msgs.msg")
+            for name in vision_names:
+                modules[name] = getattr(vision_module, name)
+            _validate_vision_schema(SimpleNamespace(**modules))
+        except Exception as exc:  # noqa: BLE001 - 明确报告实际 schema/包问题
+            raise RuntimeError(
+                "vision_msgs 不可用或消息字段与适配层不兼容；搜索了当前 AMENT_PREFIX_PATH "
+                f"中的 vision_msgs/msg/Detection3DArray，错误={exc}。请安装与评测环境一致的 "
+                "vision_msgs，并运行 `ros2 interface show vision_msgs/msg/Detection3DArray` "
+                "核对字段；本项目不提供自定义消息替代。"
+            ) from exc
+    if require_filters:
+        for key, module_name in (("message_filters", "message_filters"), ("CvBridge", "cv_bridge")):
+            try:
+                module = importlib.import_module(module_name)
+                modules[key] = module if key == "message_filters" else getattr(module, key)
+            except Exception as exc:  # noqa: BLE001 - 节点启动依赖错误
+                raise RuntimeError(
+                    f"感知节点缺少 {module_name}；搜索了当前 PYTHONPATH，错误={exc}。"
+                    "请安装 ROS2 对应包并重新 source 环境。"
+                ) from exc
+    return SimpleNamespace(**modules)
+
+
+def _validate_vision_schema(ros: SimpleNamespace) -> None:
+    array = ros.Detection3DArray()
+    detection = ros.Detection3D()
+    result = ros.ObjectHypothesisWithPose()
+    if not hasattr(array, "header") or not hasattr(array, "detections"):
+        raise RuntimeError("Detection3DArray 缺少 header/detections")
+    if not hasattr(detection, "results"):
+        raise RuntimeError("Detection3D 缺少 results")
+    hypothesis = getattr(result, "hypothesis", result)
+    if not (hasattr(hypothesis, "class_id") or hasattr(hypothesis, "id")):
+        raise RuntimeError("ObjectHypothesisWithPose 缺少 class_id/id")
+    if not hasattr(hypothesis, "score") or not hasattr(result, "pose"):
+        raise RuntimeError("ObjectHypothesisWithPose 缺少 score/pose")
+
+
+def _load_config() -> dict[str, Any]:
+    path = _resolve_config_path()
+    try:
+        yaml = importlib.import_module("yaml")
+    except ImportError as exc:
+        raise RuntimeError("缺少 PyYAML，无法读取 config.yaml；请安装 python3-yaml") from exc
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001 - 配置错误统一包含路径
+        raise RuntimeError(f"读取配置失败 {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError(f"配置顶层必须是映射：{path}")
+    return data
+
+
+def _resolve_config_path() -> Path:
+    candidates: list[Path] = []
+    env_path = os.getenv("TEAM_SORTING_CONFIG", "").strip()
+    if env_path:
+        candidates.append(Path(env_path).expanduser())
+    try:
+        packages = importlib.import_module("ament_index_python.packages")
+        share = Path(packages.get_package_share_directory("team_sorting"))
+        candidates.append(share / "config" / "config.yaml")
+    except Exception:
+        pass
+    candidates.append(Path(__file__).resolve().parents[1] / "config" / "config.yaml")
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    raise RuntimeError(
+        f"找不到 config.yaml，搜索={candidates}；请设置 TEAM_SORTING_CONFIG 或正确安装包"
+    )
+
+
+def _spin(
+    ros: SimpleNamespace,
+    node_class: type,
+    config: dict[str, Any],
+    args: Optional[list[str]],
+) -> None:
+    ros.rclpy.init(args=args)
+    node = None
+    try:
+        node = node_class(config, ros)
+        ros.rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        try:
+            if node is not None:
+                node.destroy_node()
+        finally:
+            ros.rclpy.shutdown()
+#_TeamClientNode：比赛控制主节点
+
+# 这是三个节点里最核心的一个。整个规则系统每个控制周期的数据组装与动作出口。
+
+# 它订阅：
+
+# /material/instruction比赛任务指令
+#解析当前要搬运什么、放到哪里
+# Odom底盘里程计
+#导航与安全判断
+# JointState实际关节状态
+#机械臂控制、安全保持和执行反馈
+# /team/object_estimates
+#物体三维估计结果
+#提供目标物体的位置和类别
+# 然后按照固定控制频率执行_control_tick()。
+
+# 完整过程是：
+
+# 读取最新Odom
+# +
+# 读取最新JointState
+# +
+# 读取新鲜三维目标
+# +
+# 读取当前任务
+#         ↓
+# 构造SensorSnapshot
+#         ↓
+# 交给_compute_candidate_commands()
+#         ↓
+# 得到BaseCommand和ManipulationCommand
+#         ↓
+# 交给ActionMux
+#         ↓
+# 生成FinalAction[19]
+#         ↓
+# OfficialCommandPublisher发布
+
+def _create_team_client_node(ros: SimpleNamespace) -> type:
+    class _TeamClientNode(ros.Node):
+        def __init__(self, config: dict[str, Any], ros_deps: SimpleNamespace) -> None:
+            super().__init__("team_client_node")
+            self._ros = ros_deps
+            self._config = config
+            topics = config["topics"]
+            timing = config["timing"]
+            self._state_max_delta_ns = int(float(timing["state_max_delta_s"]) * 1e9)
+            self._command_ttl_ns = int(float(timing["command_ttl_s"]) * 1e9)
+            self._base_cache = TimestampedCache()
+            self._joint_cache = TimestampedCache()
+            self._latest_estimates: tuple[ObjectEstimate3D, ...] = ()
+            self._parsed_tasks: tuple[TaskSpec, ...] = ()
+            self._pending_task: Optional[TaskSpec] = None
+            self._warned_multiple_tasks = False
+            self._local_io_ready = False
+            self._system_ready_submitted = False
+            self._last_control_warning = ""
+            self._input_issues: dict[str, str] = {}
+            self._destroying = False
+            self._control_timer: Optional[Any] = None
+            self._parser = InstructionParser()
+            self._fsm = GlobalFSM(max_pick_retries=int(config["fsm"]["max_pick_retries"]))
+            self._mux = ActionMux(_action_mux_config(config))
+            self._arm_execution = ArmExecutionController()
+            self._mapper = JointStateMapper(config.get("joint_aliases", {}))
+
+            self._official_publisher = OfficialCommandPublisher(
+                self, topics["official_commands"], ros_deps
+            )
+            self._action_pub = self.create_publisher(ros.String, topics["final_action"], 10)
+            self._fsm_pub = self.create_publisher(ros.String, topics["fsm_status"], 10)
+            self.create_subscription(ros.String, topics["instruction"], self._on_instruction, 10)
+            self.create_subscription(ros.Odometry, topics["odom"], self._on_odom, 30)
+            self.create_subscription(ros.JointState, topics["joint_states"], self._on_joints, 30)
+            self.create_subscription(
+                ros.Detection3DArray, topics["object_estimates"], self._on_estimates, 10
+            )
+            period = 1.0 / float(timing["control_rate_hz"])
+            self._control_timer = self.create_timer(period, self._control_tick)
+            self._local_io_ready = True
+
+            # 机械臂规划接线后由 arm_planning 业务链持有并按需自检 KDL；ROS 组装层
+            # 不再为当前尚未使用的规划能力设置启动硬依赖。
+
+        def _on_instruction(self, message: Any) -> None:
+            now_ns = self.get_clock().now().nanoseconds
+            try:
+                tasks = self._parser.parse(message.data, now_ns)
+                # 解析只回答“消息中有哪些任务”；选择回答“当前采用哪一个”，两者分开
+                # 才能在正式规则发布后替换策略而不改 InstructionParser。
+                self._parsed_tasks = tasks
+                selected_task = self._select_task(tasks)
+                selected_fingerprint = self._task_semantic_fingerprint(selected_task)
+                if (
+                    self._fsm.task is not None
+                    and selected_fingerprint == self._task_semantic_fingerprint(self._fsm.task)
+                ):
+                    return
+                if (
+                    self._pending_task is not None
+                    and selected_fingerprint
+                    == self._task_semantic_fingerprint(self._pending_task)
+                ):
+                    return
+                # 周期广播只更新时间，不应把同一业务任务再次提交给FSM。不同任务仍
+                # 先缓存；是否以及何时激活新的任务，待官方确认。
+                self._pending_task = selected_task
+                if self._system_ready_submitted:
+                    self._submit_pending_task(now_ns)
+            except ValueError as exc:
+                self.get_logger().error(f"任务解析失败：{exc}")
+
+        @staticmethod
+        def _task_semantic_fingerprint(task: TaskSpec) -> tuple[Any, ...]:
+            """提取任务业务语义；接收时间不同不代表任务内容发生变化。"""
+
+            return (
+                task.task_id,
+                task.instruction,
+                task.target_kind,
+                task.target_body,
+                task.target_color,
+                task.place_type,
+                task.place_world_xyz,
+                task.place_radius,
+                task.ref_prop,
+                task.ref_prop_body,
+                task.direction,
+                task.valid,
+                task.failure_reason,
+            )
+
+        def _select_task(self, tasks: tuple[TaskSpec, ...]) -> TaskSpec:
+            """选择当前提交给 FSM 的任务，同时保留完整解析结果。
+
+            单条任务直接采用；多条任务为兼容旧版本暂取第一条。正式选择、排序或是否
+            顺序执行仍待官方确认，不能在这里写死比赛规则。
+            """
+
+            if not tasks:
+                raise ValueError("任务选择不能接收空任务列表")
+            if len(tasks) > 1 and not self._warned_multiple_tasks:
+                self.get_logger().warning(
+                    f"收到 {len(tasks)} 条任务，当前兼容策略暂选第一条；完整解析结果已缓存，"
+                    "正式多任务语义待官方确认"
+                )
+                self._warned_multiple_tasks = True
+            # TODO(official-task-selection): 官方规则确认后只替换本函数，不默认顺序执行。
+            return tasks[0]
+
+        def _submit_pending_task(self, now_ns: int) -> None:
+            if not self._system_ready_submitted or self._pending_task is None:
+                return
+            if self._fsm.submit_task(self._pending_task, now_ns):
+                self._pending_task = None
+            else:
+                self.get_logger().warning("当前 FSM 阶段不接受已缓存任务，任务仍保留待诊断")
+
+        def _check_readiness(
+            self,
+            now_ns: int,
+            base: Optional[BaseState],
+            joints: Optional[RobotJointState],
+        ) -> None:
+            """反馈可靠后尝试SYSTEM_READY；成功后不再提交，意外拒绝允许重试。"""
+
+            if self._system_ready_submitted or not self._local_io_ready:
+                return
+            if base is None or joints is None or not base.valid or not joints.valid:
+                return
+            # Odom 和 JointState 是保持与安全判断的基础；没有新鲜反馈时“节点已构造”
+            # 不能等同于“系统已准备”。TODO(official-readiness)：感知节点心跳和官方
+            # Server心跳是否纳入门槛，待官方确认。
+            if not self._fsm.handle_event(FSMEvent.SYSTEM_READY, now_ns):
+                _log_input_issue_on_change(
+                    self,
+                    self._input_issues,
+                    "readiness",
+                    "FSM 拒绝 SYSTEM_READY，保持当前状态并在反馈仍可靠时重试",
+                )
+                return
+            self._system_ready_submitted = True
+            _log_input_issue_on_change(self, self._input_issues, "readiness", "")
+            self._submit_pending_task(now_ns)
+
+        def _on_odom(self, message: Any) -> None:
+            try:
+                state = _base_state_from_odom(message)
+                self._base_cache.put(state.timestamp_ns, state)
+                _log_input_issue_on_change(self, self._input_issues, "odom", "")
+            except (AttributeError, TypeError, ValueError) as exc:
+                self._base_cache.clear()
+                _log_input_issue_on_change(
+                    self, self._input_issues, "odom", f"Odom 转换失败：{exc}"
+                )
+
+        def _on_joints(self, message: Any) -> None:
+            try:
+                state = self._mapper.map_message(message)
+                self._joint_cache.put(state.timestamp_ns, state)
+                _log_input_issue_on_change(self, self._input_issues, "joints", "")
+            except (AttributeError, TypeError, ValueError) as exc:
+                self._joint_cache.clear()
+                _log_input_issue_on_change(
+                    self,
+                    self._input_issues,
+                    "joints",
+                    f"JointState 转换失败：{exc}",
+                )
+
+        def _on_estimates(self, message: Any) -> None:
+            try:
+                estimates = _estimates_from_vision(message)
+                table = _bounds_from_config(self._config["slot_bounds"]["table"])
+                shelf = _bounds_from_config(self._config["slot_bounds"]["shelf"])
+                # slot_type 只在 team client 收到米制三维位置后计算，不进入 ROS 消息。
+                self._latest_estimates = tuple(
+                    ObjectEstimate3D(
+                        class_id=item.class_id,
+                        position_xyz=item.position_xyz,
+                        confidence=item.confidence,
+                        frame_id=item.frame_id,
+                        timestamp_ns=item.timestamp_ns,
+                        slot_type=classify_slot_type(item.position_xyz, table, shelf),
+                        valid=item.valid,
+                        failure_reason=item.failure_reason,
+                    )
+                    for item in estimates
+                )
+                _log_input_issue_on_change(self, self._input_issues, "estimates", "")
+            except (AttributeError, TypeError, ValueError, RuntimeError) as exc:
+                # 新消息已经证明本轮感知不可用，不能继续把上一次结果当成当前目标。
+                self._latest_estimates = ()
+                _log_input_issue_on_change(
+                    self,
+                    self._input_issues,
+                    "estimates",
+                    f"三维目标消息转换失败：{exc}",
+                )
+
+        def _fresh_estimates(self, now_ns: int) -> tuple[ObjectEstimate3D, ...]:
+            """只保留当前状态容差内、时间不超前且有效的三维估计。"""
+
+            return tuple(
+                estimate
+                for estimate in self._latest_estimates
+                if estimate.valid
+                and 0 <= now_ns - estimate.timestamp_ns <= self._state_max_delta_ns
+            )
+
+        def _fresh_control_state(self, cache: TimestampedCache, now_ns: int) -> Optional[Any]:
+            """读取控制周期可用的状态，并拒绝时间超前的反馈。"""
+
+            state = cache.nearest(now_ns, self._state_max_delta_ns)
+            if state is None or state.timestamp_ns > now_ns:
+                return None
+            return state
+
+        def _safe_hold_candidates(
+            self, joints: RobotJointState, now_ns: int
+        ) -> tuple[BaseCommand, ManipulationCommand]:
+            """生成短TTL零底盘和基于实际反馈的关节保持候选。"""
+
+            base_command = BaseCommand(
+                0.0, 0.0, now_ns, now_ns + self._command_ttl_ns
+            )
+            hold = self._arm_execution.create_hold_command(
+                joints, now_ns, self._command_ttl_ns
+            )
+            return base_command, hold
+
+        def _compute_candidate_commands(
+            self,
+            snapshot: SensorSnapshot,
+            fsm_status: FSMStatus,
+            now_ns: int,
+        ) -> tuple[BaseCommand | None, ManipulationCommand | None]:
+            """把同周期快照交给唯一业务组装入口，返回两类候选命令。
+
+            当前完整业务尚未接线，只产生零底盘和实际关节保持。候选命令仍需经过
+            ActionMux 才成为 FinalAction，ROS发布后也还要靠反馈确认实际执行。
+            """
+
+            # TODO：未来在这里调用 navigation 和 arm_execution 组装候选；业务模块
+            # 只能返回候选，不能直接发布 ROS 话题，也不能在本函数实现算法。
+            if snapshot.joints is None or not snapshot.joints.valid:
+                return None, None
+            return self._safe_hold_candidates(snapshot.joints, now_ns)
+
+        def _log_control_warning_on_change(self, reason: str) -> None:
+            """只在控制降级原因变化时记录，避免定时器高频刷屏。"""
+
+            if reason == self._last_control_warning:
+                return
+            self._last_control_warning = reason
+            if reason:
+                self.get_logger().warning(reason)
+
+        def _publish_emergency_base_stop(self, reason: str) -> None:
+            """状态不足以构造安全19维动作时，尽力只停止底盘。"""
+
+            try:
+                self._official_publisher.publish_emergency_base_stop()
+                message = reason
+            except RuntimeError as exc:
+                message = f"{reason}；{exc}"
+            self._log_control_warning_on_change(message)
+
+        def _publish_final_action(self, action: FinalAction) -> bool:
+            """发布有效动作，并把同一个 FinalAction 作为诊断遥测发送。"""
+
+            if not action.valid:
+                self._publish_emergency_base_stop(
+                    f"ActionMux 输出无效，禁止发布19维动作：{action.failure_reason}"
+                )
+                published = False
+            else:
+                try:
+                    self._official_publisher.publish(action)
+                    published = True
+                except RuntimeError as exc:
+                    self._publish_emergency_base_stop(f"官方控制发布失败：{exc}")
+                    published = False
+            # 遥测记录的是 ActionMux 的同一输出，不代表发布成功、Server接收或实际执行。
+            action_message = self._ros.String()
+            action_message.data = final_action_to_json(action)
+            self._action_pub.publish(action_message)
+            return published
+
+        def _control_tick(self) -> None:
+            now_ns = self.get_clock().now().nanoseconds
+            base = self._fresh_control_state(self._base_cache, now_ns)
+            joints = self._fresh_control_state(self._joint_cache, now_ns)
+            self._check_readiness(now_ns, base, joints)
+            status = self._fsm.status(now_ns)
+            fsm_message = self._ros.String()
+            fsm_message.data = fsm_status_to_json(status)
+            self._fsm_pub.publish(fsm_message)
+
+            state_reasons: list[str] = []
+            if base is None:
+                state_reasons.append("缺少新鲜 Odom")
+            elif not base.valid:
+                state_reasons.append(base.failure_reason or "Odom 状态无效")
+            if joints is None:
+                state_reasons.append("缺少新鲜 JointState")
+            elif not joints.valid:
+                state_reasons.append(joints.failure_reason or "JointState 状态无效")
+            snapshot = SensorSnapshot(
+                task=self._fsm.task,
+                base=base,
+                joints=joints,
+                object_estimates=self._fresh_estimates(now_ns),
+                timestamp_ns=now_ns,
+                valid=not state_reasons,
+                failure_reason="；".join(state_reasons),
+            )
+            base_command, manipulation_command = self._compute_candidate_commands(
+                snapshot, status, now_ns
+            )
+
+            if joints is None or not joints.valid:
+                # 没有可靠实际关节时绝不能伪造17维全零；此时只能尽力让底盘停车。
+                self._publish_emergency_base_stop(
+                    snapshot.failure_reason or "JointState 不可靠，无法构造安全保持动作"
+                )
+                return
+
+            if snapshot.failure_reason:
+                # Odom陈旧时不继续普通策略，但可靠JointState仍允许经ActionMux发布零速保持。
+                self._log_control_warning_on_change(
+                    f"机器人状态降级，发布零底盘和实际关节保持：{snapshot.failure_reason}"
+                )
+            else:
+                self._log_control_warning_on_change("")
+            final_action = self._mux.compose(
+                base_command, manipulation_command, joints, status, now_ns
+            )
+            self._publish_final_action(final_action)
+
+        def destroy_node(self) -> Any:
+            """停止定时控制，并在销毁ROS实体前尽力发送安全动作。
+
+            安全退出只能覆盖正常关闭和可处理异常，无法保证 kill -9、断电或整个容器
+            消失。是否需要重复零速以及 Server watchdog 行为仍待官方确认。
+            """
+
+            if self._destroying:
+                return None
+            self._destroying = True
+            try:
+                if self._control_timer is not None:
+                    self._control_timer.cancel()
+                now_ns = self.get_clock().now().nanoseconds
+                joints = self._fresh_control_state(self._joint_cache, now_ns)
+                if joints is not None and joints.valid:
+                    base_command, hold = self._safe_hold_candidates(joints, now_ns)
+                    final_action = self._mux.compose(
+                        base_command, hold, joints, self._fsm.status(now_ns), now_ns
+                    )
+                    self._publish_final_action(final_action)
+                else:
+                    self._publish_emergency_base_stop(
+                        "节点退出时没有新鲜有效JointState，只能尽力发布底盘零速度"
+                    )
+            except Exception as exc:  # noqa: BLE001 - 必须记录，但绝不能阻止父节点销毁
+                self.get_logger().error(f"安全退出动作失败：{exc}")
+            return super().destroy_node()
+
+    return _TeamClientNode
+
+#它负责接收：
+
+# RGB图像
+# Depth图像
+# CameraInfo内参
+# Odom机器人底盘里程计
+#提供机器人位置、朝向和速度
+# JointState机器人实际关节状态
+#提供升降柱、头部、左右机械臂和夹爪状态
+
+# 工作流程：
+
+# RGB + Depth近似同步
+#         ↓
+# 找到拍摄时刻附近的Odom和JointState
+#         ↓
+# ROS Image转成RGBFrame和DepthFrame
+#         ↓
+# 调用perception_2d.py的YOLO适配器
+#         ↓
+# 得到二维检测
+#         ↓
+# 调用perception_3d.py计算三维位置
+#         ↓
+# 发布 /team/object_estimates
+
+# 关键点是：
+
+# 它负责调用视觉算法，但不在本文件里实现视觉算法。
+def _create_perception_node(ros: SimpleNamespace) -> type:
+    class _PerceptionNode(ros.Node):
+        def __init__(self, config: dict[str, Any], ros_deps: SimpleNamespace) -> None:
+            super().__init__("perception_node")
+            self._ros = ros_deps
+            topics = config["topics"]
+            timing = config["timing"]
+            self._state_max_delta_ns = int(float(timing["state_max_delta_s"]) * 1e9)
+            self._depth_unit_scale_m = float(config["perception"]["depth_unit_scale_m"])
+            if not math.isfinite(self._depth_unit_scale_m) or self._depth_unit_scale_m <= 0.0:
+                raise RuntimeError(
+                    "perception.depth_unit_scale_m 必须是正的有限数；"
+                    f"实际值={self._depth_unit_scale_m!r}"
+                )
+            self._camera_info: Optional[CameraIntrinsics] = None
+            self._last_frame_issue = ""
+            self._input_issues: dict[str, str] = {}
+            self._base_cache = TimestampedCache()
+            self._joint_cache = TimestampedCache()
+            self._mapper = JointStateMapper(config.get("joint_aliases", {}))
+            self._bridge = ros_deps.CvBridge()
+
+            official = config["official"]
+            self._yolo = OfficialYoloAdapter(
+                official_root=str(official.get("root", "")),
+                checkpoint_path=str(official.get("yolo_checkpoint", "")),
+                module_name=str(official.get("yolo_backend_module", "")),
+                confidence_threshold=float(config["perception"]["confidence_threshold"]),
+            )
+            self._transform = CameraTransformProvider(
+                official_root=str(official.get("root", "")),
+                mjcf_path=str(official.get("mjcf_path", "")),
+                module_name=str(official.get("fk_module", "discoverse.robots.mmk2.mmk2_fk")),
+                output_frame=str(config["frames"]["planning"]),
+            )
+            self._yolo.self_check()
+            self._transform.self_check()
+            self._estimator = Perception3DEstimator(self._transform)
+            self._publisher = self.create_publisher(
+                ros.Detection3DArray, topics["object_estimates"], 10
+            )
+
+            self.create_subscription(
+                ros.CameraInfo, topics["camera_info"], self._on_camera_info, 10
+            )
+            self.create_subscription(ros.Odometry, topics["odom"], self._on_odom, 30)
+            self.create_subscription(ros.JointState, topics["joint_states"], self._on_joints, 30)
+            self._rgb_sub = ros_deps.message_filters.Subscriber(self, ros.Image, topics["rgb"])
+            self._depth_sub = ros_deps.message_filters.Subscriber(self, ros.Image, topics["depth"])
+            self._sync = ros_deps.message_filters.ApproximateTimeSynchronizer(
+                [self._rgb_sub, self._depth_sub],
+                queue_size=int(config["perception"]["sync_queue_size"]),
+                slop=float(config["perception"]["sync_slop_s"]),
+            )
+            self._sync.registerCallback(self._on_rgb_depth)
+
+        def _on_camera_info(self, message: Any) -> None:
+            try:
+                k = tuple(float(value) for value in message.k)
+                if len(k) != 9:
+                    raise ValueError(f"CameraInfo.K 必须有9项，实际为{len(k)}项")
+                if not all(math.isfinite(value) for value in k):
+                    raise ValueError("CameraInfo.K 包含 NaN 或 Inf")
+                if k[0] <= 0.0 or k[4] <= 0.0:
+                    raise ValueError("CameraInfo 的 fx 和 fy 必须大于0")
+                width = int(message.width)
+                height = int(message.height)
+                if width <= 0 or height <= 0:
+                    raise ValueError("CameraInfo 图像宽高必须大于0")
+                self._camera_info = CameraIntrinsics(
+                    k=k,
+                    width=width,
+                    height=height,
+                    frame_id=str(message.header.frame_id),
+                    timestamp_ns=_stamp_to_ns(message.header.stamp),
+                )
+                _log_input_issue_on_change(self, self._input_issues, "camera_info", "")
+            except (AttributeError, TypeError, ValueError) as exc:
+                self._camera_info = None
+                _log_input_issue_on_change(
+                    self,
+                    self._input_issues,
+                    "camera_info",
+                    f"CameraInfo 转换失败，拒绝缓存：{exc}",
+                )
+
+        def _on_odom(self, message: Any) -> None:
+            try:
+                state = _base_state_from_odom(message)
+                self._base_cache.put(state.timestamp_ns, state)
+                _log_input_issue_on_change(self, self._input_issues, "odom", "")
+            except (AttributeError, TypeError, ValueError) as exc:
+                self._base_cache.clear()
+                _log_input_issue_on_change(
+                    self, self._input_issues, "odom", f"Odom 转换失败：{exc}"
+                )
+
+        def _on_joints(self, message: Any) -> None:
+            try:
+                state = self._mapper.map_message(message)
+                self._joint_cache.put(state.timestamp_ns, state)
+                _log_input_issue_on_change(self, self._input_issues, "joints", "")
+            except (AttributeError, TypeError, ValueError) as exc:
+                self._joint_cache.clear()
+                _log_input_issue_on_change(
+                    self,
+                    self._input_issues,
+                    "joints",
+                    f"JointState 转换失败：{exc}",
+                )
+
+        def _log_frame_issue_on_change(self, reason: str, *, error: bool = False) -> None:
+            """图像流只在问题变化时记录，避免每帧重复同一条日志。"""
+
+            if reason == self._last_frame_issue:
+                return
+            self._last_frame_issue = reason
+            if not reason:
+                return
+            if error:
+                self.get_logger().error(reason)
+            else:
+                self.get_logger().warning(reason)
+
+        def _on_rgb_depth(self, rgb_message: Any, depth_message: Any) -> None:
+            try:
+                timestamp_ns = _stamp_to_ns(rgb_message.header.stamp)
+                base = self._base_cache.nearest(timestamp_ns, self._state_max_delta_ns)
+                joints = self._joint_cache.nearest(timestamp_ns, self._state_max_delta_ns)
+                missing: list[str] = []
+                if self._camera_info is None:
+                    missing.append("CameraInfo")
+                if base is None or not base.valid:
+                    missing.append("邻近有效Odom")
+                if joints is None or not joints.valid:
+                    missing.append("邻近有效JointState")
+                if missing:
+                    self._log_frame_issue_on_change(
+                        f"同步图像缺少 {'/'.join(missing)}，跳过该帧"
+                    )
+                    return
+                rgb = RGBFrame(
+                    image=self._bridge.imgmsg_to_cv2(rgb_message, desired_encoding="bgr8"),
+                    encoding="bgr8",
+                    frame_id=str(rgb_message.header.frame_id),
+                    timestamp_ns=timestamp_ns,
+                )
+                depth = DepthFrame(
+                    image=self._bridge.imgmsg_to_cv2(depth_message, desired_encoding="passthrough"),
+                    unit_scale_m=self._depth_unit_scale_m,
+                    frame_id=str(depth_message.header.frame_id),
+                    timestamp_ns=_stamp_to_ns(depth_message.header.stamp),
+                )
+                detections = self._yolo.detect(rgb, depth, self._camera_info)
+                estimates = self._estimator.estimate(
+                    detections, depth, self._camera_info, base, joints
+                )
+                self._publisher.publish(
+                    _estimates_to_vision(estimates, self._ros, rgb_message.header.stamp)
+                )
+                self._log_frame_issue_on_change("")
+            except NotImplementedError as exc:
+                self._log_frame_issue_on_change(str(exc), error=True)
+            except (AttributeError, TypeError, ValueError, RuntimeError) as exc:
+                self._log_frame_issue_on_change(f"感知帧处理失败：{exc}", error=True)
+
+    return _PerceptionNode
+# 它订阅：
+
+# FinalAction
+# FSMStatus
+# 任务指令
+# 裁判taskinfo
+# 裁判gameinfo
+# 裁判score
+
+# 同时启动：
+
+# ros2 bag record
+
+# 保存高带宽数据，例如：
+
+# RGB；
+# Depth；
+# Odom；
+# JointState；
+# 三维目标；
+# 最终动作。
+
+# 它的流程是：
+
+# 节点启动
+# → 创建Episode
+# → 启动rosbag
+# → 记录任务、FSM、动作和裁判元数据
+# → 监控rosbag进程
+# → 节点退出时停止rosbag
+# → 完成Episode元数据
+
+# 它解决的是：
+
+# 以后训练VLA需要完整、时间对齐、可复现的专家轨迹。
+
+def _create_recorder_node(ros: SimpleNamespace) -> type:
+    class _DatasetRecorderNode(ros.Node):
+        def __init__(self, config: dict[str, Any], ros_deps: SimpleNamespace) -> None:
+            super().__init__("dataset_recorder_node")
+            self._ros = ros_deps
+            recorder_config = config["recorder"]
+            self.declare_parameter("enabled", bool(recorder_config.get("enabled", False)))
+            if not bool(self.get_parameter("enabled").value):
+                raise RuntimeError(
+                    "数据记录未启用；请使用 `ros2 launch team_sorting team.launch.xml "
+                    "record_data:=true`，或为 recorder 节点设置 enabled:=true"
+                )
+            topics = config["topics"]
+            self._parser = InstructionParser()
+            self._recorder = EpisodeRecorder(recorder_config["root_dir"])
+            self._rosbag_process: Optional[Any] = None
+            self._rosbag_failure = ""
+            now_ns = self.get_clock().now().nanoseconds
+            episode_id = EpisodeRecorder.make_episode_id(recorder_config["episode_prefix"])
+            self._recorder.start(
+                episode_id,
+                now_ns,
+                "临时边界：recorder 节点启动到停止；正式 Episode 边界待赛事方确认",
+            )
+            try:
+                if bool(recorder_config.get("record_rosbag", True)):
+                    command = self._recorder.build_rosbag_command(
+                        tuple(str(topic) for topic in recorder_config["rosbag_topics"])
+                    )
+                    self._rosbag_process = subprocess.Popen(command)
+                    self._recorder.mark_rosbag_started(command[4])
+                    exit_code = self._rosbag_process.poll()
+                    if exit_code is not None:
+                        self._recorder.mark_rosbag_finished(exit_code)
+                        self._rosbag_process = None
+                        raise RuntimeError(f"ros2 bag record 启动后立即退出，退出码={exit_code}")
+                    self.create_timer(1.0, self._monitor_rosbag)
+                self.create_subscription(ros.String, topics["final_action"], self._on_action, 50)
+                self.create_subscription(ros.String, topics["fsm_status"], self._on_fsm, 50)
+                self.create_subscription(
+                    ros.String, topics["instruction"], self._on_instruction, 10
+                )
+                self.create_subscription(
+                    ros.String,
+                    "/referee/taskinfo",
+                    lambda message: self._on_referee_text("/referee/taskinfo", message),
+                    10,
+                )
+                self.create_subscription(
+                    ros.String,
+                    "/referee/gameinfo",
+                    lambda message: self._on_referee_text("/referee/gameinfo", message),
+                    10,
+                )
+                self.create_subscription(
+                    ros.Int32, "/referee/score", self._on_referee_score, 10
+                )
+            except Exception as exc:  # noqa: BLE001 - 初始化失败必须回滚后原样上抛
+                # bag 已启动后若 Timer 或订阅创建失败，必须先停止子进程并结束元数据，
+                # 避免留下无人管理的录制进程或看似仍在进行的 Episode。
+                cleanup_errors: list[str] = []
+                try:
+                    self._stop_rosbag()
+                except Exception as cleanup_exc:  # noqa: BLE001 - 汇总到初始化错误
+                    cleanup_errors.append(f"停止 rosbag 失败：{cleanup_exc}")
+                try:
+                    if self._recorder.metadata is not None:
+                        self._recorder.finish(self.get_clock().now().nanoseconds)
+                except Exception as cleanup_exc:  # noqa: BLE001 - 汇总到初始化错误
+                    cleanup_errors.append(f"结束 Episode 失败：{cleanup_exc}")
+                details = f"；回滚问题={'；'.join(cleanup_errors)}" if cleanup_errors else ""
+                raise RuntimeError(f"Recorder 初始化失败：{exc}{details}") from exc
+
+        def _on_action(self, message: Any) -> None:
+            try:
+                self._recorder.record_final_action(final_action_from_json(message.data))
+            except (ValueError, RuntimeError) as exc:
+                self.get_logger().error(f"记录 FinalAction 失败：{exc}")
+
+        def _on_fsm(self, message: Any) -> None:
+            try:
+                self._recorder.record_fsm_status(fsm_status_from_json(message.data))
+            except (ValueError, RuntimeError) as exc:
+                self.get_logger().error(f"记录 FSM 失败：{exc}")
+
+        def _on_instruction(self, message: Any) -> None:
+            try:
+                task = self._recorder.record_instruction(
+                    message.data,
+                    self.get_clock().now().nanoseconds,
+                    self._parser,
+                )
+                if task is None:
+                    reason = self._recorder.metadata.instruction_parse_failure
+                    self.get_logger().warning(f"任务原文已保存，但解析失败：{reason}")
+            except RuntimeError as exc:
+                self.get_logger().error(f"记录任务指令失败：{exc}")
+
+        def _on_referee_text(self, topic: str, message: Any) -> None:
+            try:
+                self._recorder.record_referee_message(
+                    topic, message.data, self.get_clock().now().nanoseconds
+                )
+            except (ValueError, RuntimeError) as exc:
+                self.get_logger().error(f"记录裁判元数据失败：{exc}")
+
+        def _on_referee_score(self, message: Any) -> None:
+            try:
+                self._recorder.record_referee_message(
+                    "/referee/score",
+                    int(message.data),
+                    self.get_clock().now().nanoseconds,
+                )
+            except (ValueError, RuntimeError) as exc:
+                self.get_logger().error(f"记录裁判分数失败：{exc}")
+
+        def _monitor_rosbag(self) -> None:
+            if self._rosbag_process is None:
+                return
+            exit_code = self._rosbag_process.poll()
+            if exit_code is None:
+                return
+            self._recorder.mark_rosbag_finished(exit_code)
+            self._rosbag_process = None
+            self._rosbag_failure = f"ros2 bag record 在节点运行期间提前退出，退出码={exit_code}"
+            self.get_logger().error(self._rosbag_failure)
+
+        def _stop_rosbag(self) -> None:
+            if self._rosbag_process is None:
+                if self._rosbag_failure:
+                    raise RuntimeError(self._rosbag_failure)
+                return
+            process = self._rosbag_process
+            exit_code = process.poll()
+            if exit_code is None:
+                process.send_signal(signal.SIGINT)
+                try:
+                    exit_code = process.wait(timeout=30.0)
+                except subprocess.TimeoutExpired as exc:
+                    process.terminate()
+                    exit_code = process.wait(timeout=5.0)
+                    self._recorder.mark_rosbag_finished(exit_code)
+                    self._rosbag_process = None
+                    raise RuntimeError(
+                        f"ros2 bag record 收到 SIGINT 后 30 秒未正常结束，终止退出码={exit_code}"
+                    ) from exc
+            self._recorder.mark_rosbag_finished(int(exit_code))
+            self._rosbag_process = None
+            if exit_code != 0:
+                raise RuntimeError(f"ros2 bag record 非正常退出，退出码={exit_code}")
+
+        def destroy_node(self) -> Any:
+            """正常停止 rosbag、结束临时 Episode 并销毁 ROS2 节点。
+
+            参数：无。返回父类销毁结果；先向 bag 进程发送 SIGINT 并等待，时间单位
+            纳秒，空间坐标系不适用。bag 或元数据收尾失败仍会调用父类销毁，随后抛出
+            ``RuntimeError``；正式 Episode 边界仍待赛事方确认。
+            """
+
+            errors: list[str] = []
+            try:
+                self._stop_rosbag()
+            except Exception as exc:  # noqa: BLE001 - 仍需完成元数据并销毁节点
+                errors.append(str(exc))
+            try:
+                if self._recorder.metadata is not None:
+                    self._recorder.finish(self.get_clock().now().nanoseconds)
+            except Exception as exc:  # noqa: BLE001 - 销毁后仍要报告元数据错误
+                errors.append(f"结束 Episode 失败：{exc}")
+            result = super().destroy_node()
+            if errors:
+                raise RuntimeError("；".join(errors))
+            return result
+
+    return _DatasetRecorderNode
+
+
+def _action_mux_config(config: dict[str, Any]) -> ActionMuxConfig:
+    action = config["action_mux"]
+    return ActionMuxConfig(
+        max_abs_base_v=float(action["max_abs_base_v"]),
+        max_abs_base_w=float(action["max_abs_base_w"]),
+        joint_lower=tuple(float(value) for value in action["joint_lower"]),
+        joint_upper=tuple(float(value) for value in action["joint_upper"]),
+    )
+
+
+def _bounds_from_config(values: list[float]) -> Bounds3D:
+    if len(values) != 6:
+        raise ValueError("slot_bounds 每个区域必须是 [xmin,xmax,ymin,ymax,zmin,zmax]")
+    return Bounds3D(*(float(value) for value in values))
+
+
+def _log_input_issue_on_change(
+    node: Any,
+    issues: dict[str, str],
+    source: str,
+    reason: str,
+) -> None:
+    """同一输入错误只记录一次，恢复后允许下次新问题再次出现。"""
+
+    if issues.get(source, "") == reason:
+        return
+    issues[source] = reason
+    if reason:
+        node.get_logger().error(reason)
+
+
+def _stamp_to_ns(stamp: Any) -> int:
+    try:
+        if (
+            isinstance(stamp.sec, bool)
+            or isinstance(stamp.nanosec, bool)
+            or not isinstance(stamp.sec, int)
+            or not isinstance(stamp.nanosec, int)
+        ):
+            raise ValueError("sec 和 nanosec 必须是真正整数，不能使用 bool")
+        sec = int(stamp.sec)
+        nanosec = int(stamp.nanosec)
+    except (AttributeError, TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"ROS 时间戳格式无效：{exc}") from exc
+    if sec < 0 or not 0 <= nanosec < 1_000_000_000:
+        raise ValueError(f"ROS 时间戳范围无效：sec={sec}, nanosec={nanosec}")
+    return sec * 1_000_000_000 + nanosec
+
+
+def _set_stamp(stamp: Any, timestamp_ns: int) -> None:
+    if isinstance(timestamp_ns, bool) or not isinstance(timestamp_ns, int) or timestamp_ns < 0:
+        raise ValueError("纳秒时间必须是非负整数，不能使用 bool")
+    stamp.sec = timestamp_ns // 1_000_000_000
+    stamp.nanosec = timestamp_ns % 1_000_000_000
+
+
+def _base_state_from_odom(message: Any) -> BaseState:
+    try:
+        pose = message.pose.pose
+        twist = message.twist.twist
+        position = (
+            float(pose.position.x),
+            float(pose.position.y),
+            float(pose.position.z),
+        )
+        q = pose.orientation
+        quaternion = (float(q.x), float(q.y), float(q.z), float(q.w))
+        linear_velocity = (
+            float(twist.linear.x),
+            float(twist.linear.y),
+            float(twist.linear.z),
+        )
+        angular_velocity = (
+            float(twist.angular.x),
+            float(twist.angular.y),
+            float(twist.angular.z),
+        )
+        timestamp_ns = _stamp_to_ns(message.header.stamp)
+    except (AttributeError, TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"Odom 字段格式无效：{exc}") from exc
+    finite_groups = (
+        ("位置", position),
+        ("四元数", quaternion),
+        ("线速度", linear_velocity),
+        ("角速度", angular_velocity),
+    )
+    for label, values in finite_groups:
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError(f"Odom {label}包含 NaN/Inf")
+    norm = math.sqrt(sum(value * value for value in quaternion))
+    if norm < 1e-12:
+        raise ValueError("Odom 四元数范数为零")
+    qx, qy, qz, qw = (value / norm for value in quaternion)
+    yaw = math.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
+    return BaseState(
+        position_xyz=position,
+        orientation_xyzw=(qx, qy, qz, qw),
+        yaw=yaw,
+        linear_velocity_xyz=linear_velocity,
+        angular_velocity_xyz=angular_velocity,
+        frame_id=str(message.header.frame_id),
+        timestamp_ns=timestamp_ns,
+    )
+
+
+def _estimates_to_vision(
+    estimates: tuple[ObjectEstimate3D, ...], ros: SimpleNamespace, fallback_stamp: Any
+) -> Any:
+    message = ros.Detection3DArray()
+    if estimates:
+        message.header.frame_id = estimates[0].frame_id
+        _set_stamp(message.header.stamp, estimates[0].timestamp_ns)
+    else:
+        _set_stamp(message.header.stamp, _stamp_to_ns(fallback_stamp))
+    for estimate in estimates:
+        if not estimate.valid:
+            continue
+        xyz = tuple(float(value) for value in estimate.position_xyz)
+        confidence = _validated_confidence(estimate.confidence, "ObjectEstimate3D")
+        if not all(math.isfinite(value) for value in xyz):
+            raise ValueError("ObjectEstimate3D 三维位置包含 NaN/Inf")
+        detection = ros.Detection3D()
+        if hasattr(detection, "header"):
+            detection.header.frame_id = estimate.frame_id
+            _set_stamp(detection.header.stamp, estimate.timestamp_ns)
+        result = ros.ObjectHypothesisWithPose()
+        hypothesis = getattr(result, "hypothesis", result)
+        if hasattr(hypothesis, "class_id"):
+            hypothesis.class_id = estimate.class_id
+        elif hasattr(hypothesis, "id"):
+            hypothesis.id = estimate.class_id
+        else:
+            raise RuntimeError("vision_msgs hypothesis 没有 class_id/id 字段")
+        hypothesis.score = confidence
+        pose = _vision_result_pose(result)
+        pose.position.x, pose.position.y, pose.position.z = xyz
+        # 单位四元数只是满足 Pose 消息结构，不表示已估计出物体的真实朝向。
+        pose.orientation.x = 0.0
+        pose.orientation.y = 0.0
+        pose.orientation.z = 0.0
+        pose.orientation.w = 1.0
+        detection.results.append(result)
+        message.detections.append(detection)
+    return message
+
+
+def _estimates_from_vision(message: Any) -> tuple[ObjectEstimate3D, ...]:
+    array_timestamp_ns = _stamp_to_ns(message.header.stamp)
+    array_frame_id = str(message.header.frame_id)
+    converted: list[ObjectEstimate3D] = []
+    for detection in message.detections:
+        if not detection.results:
+            continue
+        result = detection.results[0]
+        hypothesis = getattr(result, "hypothesis", result)
+        class_id = getattr(hypothesis, "class_id", getattr(hypothesis, "id", ""))
+        if not class_id:
+            raise RuntimeError("vision_msgs 三维结果缺少类别")
+        header = detection.header if hasattr(detection, "header") else message.header
+        position = _vision_result_position(result)
+        xyz = (float(position.x), float(position.y), float(position.z))
+        if not all(math.isfinite(value) for value in xyz):
+            raise ValueError("vision_msgs 三维位置包含 NaN/Inf")
+        confidence = _validated_confidence(hypothesis.score, "vision_msgs 三维结果")
+        try:
+            timestamp_ns = _stamp_to_ns(header.stamp)
+        except (AttributeError, TypeError, ValueError):
+            timestamp_ns = array_timestamp_ns
+        if timestamp_ns == 0 and array_timestamp_ns != 0:
+            timestamp_ns = array_timestamp_ns
+        converted.append(
+            ObjectEstimate3D(
+                class_id=str(class_id),
+                position_xyz=xyz,
+                confidence=confidence,
+                frame_id=str(getattr(header, "frame_id", "") or array_frame_id),
+                timestamp_ns=timestamp_ns,
+                slot_type=SlotType.UNKNOWN,
+            )
+        )
+    return tuple(converted)
+
+
+def _validated_confidence(value: Any, source: str) -> float:
+    """把消息置信度收窄为0到1的有限浮点数。"""
+
+    if isinstance(value, bool):
+        raise ValueError(f"{source} 置信度不能使用 bool")
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{source} 置信度格式无效：{value!r}") from exc
+    if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
+        raise ValueError(f"{source} 置信度必须是0到1的有限数：{confidence!r}")
+    return confidence
+
+
+def _vision_result_position(result: Any) -> Any:
+    return _vision_result_pose(result).position
+
+
+def _vision_result_pose(result: Any) -> Any:
+    pose = result.pose
+    if hasattr(pose, "pose"):
+        pose = pose.pose
+    if not hasattr(pose, "position") or not hasattr(pose, "orientation"):
+        raise RuntimeError("vision_msgs ObjectHypothesisWithPose.pose 缺少 position/orientation")
+    return pose
