@@ -1,0 +1,40 @@
+# Python缓存
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Python虚拟环境
+.venv/
+venv/
+env/
+
+# Python打包产物
+dist/
+*.egg-info/
+
+# ROS 2构建产物
+build/
+install/
+log/
+
+# 数据采集与rosbag
+team_sorting_dataset/
+*.db3
+*.mcap
+*.bag
+
+# 编辑器与系统文件
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 临时文件
+*.tmp
+*.swp
+*.log
+
+# 本地环境变量与敏感配置
+.env
+.env.*
+!.env.example

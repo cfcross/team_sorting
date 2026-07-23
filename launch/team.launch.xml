@@ -1,0 +1,10 @@
+<?xml version="1.0"?>
+<launch>
+  <arg name="record_data" default="false" />
+  <node pkg="team_sorting" exec="perception_node" name="perception_node" output="screen" />
+  <node pkg="team_sorting" exec="team_client_node" name="team_client_node" output="screen" />
+  <node pkg="team_sorting" exec="dataset_recorder_node" name="dataset_recorder_node"
+        output="screen" if="$(var record_data)">
+    <param name="enabled" value="true" />
+  </node>
+</launch>

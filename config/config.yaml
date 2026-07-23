@@ -1,0 +1,123 @@
+# 集中运行参数：本文件不是算法实现，主要由 ros_nodes.py 读取，再由 ROS 组装层把
+# 参数交给感知、FSM、ActionMux 和 Recorder；导航与机械臂完成接线后也从该边界取值。
+# 修改这里可能同时影响多个模块，因此它是公共文件，正式参数必须经对应负责人评审。
+#
+# 只有下列路径有明确的环境变量覆盖；TEAM_SORTING_CONFIG 是选择整份配置文件，
+# 不是逐字段覆盖：
+#   MATERIAL_SORTING_OFFICIAL_ROOT -> official.root
+#   MATERIAL_SORTING_YOLO_CHECKPOINT -> official.yolo_checkpoint
+#   TEAM_SORTING_MJCF -> official.mjcf_path
+# 空路径表示交给环境变量或薄适配器继续搜索，不表示依赖或算法一定可用。
+# 节点能够启动也不等于感知、导航、抓放和裁判闭环已经完成。
+
+official:
+  # PerceptionNode 把 root 交给 YOLO 和 MMK2FK 适配器；未来 KDL 接线也可复用该根目录。
+  root: ""                   # 可由 MATERIAL_SORTING_OFFICIAL_ROOT 覆盖
+  yolo_checkpoint: ""        # OfficialYoloAdapter；可由 MATERIAL_SORTING_YOLO_CHECKPOINT 覆盖
+  mjcf_path: ""              # CameraTransformProvider；可由 TEAM_SORTING_MJCF 覆盖
+  # 为空时 OfficialYoloAdapter 会尝试当前标准模块名，不会切换到伪检测器。
+  yolo_backend_module: ""
+  # 当前尚未被 ros_nodes.py 消费；机械臂规划接线后才交给 OfficialKDLAdapter。
+  kdl_module: "mmk2_kdl"
+  # CameraTransformProvider 延迟导入官方 MMK2FK 的模块名。
+  fk_module: "discoverse.robots.mmk2.mmk2_fk"
+
+frames:
+  # 三维感知输出和槽位分类使用该 frame，导航完成接线后也应遵守同一规划 frame。
+  # 当前选择 odom；world 与 odom 的关系、MMK2FK真实输出 frame 仍待官方确认。
+  # Arm KDL 要求 footprint，修改此值不会自动补出 odom 到 footprint 的坐标变换。
+  planning: "odom"
+
+topics:
+  # 任务：官方 Server 发布；TeamClientNode 和 DatasetRecorderNode 订阅。
+  instruction: "/material/instruction"
+  # 头部相机：官方相机驱动发布；PerceptionNode 消费，Recorder的bag列表在下方另列。
+  rgb: "/head_camera/color/image_raw"
+  depth: "/head_camera/aligned_depth_to_color/image_raw"
+  camera_info: "/head_camera/color/camera_info"
+  # 实际状态：官方SLAM/机器人发布；TeamClientNode和PerceptionNode消费。
+  odom: "/slamware_ros_sdk_server_node/odom"
+  joint_states: "/joint_states"
+  # 团队三维估计：PerceptionNode发布，TeamClientNode消费。
+  object_estimates: "/team/object_estimates"
+  # 团队遥测：TeamClientNode发布，Recorder订阅；不能另拼第二份FinalAction。
+  final_action: "/team/final_action"
+  fsm_status: "/team/fsm_status"
+  # 唯一官方动作出口：只允许OfficialCommandPublisher向官方控制器发布这五项。
+  # 当前字符串与本机官方源码一致，仍须在正式Docker用ros2 topic list/info核对类型和连接。
+  official_commands:
+    cmd_vel: "/cmd_vel"
+    slide: "/spine_forward_position_controller/commands"
+    head: "/head_forward_position_controller/commands"
+    left_arm: "/left_arm_forward_position_controller/commands"
+    right_arm: "/right_arm_forward_position_controller/commands"
+
+timing:
+  # 当前均为团队保守初值，仍需结合真实消息延迟和Server watchdog测试；本轮不调参。
+  control_rate_hz: 20.0       # Hz；20 Hz约等于每0.05秒执行一次控制周期
+  command_ttl_s: 0.20         # 秒；TeamClientNode生成候选命令的短期有效时间
+  state_max_delta_s: 0.15     # 秒；Odom/JointState/三维估计允许的最大时间差，必须非负
+
+perception:
+  confidence_threshold: 0.65  # OfficialYoloAdapter阈值，无单位，合法范围0到1
+  sync_queue_size: 10         # RGB/Depth近似同步队列长度，必须是非bool正整数
+  sync_slop_s: 0.05           # RGB/Depth近似同步容差，单位秒，必须非负
+  # 原始深度乘该比例得到米；0.001表示毫米转米，由PerceptionNode构造DepthFrame。
+  depth_unit_scale_m: 0.001
+
+fsm:
+  # 客户端在抓取失败后重新进入REFINE_TARGET的次数，不等于裁判允许的总尝试规则。
+  max_pick_retries: 1
+
+# 轴对齐区域顺序：[xmin,xmax,ymin,ymax,zmin,zmax]，单位米，必须和frames.planning一致。
+# 当前每组最小值大于最大值是故意的安全占位，使分类返回UNKNOWN而不是猜测桌面/货架。
+# 联调前必须由系统、视觉和导航共同确认真实frame及区域；这里不能填写推测坐标。
+slot_bounds:
+  table: [1.0, -1.0, 1.0, -1.0, 1.0, -1.0]
+  shelf: [1.0, -1.0, 1.0, -1.0, 1.0, -1.0]
+
+action_mux:
+  # TeamClientNode读取后构造ActionMuxConfig；底盘值是团队初始安全上限，不是官方性能值。
+  max_abs_base_v: 0.25        # m/s，底盘前向线速度v的绝对值上限
+  max_abs_base_w: 0.50        # rad/s，底盘绕Z轴角速度w的绝对值上限
+  # 17维必须严格对应团队顺序：
+  # [slide, head_yaw, head_pitch, left_arm_joint1..6, left_gripper,
+  #  right_arm_joint1..6, right_gripper]。
+  # slide单位米，head/arm旋转关节单位弧度，gripper使用官方0到1控制量。
+  # 当前具体数值不得视为正式物理限位；尤其六轴臂范围与本机官方MJCF/KDL尚未统一，
+  # 必须在正式Docker确认实际模型、KDL和控制器后再评审，不能仅凭本配置宣称安全。
+  joint_lower:
+    [-0.04, -0.50, -1.18, -3.14, -2.50, -3.14, -2.60, -3.14, -2.60,
+     0.00, -3.14, -2.50, -3.14, -2.60, -3.14, -2.60, 0.00]
+  joint_upper:
+    [0.87, 0.50, 0.16, 3.14, 2.50, 3.14, 2.60, 3.14, 2.60,
+     1.00, 3.14, 2.50, 3.14, 2.60, 3.14, 2.60, 1.00]
+
+recorder:
+  # 普通launch默认不创建Recorder；record_data:=true时launch创建节点并显式覆盖为true。
+  enabled: false
+  # 仅在Recorder节点已经运行时生效；true表示由该节点管理外部ros2 bag子进程。
+  record_rosbag: true
+  # 相对路径由节点进程的当前工作目录解析；安装/launch环境最终落点必须运行确认。
+  root_dir: "./team_sorting_dataset"
+  # EpisodeRecorder生成可读且安全的Episode目录名前缀。
+  episode_prefix: "episode"
+  # rosbag原样保存高带宽传感器、团队遥测和裁判信息；列表必须非空、无重复且以/开头。
+  rosbag_topics:
+    - "/material/instruction"                         # 原始任务消息
+    - "/head_camera/color/image_raw"                 # 原始RGB
+    - "/head_camera/aligned_depth_to_color/image_raw" # 与RGB对齐的原始Depth
+    - "/head_camera/color/camera_info"               # 相机内参
+    - "/slamware_ros_sdk_server_node/odom"           # 底盘实际Odom
+    - "/joint_states"                                # 机器人实际关节反馈
+    - "/team/object_estimates"                       # 团队三维目标估计
+    - "/team/fsm_status"                             # FSM阶段遥测
+    - "/team/final_action"                           # ActionMux唯一最终动作遥测
+    - "/referee/taskinfo"                            # 裁判任务信息
+    - "/referee/gameinfo"                            # 裁判比赛状态
+    - "/referee/score"                               # 裁判分数
+
+# 把官方JointState.name映射到团队JOINT_NAMES；键和值都必须是字符串。
+# 空映射表示名称必须已经逐项完全一致，应在正式环境用ros2 topic echo /joint_states确认，
+# 不能根据猜测填写别名。
+joint_aliases: {}
