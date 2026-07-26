@@ -1,15 +1,15 @@
 """视觉1负责的二维感知单元测试与安全回归测试。
 
 测试模块：``perception_2d.py`` 中的 ``OfficialYoloAdapter``、二维检测转换与
-``Detection2DStabilizer`` 占位接口。测试使用轻量 ``_FakeImage``、fake backend、
+``Detection2DStabilizer`` 多帧稳定器。测试使用轻量 ``_FakeImage``、fake backend、
 ``MagicMock``、临时目录和导入 patch；不加载真实 YOLO 权重，也不需要官方比赛环境。
 运行 ``detect`` 的用例仍需要项目正常依赖中的 NumPy，缺少依赖时只报告环境问题，
 测试不会自动安装软件。
 
 测试通过能够证明：在 fake 依赖下，置信度与检测字段校验、官方候选路径搜索、
-中心宽高到 ``bbox_xyxy`` 的转换、类别与边界过滤，以及尚未实现接口的失败方式符合
-当前约定。测试通过不能证明：真实 YOLO 精度、真实权重和官方后端兼容性、相机时间
-同步、三维定位、ROS2 接线、机器人实际抓取或比赛端到端成功。
+中心宽高到 ``bbox_xyxy`` 的转换、类别与边界过滤，以及多帧关联、确认、平滑、丢失
+和时间戳策略符合当前约定。测试通过不能证明：真实 YOLO 精度、真实权重和官方后端
+兼容性、相机时间同步、三维定位、ROS2 接线、机器人实际抓取或比赛端到端成功。
 
 pytest 入门：``test_`` 开头的函数是测试用例；``assert`` 表示必须满足的条件；
 ``pytest.raises`` 表示预期必须抛出异常；``parametrize`` 用多组输入重复验证同一规则；
@@ -30,7 +30,7 @@ mock 还能记录函数是否按约定被调用。测试函数只用于验证代
   5. 未知类别、低置信度和非法数值过滤
   6. BBOX 越界裁剪与后端输出契约
   7. 模型未加载时 detect 清晰失败
-  8. Detection2DStabilizer 仍明确抛出 NotImplementedError
+  8. Detection2DStabilizer 的参数、关联、确认、平滑、丢失、时序与 reset
 """
 
 from __future__ import annotations
@@ -127,6 +127,25 @@ def _make_detection_dict(
 ) -> dict[str, Any]:
     """构造一个符合官方字典格式的单条检测结果。"""
     return {"class": class_id, "x": x, "y": y, "w": w, "h": h, "conf": conf}
+
+
+def _make_detection(
+    class_id: str = "pink",
+    bbox_xyxy: tuple[float, float, float, float] = (10.0, 20.0, 30.0, 40.0),
+    confidence: float = 0.8,
+    timestamp_ns: int = 100,
+    valid: bool = True,
+) -> Detection2D:
+    """构造稳定器输入；测试可显式覆盖字段来验证防御性过滤。"""
+
+    return Detection2D(
+        class_id=class_id,
+        bbox_xyxy=bbox_xyxy,
+        confidence=confidence,
+        timestamp_ns=timestamp_ns,
+        valid=valid,
+        failure_reason="" if valid else "上游检测无效",
+    )
 
 
 # 少量测试会访问 ``_searched``、``_backend`` 或 ``_resolve_checkpoint``。它们用于
@@ -447,25 +466,404 @@ def test_detect_without_self_check_raises() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Detection2DStabilizer 临时未实现约束
+# Detection2DStabilizer 参数与真实行为
 # ---------------------------------------------------------------------------
 
-# 当前作用：防止尚未实现的多帧算法返回空值、零值或伪成功。
-# 替换条件：``update`` 真正实现时，必须在同一提交中把本组占位测试替换为行为测试；
-# 生产方法仍未实现时不得删除。未来至少覆盖相邻帧关联、遮挡恢复、丢失删除和置信度稳定。
+@pytest.mark.parametrize(
+    ("parameter_name", "bad_value"),
+    [
+        ("iou_match_threshold", True),
+        ("iou_match_threshold", "0.5"),
+        ("iou_match_threshold", float("nan")),
+        ("iou_match_threshold", float("inf")),
+        ("iou_match_threshold", float("-inf")),
+        ("iou_match_threshold", -0.1),
+        ("iou_match_threshold", 1.1),
+        ("iou_match_threshold", 10**400),
+        ("bbox_smoothing_alpha", False),
+        ("bbox_smoothing_alpha", "0.5"),
+        ("bbox_smoothing_alpha", float("nan")),
+        ("bbox_smoothing_alpha", float("inf")),
+        ("bbox_smoothing_alpha", -0.1),
+        ("bbox_smoothing_alpha", 1.1),
+        ("confidence_smoothing_alpha", True),
+        ("confidence_smoothing_alpha", "0.5"),
+        ("confidence_smoothing_alpha", float("nan")),
+        ("confidence_smoothing_alpha", float("-inf")),
+        ("confidence_smoothing_alpha", -0.1),
+        ("confidence_smoothing_alpha", 1.1),
+    ],
+)
+def test_stabilizer_rejects_invalid_float_parameters(
+    parameter_name: str, bad_value: object
+) -> None:
+    """IoU 和 EMA 参数必须拒绝 bool、非数值、NaN/Inf 与越界值。"""
+
+    with pytest.raises(ValueError):
+        Detection2DStabilizer(**{parameter_name: bad_value})  # type: ignore[arg-type]
 
 
-def test_stabilizer_update_raises_not_implemented() -> None:
-    """Detection2DStabilizer.update 应明确抛出 NotImplementedError。"""
+@pytest.mark.parametrize(
+    ("parameter_name", "bad_value"),
+    [
+        ("min_confirmed_hits", True),
+        ("min_confirmed_hits", 0),
+        ("min_confirmed_hits", -1),
+        ("min_confirmed_hits", 2.0),
+        ("min_confirmed_hits", float("nan")),
+        ("min_confirmed_hits", float("inf")),
+        ("max_missed_frames", False),
+        ("max_missed_frames", -1),
+        ("max_missed_frames", 2.0),
+        ("max_missed_frames", float("nan")),
+        ("max_missed_frames", float("-inf")),
+    ],
+)
+def test_stabilizer_rejects_invalid_frame_count_parameters(
+    parameter_name: str, bad_value: object
+) -> None:
+    """确认与丢失帧数必须是真正的正整数/非负整数。"""
+
+    with pytest.raises(ValueError):
+        Detection2DStabilizer(**{parameter_name: bad_value})  # type: ignore[arg-type]
+
+
+def test_stabilizer_accepts_parameter_boundaries() -> None:
+    """IoU/alpha 的 0 和 1、min_hits=1、max_missed=0 均有明确语义。"""
+
+    stabilizer = Detection2DStabilizer(
+        iou_match_threshold=0.0,
+        min_confirmed_hits=1,
+        max_missed_frames=0,
+        bbox_smoothing_alpha=0.0,
+        confidence_smoothing_alpha=1.0,
+    )
+    result = stabilizer.update((_make_detection(),))
+    assert isinstance(result, tuple)
+    assert len(result) == 1
+
+    Detection2DStabilizer(
+        iou_match_threshold=1.0,
+        bbox_smoothing_alpha=1.0,
+        confidence_smoothing_alpha=0.0,
+    )
+
+
+def test_stabilizer_requires_consecutive_confirmation_and_preserves_contract() -> None:
+    """默认首帧只建候选，第二个相似新帧才输出新的公共 Detection2D。"""
+
     stabilizer = Detection2DStabilizer()
-    with pytest.raises(NotImplementedError, match="视觉1"):
-        stabilizer.update(())
+    first = _make_detection(timestamp_ns=100)
+    second = _make_detection(
+        bbox_xyxy=(12.0, 20.0, 32.0, 40.0),
+        confidence=0.6,
+        timestamp_ns=200,
+    )
+
+    assert stabilizer.update((first,)) == ()
+    result = stabilizer.update((second,))
+
+    assert isinstance(result, tuple)
+    assert len(result) == 1
+    output = result[0]
+    assert isinstance(output, Detection2D)
+    assert output is not second
+    assert output.class_id == "pink"
+    assert output.timestamp_ns == 200
+    assert output.valid is True
+    assert output.failure_reason == ""
 
 
-def test_stabilizer_docstring_has_todo_hints() -> None:
-    """docstring 中应包含对视觉1负责人的明确提示。"""
-    doc = Detection2DStabilizer.__doc__ or ""
-    assert "视觉1" in doc, "docstring 应注明由视觉1负责人实现"
+def test_stabilizer_smooths_bbox_and_confidence_with_ema() -> None:
+    """EMA 的 alpha 权重施加到当前检测，结果位于旧值与新值之间。"""
+
+    stabilizer = Detection2DStabilizer(
+        bbox_smoothing_alpha=0.25,
+        confidence_smoothing_alpha=0.25,
+    )
+    first_bbox = (10.0, 20.0, 30.0, 40.0)
+    second_bbox = (14.0, 24.0, 34.0, 44.0)
+    assert stabilizer.update(
+        (_make_detection(bbox_xyxy=first_bbox, confidence=0.8, timestamp_ns=100),)
+    ) == ()
+
+    output = stabilizer.update(
+        (_make_detection(bbox_xyxy=second_bbox, confidence=0.4, timestamp_ns=200),)
+    )[0]
+
+    assert output.bbox_xyxy == pytest.approx((11.0, 21.0, 31.0, 41.0))
+    assert output.bbox_xyxy != first_bbox
+    assert output.bbox_xyxy != second_bbox
+    assert output.bbox_xyxy[2] > output.bbox_xyxy[0]
+    assert output.bbox_xyxy[3] > output.bbox_xyxy[1]
+    assert output.confidence == pytest.approx(0.7)
+    assert 0.0 <= output.confidence <= 1.0
+
+
+def test_stabilizer_isolated_detection_expires_and_must_reconfirm() -> None:
+    """单帧误检从不输出，超过丢失上限后同位置目标也按新轨迹确认。"""
+
+    stabilizer = Detection2DStabilizer(max_missed_frames=1)
+    assert stabilizer.update((_make_detection(timestamp_ns=100),)) == ()
+    assert stabilizer.update(()) == ()
+    assert stabilizer.update(()) == ()
+
+    assert stabilizer.update((_make_detection(timestamp_ns=200),)) == ()
+    result = stabilizer.update((_make_detection(timestamp_ns=300),))
+    assert len(result) == 1
+    assert result[0].timestamp_ns == 300
+
+
+def test_stabilizer_unconfirmed_hits_must_be_consecutive() -> None:
+    """候选轨迹发生一次 miss 后不能用此前命中数凑够确认阈值。"""
+
+    stabilizer = Detection2DStabilizer(
+        min_confirmed_hits=3,
+        max_missed_frames=2,
+    )
+    assert stabilizer.update((_make_detection(timestamp_ns=100),)) == ()
+    assert stabilizer.update(()) == ()
+    assert stabilizer.update((_make_detection(timestamp_ns=200),)) == ()
+    assert stabilizer.update((_make_detection(timestamp_ns=300),)) == ()
+    assert len(stabilizer.update((_make_detection(timestamp_ns=400),))) == 1
+
+
+def test_stabilizer_empty_frame_and_short_loss_do_not_emit_stale_detection() -> None:
+    """已确认轨迹可内部跨越丢失上限内的空帧，但空帧本身绝不重复旧输出。"""
+
+    stabilizer = Detection2DStabilizer(max_missed_frames=2)
+    assert stabilizer.update((_make_detection(timestamp_ns=100),)) == ()
+    assert len(stabilizer.update((_make_detection(timestamp_ns=200),))) == 1
+
+    assert stabilizer.update(()) == ()
+    assert stabilizer.update(()) == ()
+    recovered = stabilizer.update((_make_detection(timestamp_ns=300),))
+
+    assert len(recovered) == 1
+    assert recovered[0].timestamp_ns == 300
+
+
+def test_stabilizer_confirmed_track_expires_after_miss_limit() -> None:
+    """已确认轨迹超过丢失上限也必须删除，重现后重新完成确认。"""
+
+    stabilizer = Detection2DStabilizer(max_missed_frames=1)
+    assert stabilizer.update((_make_detection(timestamp_ns=100),)) == ()
+    assert len(stabilizer.update((_make_detection(timestamp_ns=200),))) == 1
+    assert stabilizer.update(()) == ()
+    assert stabilizer.update(()) == ()
+
+    assert stabilizer.update((_make_detection(timestamp_ns=300),)) == ()
+    result = stabilizer.update((_make_detection(timestamp_ns=400),))
+    assert len(result) == 1
+    assert result[0].timestamp_ns == 400
+
+
+def test_stabilizer_does_not_match_across_classes() -> None:
+    """相同 bbox 也不能让 yellow 检测确认 pink 轨迹。"""
+
+    stabilizer = Detection2DStabilizer()
+    assert stabilizer.update((_make_detection(class_id="pink", timestamp_ns=100),)) == ()
+    assert (
+        stabilizer.update((_make_detection(class_id="yellow", timestamp_ns=200),))
+        == ()
+    )
+    result = stabilizer.update(
+        (_make_detection(class_id="yellow", timestamp_ns=300),)
+    )
+    assert [item.class_id for item in result] == ["yellow"]
+
+
+def test_stabilizer_tracks_three_classes_and_sorts_output_deterministically() -> None:
+    """三类可同时确认，输出类别顺序只用于确定性而非任务执行顺序。"""
+
+    stabilizer = Detection2DStabilizer()
+    first_frame = (
+        _make_detection("brown", (80.0, 10.0, 100.0, 30.0), timestamp_ns=100),
+        _make_detection("pink", (10.0, 10.0, 30.0, 30.0), timestamp_ns=100),
+        _make_detection("yellow", (45.0, 10.0, 65.0, 30.0), timestamp_ns=100),
+    )
+    second_frame = (
+        _make_detection("yellow", (46.0, 10.0, 66.0, 30.0), timestamp_ns=200),
+        _make_detection("brown", (81.0, 10.0, 101.0, 30.0), timestamp_ns=200),
+        _make_detection("pink", (11.0, 10.0, 31.0, 30.0), timestamp_ns=200),
+    )
+
+    assert stabilizer.update(first_frame) == ()
+    result = stabilizer.update(second_frame)
+    assert [item.class_id for item in result] == ["pink", "yellow", "brown"]
+
+
+def test_stabilizer_keeps_far_same_class_targets_separate() -> None:
+    """同类左右两个远框应建立并确认两条轨迹，且按左上角排序。"""
+
+    stabilizer = Detection2DStabilizer(iou_match_threshold=0.2)
+    first_frame = (
+        _make_detection(bbox_xyxy=(100.0, 0.0, 120.0, 20.0), timestamp_ns=100),
+        _make_detection(bbox_xyxy=(0.0, 0.0, 20.0, 20.0), timestamp_ns=100),
+    )
+    second_frame = (
+        _make_detection(bbox_xyxy=(1.0, 0.0, 21.0, 20.0), timestamp_ns=200),
+        _make_detection(bbox_xyxy=(99.0, 0.0, 119.0, 20.0), timestamp_ns=200),
+    )
+
+    assert stabilizer.update(first_frame) == ()
+    result = stabilizer.update(second_frame)
+    assert len(result) == 2
+    assert result[0].bbox_xyxy[0] < result[1].bbox_xyxy[0]
+    assert result[0].bbox_xyxy[2] < 30.0
+    assert result[1].bbox_xyxy[0] > 90.0
+
+
+def test_stabilizer_matches_each_detection_to_at_most_one_track() -> None:
+    """一个同时覆盖两条同类轨迹的框，本帧也只能更新并输出其中一条。"""
+
+    stabilizer = Detection2DStabilizer(iou_match_threshold=0.3)
+    two_targets_100 = (
+        _make_detection(bbox_xyxy=(0.0, 0.0, 10.0, 10.0), timestamp_ns=100),
+        _make_detection(bbox_xyxy=(4.0, 0.0, 14.0, 10.0), timestamp_ns=100),
+    )
+    two_targets_200 = (
+        _make_detection(bbox_xyxy=(0.0, 0.0, 10.0, 10.0), timestamp_ns=200),
+        _make_detection(bbox_xyxy=(4.0, 0.0, 14.0, 10.0), timestamp_ns=200),
+    )
+    assert stabilizer.update(two_targets_100) == ()
+    assert len(stabilizer.update(two_targets_200)) == 2
+
+    bridge = _make_detection(
+        bbox_xyxy=(2.0, 0.0, 12.0, 10.0),
+        timestamp_ns=300,
+    )
+    assert len(stabilizer.update((bridge,))) == 1
+
+
+def test_stabilizer_zero_iou_never_matches_even_with_zero_threshold() -> None:
+    """阈值为 0 也不能把完全不相交的同类目标合并成一条轨迹。"""
+
+    stabilizer = Detection2DStabilizer(iou_match_threshold=0.0)
+    assert stabilizer.update(
+        (_make_detection(bbox_xyxy=(0.0, 0.0, 10.0, 10.0), timestamp_ns=100),)
+    ) == ()
+    assert stabilizer.update(
+        (_make_detection(bbox_xyxy=(100.0, 0.0, 110.0, 10.0), timestamp_ns=200),)
+    ) == ()
+    result = stabilizer.update(
+        (_make_detection(bbox_xyxy=(101.0, 0.0, 111.0, 10.0), timestamp_ns=300),)
+    )
+    assert len(result) == 1
+    assert result[0].bbox_xyxy[0] > 100.0
+
+
+def test_stabilizer_rejects_positive_iou_below_configured_threshold() -> None:
+    """有少量重叠也必须达到配置阈值，不能仅凭 IoU 为正就关联。"""
+
+    stabilizer = Detection2DStabilizer(iou_match_threshold=0.5)
+    assert stabilizer.update(
+        (_make_detection(bbox_xyxy=(0.0, 0.0, 10.0, 10.0), timestamp_ns=100),)
+    ) == ()
+    assert stabilizer.update(
+        (_make_detection(bbox_xyxy=(6.0, 0.0, 16.0, 10.0), timestamp_ns=200),)
+    ) == ()
+    result = stabilizer.update(
+        (_make_detection(bbox_xyxy=(7.0, 0.0, 17.0, 10.0), timestamp_ns=300),)
+    )
+    assert len(result) == 1
+    assert result[0].bbox_xyxy[0] > 6.0
+
+
+def test_stabilizer_rejects_out_of_order_and_duplicate_timestamps_transactionally() -> None:
+    """旧帧和重复帧不做 EMA、不增加 miss，也不能被重复计为确认命中。"""
+
+    stabilizer = Detection2DStabilizer(
+        max_missed_frames=0,
+        bbox_smoothing_alpha=0.5,
+    )
+    first = _make_detection(
+        bbox_xyxy=(0.0, 0.0, 10.0, 10.0),
+        timestamp_ns=100,
+    )
+    assert stabilizer.update((first,)) == ()
+    assert stabilizer.update((first,)) == ()
+    second = stabilizer.update(
+        (_make_detection(bbox_xyxy=(2.0, 0.0, 12.0, 10.0), timestamp_ns=200),)
+    )
+    assert second[0].bbox_xyxy == pytest.approx((1.0, 0.0, 11.0, 10.0))
+
+    assert stabilizer.update(
+        (_make_detection(bbox_xyxy=(4.0, 0.0, 14.0, 10.0), timestamp_ns=150),)
+    ) == ()
+    current = stabilizer.update(
+        (_make_detection(bbox_xyxy=(4.0, 0.0, 14.0, 10.0), timestamp_ns=300),)
+    )
+    assert current[0].bbox_xyxy == pytest.approx((2.5, 0.0, 12.5, 10.0))
+    assert current[0].timestamp_ns == 300
+
+
+def test_stabilizer_reset_clears_tracks_misses_and_timestamp_history() -> None:
+    """reset 后较旧的新时间线也能从首帧重新确认。"""
+
+    stabilizer = Detection2DStabilizer()
+    assert stabilizer.update((_make_detection(timestamp_ns=1_000),)) == ()
+    assert len(stabilizer.update((_make_detection(timestamp_ns=2_000),))) == 1
+    assert stabilizer.update(()) == ()
+
+    stabilizer.reset()
+
+    assert stabilizer.update((_make_detection(timestamp_ns=10),)) == ()
+    result = stabilizer.update((_make_detection(timestamp_ns=20),))
+    assert len(result) == 1
+    assert result[0].timestamp_ns == 20
+
+
+def test_stabilizer_ignores_invalid_detections_without_poisoning_valid_target() -> None:
+    """同帧坏项（含更大时间戳）不能建轨、更新轨迹或阻止合法目标确认。"""
+
+    invalid = (
+        _make_detection(valid=False, timestamp_ns=900_000),
+        _make_detection(class_id="", timestamp_ns=900_001),
+        _make_detection(class_id="blue", timestamp_ns=900_002),
+        _make_detection(
+            bbox_xyxy=(float("nan"), 0.0, 10.0, 10.0),
+            timestamp_ns=900_003,
+        ),
+        _make_detection(
+            bbox_xyxy=(0.0, 0.0, float("inf"), 10.0),
+            timestamp_ns=900_004,
+        ),
+        _make_detection(
+            bbox_xyxy=(0.0, 0.0, 10**400, 10.0),  # type: ignore[arg-type]
+            timestamp_ns=900_004,
+        ),
+        _make_detection(bbox_xyxy=(10.0, 0.0, 0.0, 10.0), timestamp_ns=900_005),
+        _make_detection(confidence=float("nan"), timestamp_ns=900_006),
+        _make_detection(confidence=float("inf"), timestamp_ns=900_007),
+        _make_detection(confidence=-0.1, timestamp_ns=900_008),
+        _make_detection(confidence=1.1, timestamp_ns=900_009),
+        _make_detection(timestamp_ns=True),  # type: ignore[arg-type]
+        _make_detection(timestamp_ns=-1),
+        _make_detection(timestamp_ns=1.5),  # type: ignore[arg-type]
+    )
+    stabilizer = Detection2DStabilizer()
+
+    assert stabilizer.update(
+        (_make_detection(timestamp_ns=100), *invalid)
+    ) == ()
+    result = stabilizer.update(
+        (_make_detection(timestamp_ns=200), *reversed(invalid))
+    )
+
+    assert len(result) == 1
+    assert result[0].class_id == "pink"
+    assert result[0].timestamp_ns == 200
+
+
+def test_stabilizer_instances_do_not_share_track_history() -> None:
+    """两个稳定器对象各自维护轨迹，第二个实例不能继承第一个的确认状态。"""
+
+    first = Detection2DStabilizer()
+    second = Detection2DStabilizer()
+    assert first.update((_make_detection(timestamp_ns=100),)) == ()
+    assert len(first.update((_make_detection(timestamp_ns=200),))) == 1
+    assert second.update((_make_detection(timestamp_ns=100),)) == ()
 
 
 # ---------------------------------------------------------------------------
