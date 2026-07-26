@@ -15,16 +15,17 @@ RGBFrame（ROS 消息转换后的彩色帧）
   → 原始字典检测（每个 dict 含 class/x/y/w/h/conf，中心宽高格式）
   → 合法性检查（类别过滤、置信度阈值、NaN/Inf 拒绝、宽高正数检查、越界裁剪）
   → Detection2D（团队统一二维框，bbox_xyxy 为 RGB 像素坐标）
-  → 后续多帧稳定（Detection2DStabilizer，由视觉1负责人实现）
+  → 可供后续 ROS 薄接线调用的多帧稳定器（当前尚未接入 PerceptionNode）
   → perception_3d（结合深度和内参做三维反投影）
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 import importlib
 import math
-from numbers import Real
+from numbers import Integral, Real
 import os
 from pathlib import Path
 import sys
@@ -382,40 +383,373 @@ class OfficialYoloAdapter:
         return None
 
 
+@dataclass
+class _DetectionTrack:
+    """稳定器实例内部的可变轨迹；该类型不会跨公共接口暴露。"""
+
+    track_id: int
+    class_id: str
+    bbox_xyxy: tuple[float, float, float, float]
+    confidence: float
+    last_timestamp_ns: int
+    hit_count: int
+    missed_frames: int
+    confirmed: bool
+
+
+def _validated_unit_interval(value: Any, name: str) -> float:
+    """校验 0～1 的有限实数，同时拒绝 Python 中属于整数子类的 bool。"""
+
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"{name} 必须是 0 到 1 的有限数值，不能使用 bool 或其他类型")
+    try:
+        result = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{name} 必须能安全转换为有限浮点数") from exc
+    if not math.isfinite(result) or not 0.0 <= result <= 1.0:
+        raise ValueError(f"{name} 必须位于 0 到 1，实际值={result!r}")
+    return result
+
+
+def _validated_frame_count(value: Any, name: str, *, allow_zero: bool) -> int:
+    """校验帧数参数，不把 True/False 当作 1/0 接受。"""
+
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        qualifier = "非负" if allow_zero else "正"
+        raise ValueError(f"{name} 必须是{qualifier}整数，不能使用 bool 或其他类型")
+    result = int(value)
+    if result < 0 or (not allow_zero and result == 0):
+        qualifier = "非负" if allow_zero else "正"
+        raise ValueError(f"{name} 必须是{qualifier}整数，实际值={result}")
+    return result
+
+
+def _detection_timestamp(value: Any) -> Optional[int]:
+    """返回合法的非负纳秒时间；非法时间不参与帧时序判断。"""
+
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        return None
+    result = int(value)
+    return result if result >= 0 else None
+
+
+def _normalized_detection(detection: Any) -> Optional[Detection2D]:
+    """把一条合法检测复制为规范浮点值；单条坏数据不会破坏同帧其他检测。"""
+
+    if not isinstance(detection, Detection2D) or detection.valid is not True:
+        return None
+    if (
+        not isinstance(detection.class_id, str)
+        or not detection.class_id
+        or detection.class_id not in OfficialYoloAdapter.CLASS_NAMES
+    ):
+        return None
+    timestamp_ns = _detection_timestamp(detection.timestamp_ns)
+    if timestamp_ns is None:
+        return None
+
+    bbox = detection.bbox_xyxy
+    if isinstance(bbox, (str, bytes)):
+        return None
+    try:
+        bbox_items = tuple(bbox)
+    except TypeError:
+        return None
+    if len(bbox_items) != 4:
+        return None
+    if any(isinstance(value, bool) or not isinstance(value, Real) for value in bbox_items):
+        return None
+    try:
+        bbox_xyxy = tuple(float(value) for value in bbox_items)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not all(math.isfinite(value) for value in bbox_xyxy):
+        return None
+    x0, y0, x1, y1 = bbox_xyxy
+    if x1 <= x0 or y1 <= y0:
+        return None
+
+    confidence_value = detection.confidence
+    if isinstance(confidence_value, bool) or not isinstance(confidence_value, Real):
+        return None
+    try:
+        confidence = float(confidence_value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
+        return None
+
+    # 输入 dataclass 是不可变对象；复制后只把规范值写入私有轨迹，绝不修改上游对象。
+    return Detection2D(
+        class_id=detection.class_id,
+        bbox_xyxy=(x0, y0, x1, y1),
+        confidence=confidence,
+        timestamp_ns=timestamp_ns,
+    )
+
+
+def _bbox_iou(
+    first: tuple[float, float, float, float],
+    second: tuple[float, float, float, float],
+) -> float:
+    """计算两个合法 xyxy 像素框的交并比。"""
+
+    left = max(first[0], second[0])
+    top = max(first[1], second[1])
+    right = min(first[2], second[2])
+    bottom = min(first[3], second[3])
+    intersection = max(0.0, right - left) * max(0.0, bottom - top)
+    first_area = (first[2] - first[0]) * (first[3] - first[1])
+    second_area = (second[2] - second[0]) * (second[3] - second[1])
+    union = first_area + second_area - intersection
+    if (
+        not all(
+            math.isfinite(value)
+            for value in (intersection, first_area, second_area, union)
+        )
+        or union <= 0.0
+    ):
+        return 0.0
+    score = intersection / union
+    return score if math.isfinite(score) else 0.0
+
+
 class Detection2DStabilizer:
-    """二维检测多帧稳定器的接口骨架。
+    """轻量、确定的二维多目标多帧稳定器。
 
-    本类由 **视觉1负责人** 实现完整的多帧跟踪与滤波算法。
-    当前仅提供接口定义和 ``NotImplementedError`` 占位，确保上下游可以提前接入。
+    每次 ``update`` 视为处理一帧检测：只允许同类别轨迹按 IoU 做贪心一对一关联；
+    新轨迹连续命中 ``min_confirmed_hits`` 次后才输出，匹配框和置信度分别使用 EMA
+    平滑。当前帧未匹配的轨迹只保留在实例内部，超过 ``max_missed_frames`` 后删除，
+    丢失帧不会重复输出旧检测。
 
-    输入：
-      - ``detections``：当前帧的 ``Detection2D`` 元组，bbox 为 RGB 像素坐标
+    非空输入中，合法检测应来自同一 RGB 帧并具有同一纳秒时间戳；防御性处理混合
+    时间戳时只采用其中最新的合法检测组。该时间戳若不严格晚于最近已处理的非空帧，
+    整次更新会被视为乱序/重复帧：不修改轨迹、不增加丢失计数并返回空元组。空输入
+    没有可用时间戳，因此只增加丢失计数，不修改最近处理时间。
 
-    输出：
-      - 仍使用同一公共契约的稳定 ``Detection2D`` 元组，不新增私有输出格式
-
-    状态：
-      - 实现时可维护有限时间窗口内的检测历史；具体关联和滤波策略由视觉1评审确定
-
-    建议测试项（视觉1实现后请补充到 tests/test_perception_2d.py）：
-      - 连续相似检测能够稳定输出，孤立误检能够被过滤
-      - 空帧和短时丢失按确定策略处理，过期历史不会永久保留
-      - 时间戳、类别和 bbox 坐标语义保持不变
-
-    坐标系/单位：bbox 为像素，时间为纳秒。
-    失败：第一版算法尚未实现，调用 ``update`` 会抛出中文 ``NotImplementedError``。
+    输入和输出均为 ``tuple[Detection2D, ...]``，bbox 始终是 RGB 像素坐标
+    ``(x0,y0,x1,y1)``。内部轨迹编号不会写入公共字段。调用 ``reset`` 可恢复到刚
+    构造的状态。
     """
 
-    def update(self, detections: tuple[Detection2D, ...]) -> tuple[Detection2D, ...]:
-        """对一帧二维检测执行多帧稳定。
+    def __init__(
+        self,
+        iou_match_threshold: float = 0.3,
+        min_confirmed_hits: int = 2,
+        max_missed_frames: int = 2,
+        bbox_smoothing_alpha: float = 0.5,
+        confidence_smoothing_alpha: float = 0.5,
+    ) -> None:
+        """保存稳定策略参数并创建实例私有轨迹状态。
 
-        参数：当前帧像素坐标检测；返回稳定检测元组。
-        失败：第一版尚未确定跟踪和滤波策略，当前明确抛出 ``NotImplementedError``。
+        IoU 和两个 EMA alpha 均为 0～1 的有限数；确认帧数必须为正整数，最大丢失
+        帧数必须为非负整数。所有参数都显式拒绝 bool、NaN、Inf 和越界值。
         """
 
-        raise NotImplementedError(
-            "二维多帧稳定算法尚未实现，请由视觉1负责人完成。"
-            "入参：当前帧 Detection2D 元组；"
-            "出参：稳定后的 Detection2D 元组；"
-            "具体跟踪和滤波策略需另行评审并补充测试。"
+        self.iou_match_threshold = _validated_unit_interval(
+            iou_match_threshold, "iou_match_threshold"
         )
+        self.min_confirmed_hits = _validated_frame_count(
+            min_confirmed_hits, "min_confirmed_hits", allow_zero=False
+        )
+        self.max_missed_frames = _validated_frame_count(
+            max_missed_frames, "max_missed_frames", allow_zero=True
+        )
+        self.bbox_smoothing_alpha = _validated_unit_interval(
+            bbox_smoothing_alpha, "bbox_smoothing_alpha"
+        )
+        self.confidence_smoothing_alpha = _validated_unit_interval(
+            confidence_smoothing_alpha, "confidence_smoothing_alpha"
+        )
+        self._tracks: dict[int, _DetectionTrack] = {}
+        self._next_track_id = 0
+        self._last_timestamp_ns: Optional[int] = None
+
+    def reset(self) -> None:
+        """清空轨迹、编号和最近时间戳，恢复到刚构造后的状态。"""
+
+        self._tracks.clear()
+        self._next_track_id = 0
+        self._last_timestamp_ns = None
+
+    def update(self, detections: tuple[Detection2D, ...]) -> tuple[Detection2D, ...]:
+        """关联并平滑当前帧检测，只返回本帧实际匹配且已确认的目标。
+
+        无效检测会逐条忽略。空帧会让现有轨迹增加一次丢失，但返回空元组；乱序或
+        重复的非空帧则完全不改变状态。输出时间戳始终来自本帧实际检测，不做平均。
+        """
+
+        normalized = tuple(
+            item
+            for detection in detections
+            if (item := _normalized_detection(detection)) is not None
+        )
+
+        if normalized:
+            # OfficialYoloAdapter 会给同帧所有框相同时间；若上游违反该约定，只处理
+            # 最新一组，避免较旧检测让某条轨迹的时间倒退。
+            frame_timestamp_ns = max(item.timestamp_ns for item in normalized)
+            current = tuple(
+                item for item in normalized if item.timestamp_ns == frame_timestamp_ns
+            )
+        else:
+            # 即使检测的类别、框或置信度无效，只要它携带合法帧时间，就仍可判断这
+            # 是否是一帧陈旧输入；完全空帧则没有时间依据。
+            timestamps = tuple(
+                timestamp
+                for detection in detections
+                if isinstance(detection, Detection2D)
+                and (timestamp := _detection_timestamp(detection.timestamp_ns)) is not None
+            )
+            if not timestamps:
+                self._mark_tracks_missed(set(self._tracks))
+                return ()
+            frame_timestamp_ns = max(timestamps)
+            current = ()
+
+        if (
+            self._last_timestamp_ns is not None
+            and frame_timestamp_ns <= self._last_timestamp_ns
+        ):
+            return ()
+        self._last_timestamp_ns = frame_timestamp_ns
+
+        # 先按类别和几何排序，避免后端输出顺序影响相同输入集合的关联结果。
+        class_order = {
+            class_id: index
+            for index, class_id in enumerate(OfficialYoloAdapter.CLASS_NAMES)
+        }
+        ordered = tuple(
+            sorted(
+                current,
+                key=lambda item: (
+                    class_order[item.class_id],
+                    *item.bbox_xyxy,
+                    item.confidence,
+                ),
+            )
+        )
+
+        candidates: list[tuple[float, int, int]] = []
+        for track_id, track in self._tracks.items():
+            for detection_index, detection in enumerate(ordered):
+                if track.class_id != detection.class_id:
+                    continue
+                score = _bbox_iou(track.bbox_xyxy, detection.bbox_xyxy)
+                # 即使调用者把阈值设为 0，也不能把完全无重叠的远目标合并。
+                if score > 0.0 and score >= self.iou_match_threshold:
+                    candidates.append((score, track_id, detection_index))
+
+        # 分数高者优先；相同分数按稳定的轨迹编号和规范检测顺序打破平局。
+        candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
+        matched_track_ids: set[int] = set()
+        matched_detection_indices: set[int] = set()
+        for _, track_id, detection_index in candidates:
+            if (
+                track_id in matched_track_ids
+                or detection_index in matched_detection_indices
+            ):
+                continue
+            if not self._update_track(
+                self._tracks[track_id], ordered[detection_index]
+            ):
+                continue
+            matched_track_ids.add(track_id)
+            matched_detection_indices.add(detection_index)
+
+        existing_track_ids = set(self._tracks)
+        self._mark_tracks_missed(existing_track_ids - matched_track_ids)
+
+        for detection_index, detection in enumerate(ordered):
+            if detection_index in matched_detection_indices:
+                continue
+            track = self._create_track(detection)
+            if track.confirmed:
+                matched_track_ids.add(track.track_id)
+
+        outputs = [
+            (
+                track_id,
+                Detection2D(
+                    class_id=track.class_id,
+                    bbox_xyxy=track.bbox_xyxy,
+                    confidence=track.confidence,
+                    timestamp_ns=track.last_timestamp_ns,
+                    valid=True,
+                    failure_reason="",
+                ),
+            )
+            for track_id in matched_track_ids
+            if (track := self._tracks.get(track_id)) is not None and track.confirmed
+        ]
+        outputs.sort(
+            key=lambda pair: (
+                class_order[pair[1].class_id],
+                pair[1].bbox_xyxy[0],
+                pair[1].bbox_xyxy[1],
+                pair[1].bbox_xyxy[2],
+                pair[1].bbox_xyxy[3],
+                pair[0],
+            )
+        )
+        return tuple(item for _, item in outputs)
+
+    def _create_track(self, detection: Detection2D) -> _DetectionTrack:
+        track = _DetectionTrack(
+            track_id=self._next_track_id,
+            class_id=detection.class_id,
+            bbox_xyxy=detection.bbox_xyxy,
+            confidence=detection.confidence,
+            last_timestamp_ns=detection.timestamp_ns,
+            hit_count=1,
+            missed_frames=0,
+            confirmed=self.min_confirmed_hits == 1,
+        )
+        self._tracks[track.track_id] = track
+        self._next_track_id += 1
+        return track
+
+    def _update_track(self, track: _DetectionTrack, detection: Detection2D) -> bool:
+        bbox_alpha = self.bbox_smoothing_alpha
+        smoothed_bbox = tuple(
+            bbox_alpha * current + (1.0 - bbox_alpha) * previous
+            for previous, current in zip(track.bbox_xyxy, detection.bbox_xyxy)
+        )
+        x0, y0, x1, y1 = smoothed_bbox
+        if (
+            not all(math.isfinite(value) for value in smoothed_bbox)
+            or x1 <= x0
+            or y1 <= y0
+        ):
+            # 合法输入框的凸组合理论上仍合法；若浮点异常破坏该不变量，就拒绝更新，
+            # 不能把危险框继续交给三维估计。
+            return False
+
+        confidence_alpha = self.confidence_smoothing_alpha
+        smoothed_confidence = (
+            confidence_alpha * detection.confidence
+            + (1.0 - confidence_alpha) * track.confidence
+        )
+        if not math.isfinite(smoothed_confidence):
+            return False
+
+        track.bbox_xyxy = (x0, y0, x1, y1)
+        track.confidence = min(1.0, max(0.0, smoothed_confidence))
+        track.last_timestamp_ns = detection.timestamp_ns
+        track.hit_count += 1
+        track.missed_frames = 0
+        if track.hit_count >= self.min_confirmed_hits:
+            track.confirmed = True
+        return True
+
+    def _mark_tracks_missed(self, track_ids: set[int]) -> None:
+        for track_id in sorted(track_ids):
+            track = self._tracks.get(track_id)
+            if track is None:
+                continue
+            track.missed_frames += 1
+            # 候选轨迹必须连续命中才能确认；已确认轨迹则保留确认状态以支持短时遮挡。
+            if not track.confirmed:
+                track.hit_count = 0
+            if track.missed_frames > self.max_missed_frames:
+                del self._tracks[track_id]
