@@ -28,6 +28,26 @@ frames:
   # Arm KDL 要求 footprint，修改此值不会自动补出 odom 到 footprint 的坐标变换。
   planning: "odom"
 
+# 全局官方发布门，独立于External Candidate自身的三道门。默认observe-only允许订阅、
+# FSM、ActionMux和团队遥测，但绝不创建五组官方控制publisher。只有显式同时设置
+# observe_only=false、enable_official_publish=true、simulation_only=true才允许创建
+# OfficialCommandPublisher；simulation_only=false在当前阶段启动即拒绝。
+control:
+  observe_only: true
+  enable_official_publish: false
+  simulation_only: true
+  # 仅用于“官方仿真Server与本节点共同全新启动且刚完成reset”的Stage 2A验证。
+  # enabled与fresh_reset_confirmed都必须由运行时临时配置显式开启；默认不建立head
+  # controller-target shadow。初值固定对应官方reset后的绝对controller target，不能
+  # 用/joint_states反馈替代，也不能推广到Server未reset或节点单独重启的场景。
+  head_target_tracking:
+    enabled: false
+    require_fresh_reset: true
+    fresh_reset_confirmed: false
+    initial_yaw_target: 0.0
+    initial_pitch_target: 0.0
+    require_exclusive_writer: true
+
 topics:
   # 任务：官方 Server 发布；TeamClientNode 和 DatasetRecorderNode 订阅。
   instruction: "/material/instruction"

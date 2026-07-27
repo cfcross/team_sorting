@@ -25,6 +25,26 @@ Candidate 也不能绕过现有 `ActionMux -> FinalAction[19] -> OfficialCommand
 链路。当前阶段只完成 consumer 代码与测试，不代表仿真微动已经完成；head-yaw 临时边界
 也不是官方物理限位，正式运动前仍须在官方镜像验证。
 
+External Candidate三道门之外还有独立的全局官方发布门。默认
+`control.observe_only=true`、`control.enable_official_publish=false`、
+`control.simulation_only=true`：节点可以订阅状态、运行FSM和ActionMux，并发布
+`/team/fsm_status`、`/team/final_action`诊断遥测，但不会创建
+`OfficialCommandPublisher`或五组官方控制publisher，退出时也不会发布紧急底盘命令。
+只有显式同时设置`observe_only=false`、`enable_official_publish=true`且
+`simulation_only=true`才会创建官方发布器；observe-only优先关闭发布，
+`simulation_only=false`在当前阶段直接拒绝启动。运行时覆盖应通过
+`TEAM_SORTING_CONFIG`指向一份非持久配置，不能改写仓库默认值。
+
+Stage 2A的head发布还受`control.head_target_tracking`约束。该shadow默认关闭，只能在
+官方仿真Server与本节点共同全新启动、已确认刚完成reset、初始绝对controller target
+严格为`[0.0, 0.0]`且head话题没有其他publisher时临时启用。`/joint_states`是物理反馈，
+不能用于恢复或覆盖未知controller target；yaw-only发布复用shadow中的pitch target，
+而不是回写当前pitch反馈。节点重启、Server未重启、reset身份不确定或出现其他head
+writer时必须重新授权并fail closed。通用安全恢复仍需官方Server暴露controller target。
+无论全局发布门是否开启，当前Stage 2A节点退出都只取消control timer、清空pending并
+销毁ROS实体，不发布cmd_vel或任何关节controller target；JointState反馈不能作为退出
+安全保持目标。`publish_emergency_base_stop()`仅保留给未来明确授权的底盘故障路径。
+
 防重放状态在 Candidate 成功进入单元素 pending 槽时即生效：generation 在此时绑定、
 request ID 在此时记为已使用。即使 Candidate 随后在控制周期因 JointState、delta 或临时
 限位检查失败，这两项状态也不会回退或允许重放；这只是 fail-closed 防重放语义，不表示
@@ -96,7 +116,9 @@ Candidate 已执行、已发布或已被机器人采用。
 ```
 
 图中 Navigation、Arm Planning 和 Arm Execution 表示目标架构。当前 `team_client_node`
-尚未把完整导航与抓放算法接入控制循环；它只生成底盘零速和基于实际关节反馈的保持命令。
+尚未把完整导航与抓放算法接入控制循环；默认只生成底盘零速候选，不生成主动17维关节
+保持候选。ActionMux仍可基于实际反馈形成诊断FinalAction，但observe-only全局门禁止
+将其发布到官方控制话题。
 
 ## 4. 三个 ROS2 节点
 
@@ -122,14 +144,14 @@ ROS 2 节点可以理解为一个独立运行、通过话题交换消息的程�
 
 - **订阅**：`/material/instruction`、`/slamware_ros_sdk_server_node/odom`、
   `/joint_states`、`/team/object_estimates`。
-- **发布**：团队遥测 `/team/fsm_status`、`/team/final_action`，并通过唯一的
-  `OfficialCommandPublisher` 发布五组官方控制话题。
-- **调用**：当前实际调用 `fsm.py`、`action_mux.py`、`arm_execution.py` 的安全保持、
-  `arm_planning.py` 的官方 KDL 启动自检，以及 `navigation.py` 的区域分类；完整架构还应
+- **发布**：团队遥测 `/team/fsm_status`、`/team/final_action`；只有全局发布门开启时，
+  才通过唯一的 `OfficialCommandPublisher` 发布五组官方控制话题。默认不创建该实例。
+- **调用**：当前实际调用 `fsm.py`、`action_mux.py`，并保留 `arm_execution.py` 的显式
+  主动保持能力，以及 `navigation.py` 的区域分类；完整架构还应
   在这里按 FSM 阶段组织导航、抓放规划和执行。
 - **不负责**：YOLO、深度图处理、相机外参算法、KDL 实现或数据落盘。
-- **是否必需**：默认 launch 会启动，也是控制链必需节点；只有它可以经
-  `OfficialCommandPublisher` 发官方控制话题。
+- **是否必需**：默认 launch 会启动；默认只观察和发团队遥测。只有全局发布门明确开启
+  时，它才可以经`OfficialCommandPublisher`发官方控制话题。
 
 `team_client_node` 每个控制周期构造的 `SensorSnapshot` 只含任务、底盘状态、实际关节
 状态和三维目标，**不含 RGB、Depth 或 CameraInfo**。图像留在感知节点和 rosbag，避免
@@ -210,6 +232,10 @@ RobotJointState（实际反馈，用于安全保持）
              v
 OfficialCommandPublisher -> 五组官方控制话题
 ```
+
+`FinalAction`诊断生成与官方发布是两个不同边界。默认observe-only仍执行到ActionMux并
+发布团队遥测，但流程在OfficialCommandPublisher之前终止；External Candidate的开关
+不能替代该全局门。
 
 ### 数据记录流
 
@@ -367,6 +393,13 @@ Episode 级结果，不能复制成每一帧的真值标签。当前仓库只负
 | `timing.control_rate_hz` | `20.0` | 客户端控制周期频率 |
 | `timing.command_ttl_s` | `0.20` | 底盘/机械臂候选命令有效期 |
 | `timing.state_max_delta_s` | `0.15` | 图像或控制时刻可接受的邻近状态最大时间差 |
+| `control.observe_only` | `true` | 最高优先级观察模式；不创建或调用官方发布器 |
+| `control.enable_official_publish` | `false` | 全局官方发布授权，默认关闭 |
+| `control.simulation_only` | `true` | 当前只允许仿真；false时拒绝启动 |
+| `control.head_target_tracking.enabled` | `false` | fresh-reset专用head target shadow总门，默认关闭 |
+| `control.head_target_tracking.fresh_reset_confirmed` | `false` | 运行方对本节点与官方Server共同fresh reset的显式确认 |
+| `control.head_target_tracking.initial_{yaw,pitch}_target` | `0.0` | Stage 2A固定reset controller target，单位rad，不能用JointState代替 |
+| `control.head_target_tracking.require_exclusive_writer` | `true` | 每次head发布前要求ROS graph中只有本节点一个publisher |
 | `perception.sync_slop_s` | `0.05` | RGB/Depth 近似同步容差 |
 | `perception.depth_unit_scale_m` | `0.001` | 深度原始值换算为米的乘数 |
 | `recorder.enabled` | `false` | 默认不启动记录 |
@@ -458,8 +491,10 @@ ros2 launch team_sorting team.launch.xml record_data:=true
 - 业务结果驱动 FSM、底盘与机械臂协同的完整比赛闭环；
 - ACT/VLA 数据处理、训练和推理。
 
-当前 `team_client_node` 在控制周期中只创建零速 `BaseCommand` 和实际关节保持命令；
-“仓库骨架完成”绝不等于“比赛代码完成”。
+当前 `team_client_node` 在默认控制周期中只创建零速 `BaseCommand`，机械臂业务候选为
+`None`；ActionMux基于实际反馈生成诊断FinalAction。默认observe-only不创建官方发布器，
+因此“生成诊断FinalAction”不等于“发送位置保持命令”。`create_hold_command()`仍保留给
+未来明确授权的主动保持场景。“仓库骨架完成”绝不等于“比赛代码完成”。
 
 ### 待确认
 

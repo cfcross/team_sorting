@@ -228,12 +228,50 @@ class OfficialCommandPublisher:
     ``RuntimeError``，本类不重建第二份动作或执行控制算法。
     """
 
-    def __init__(self, node: Any, topics: dict[str, str], ros: Optional[SimpleNamespace] = None) -> None:
+    def __init__(
+        self,
+        node: Any,
+        topics: dict[str, str],
+        ros: Optional[SimpleNamespace] = None,
+        head_target_tracking: Optional[dict[str, Any]] = None,
+    ) -> None:
         self._ros = ros or _load_ros_dependencies(require_vision=False, require_filters=False)
         required = ("cmd_vel", "slide", "head", "left_arm", "right_arm")
         missing = [name for name in required if not topics.get(name)]
         if missing:
             raise RuntimeError(f"官方控制话题配置缺失：{missing}")
+        self._node = node
+        self._head_topic = topics["head"]
+        tracking = head_target_tracking or {
+            "enabled": False,
+            "fresh_reset_confirmed": False,
+            "initial_yaw_target": 0.0,
+            "initial_pitch_target": 0.0,
+            "require_exclusive_writer": True,
+            "yaw_lower": -0.5,
+            "yaw_upper": 0.5,
+            "pitch_lower": -1.18,
+            "pitch_upper": 0.16,
+        }
+        self._head_tracking_enabled = bool(tracking["enabled"])
+        self._require_exclusive_head_writer = bool(
+            tracking["require_exclusive_writer"]
+        )
+        self._head_yaw_bounds = (
+            float(tracking["yaw_lower"]),
+            float(tracking["yaw_upper"]),
+        )
+        self._head_pitch_bounds = (
+            float(tracking["pitch_lower"]),
+            float(tracking["pitch_upper"]),
+        )
+        self.last_head_controller_target: Optional[list[float]] = None
+        if self._head_tracking_enabled and tracking["fresh_reset_confirmed"]:
+            self.last_head_controller_target = [
+                float(tracking["initial_yaw_target"]),
+                float(tracking["initial_pitch_target"]),
+            ]
+        self.last_head_publish_failure_reason = ""
         self._base = node.create_publisher(self._ros.Twist, topics["cmd_vel"], 10)
         self._slide = node.create_publisher(self._ros.Float64MultiArray, topics["slide"], 10)
         self._head = node.create_publisher(self._ros.Float64MultiArray, topics["head"], 10)
@@ -273,8 +311,64 @@ class OfficialCommandPublisher:
         except Exception as exc:  # noqa: BLE001 - ROS 中间件异常统一说明
             raise RuntimeError(f"发布官方控制话题失败：{exc}") from exc
 
+    def head_writer_is_exclusive(self) -> bool:
+        """只在ROS graph确认本节点是head话题唯一publisher时返回真。"""
+
+        try:
+            count = self._node.count_publishers(self._head_topic)
+        except (AttributeError, RuntimeError):
+            return False
+        return type(count) is int and count == 1
+
+    def publish_head(self, action: FinalAction) -> None:
+        """以绝对controller target只发布head分组。
+
+        ``FinalAction[3]``仍是ActionMux验证后的绝对yaw关节目标；pitch不能取
+        ``FinalAction[4]``中的物理反馈保持值，而必须复用fresh-reset作用域内维护的
+        controller target shadow。发布成功后才更新yaw shadow，失败时保持原值。
+        """
+
+        if not action.valid:
+            raise RuntimeError(f"拒绝发布无效 FinalAction：{action.failure_reason}")
+        if not self._head_tracking_enabled:
+            self.last_head_publish_failure_reason = "head_target_tracking_disabled"
+            raise RuntimeError(self.last_head_publish_failure_reason)
+        if self.last_head_controller_target is None:
+            self.last_head_publish_failure_reason = "fresh_reset_not_confirmed"
+            raise RuntimeError(self.last_head_publish_failure_reason)
+        if self._require_exclusive_head_writer and not self.head_writer_is_exclusive():
+            self.last_head_publish_failure_reason = "head_writer_not_exclusive"
+            raise RuntimeError(self.last_head_publish_failure_reason)
+        yaw_target = action.values[3]
+        if isinstance(yaw_target, bool) or not isinstance(yaw_target, (int, float)):
+            self.last_head_publish_failure_reason = "head_yaw_target_invalid"
+            raise RuntimeError(self.last_head_publish_failure_reason)
+        yaw_target = float(yaw_target)
+        if not math.isfinite(yaw_target) or not (
+            self._head_yaw_bounds[0] <= yaw_target <= self._head_yaw_bounds[1]
+        ):
+            self.last_head_publish_failure_reason = "head_yaw_target_out_of_range"
+            raise RuntimeError(self.last_head_publish_failure_reason)
+        pitch_target = self.last_head_controller_target[1]
+        if not math.isfinite(pitch_target) or not (
+            self._head_pitch_bounds[0]
+            <= pitch_target
+            <= self._head_pitch_bounds[1]
+        ):
+            self.last_head_publish_failure_reason = "head_pitch_shadow_invalid"
+            raise RuntimeError(self.last_head_publish_failure_reason)
+        head = self._ros.Float64MultiArray()
+        head.data = [yaw_target, pitch_target]
+        try:
+            self._head.publish(head)
+        except Exception as exc:  # noqa: BLE001 - ROS 中间件异常统一说明
+            self.last_head_publish_failure_reason = "head_publish_failed"
+            raise RuntimeError(f"发布官方head控制话题失败：{exc}") from exc
+        self.last_head_controller_target[0] = yaw_target
+        self.last_head_publish_failure_reason = ""
+
     def publish_emergency_base_stop(self) -> None:
-        """仅在状态失联或节点退出时尽力发布底盘零速度。
+        """仅在未来明确授权的底盘控制故障路径尽力发布零速度。
 
         正常控制仍必须经过 ActionMux 和完整 ``FinalAction``。当可靠 JointState 已经
         不可用时，不能伪造 17 维全零关节目标；这个窄接口只停止底盘，不发布机械臂
@@ -295,7 +389,8 @@ def main_team_client(args: Optional[list[str]] = None) -> None:
 
     参数：可选 ROS2 命令行参数；返回：正常关闭时无返回。节点处理消息各自的米/弧度和
     frame_id。失败：缺少 rclpy/vision_msgs/配置时抛出清晰 ``RuntimeError``；
-    完整业务算法未实现时只输出安全保持，不伪造任务完成。
+    完整业务算法未实现时默认仅计算和发布团队诊断遥测，不创建官方控制发布器，也不
+    伪造任务完成。只有显式通过全局发布门时才允许进入官方控制发布链。
     """
 
     ros = _load_ros_dependencies(require_vision=True, require_filters=False)
@@ -458,7 +553,10 @@ def _spin(
             if node is not None:
                 node.destroy_node()
         finally:
-            ros.rclpy.shutdown()
+            # SIGINT handler 可能已经关闭 context；重复 shutdown 会抛 RCLError。节点
+            # 必须先完成自身清理，而 context 仍有效时才由这里执行最终 shutdown。
+            if _rclpy_context_ok(ros, node):
+                ros.rclpy.shutdown()
 #_TeamClientNode：比赛控制主节点
 
 # 这是三个节点里最核心的一个。整个规则系统每个控制周期的数据组装与动作出口。
@@ -517,6 +615,8 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             self._local_io_ready = False
             self._system_ready_submitted = False
             self._last_control_warning = ""
+            self._last_non_ros_warning = ""
+            self._destroy_failure_reason = ""
             self._input_issues: dict[str, str] = {}
             self._destroying = False
             self._control_timer: Optional[Any] = None
@@ -536,10 +636,34 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             )
             self._external_candidate_subscription: Optional[Any] = None
             self._last_control_tick_ns: Optional[int] = None
-
-            self._official_publisher = OfficialCommandPublisher(
-                self, topics["official_commands"], ros_deps
-            )
+            control = _validated_control_config(config)
+            self._observe_only = control["observe_only"]
+            self._enable_official_publish = control["enable_official_publish"]
+            self._simulation_only = control["simulation_only"]
+            self._official_publisher: Optional[OfficialCommandPublisher] = None
+            if _official_publish_enabled(control):
+                head_tracking = {
+                    **control["head_target_tracking"],
+                    "yaw_lower": self._mux.config.joint_lower[1],
+                    "yaw_upper": self._mux.config.joint_upper[1],
+                    "pitch_lower": self._mux.config.joint_lower[2],
+                    "pitch_upper": self._mux.config.joint_upper[2],
+                }
+                self._official_publisher = OfficialCommandPublisher(
+                    self,
+                    topics["official_commands"],
+                    ros_deps,
+                    head_tracking,
+                )
+            else:
+                reason = (
+                    "observe_only"
+                    if self._observe_only
+                    else "enable_official_publish=false"
+                )
+                self.get_logger().info(
+                    f"official_publish_disabled:{reason};仅发布团队诊断遥测"
+                )
             self._action_pub = self.create_publisher(ros.String, topics["final_action"], 10)
             self._fsm_pub = self.create_publisher(ros.String, topics["fsm_status"], 10)
             self.create_subscription(ros.String, topics["instruction"], self._on_instruction, 10)
@@ -757,7 +881,11 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
         def _safe_hold_candidates(
             self, joints: RobotJointState, now_ns: int
         ) -> tuple[BaseCommand, ManipulationCommand]:
-            """生成短TTL零底盘和基于实际反馈的关节保持候选。"""
+            """为明确要求主动保持的受控场景生成短TTL候选。
+
+            本函数会把17项 ``controlled_mask`` 全部设为真，属于主动位置控制，不能作为
+            节点默认骨架行为；当前Stage 2A普通周期和节点退出都不调用本函数。
+            """
 
             base_command = BaseCommand(
                 0.0, 0.0, now_ns, now_ns + self._command_ttl_ns
@@ -775,15 +903,18 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
         ) -> tuple[BaseCommand | None, ManipulationCommand | None]:
             """把同周期快照交给唯一业务组装入口，返回两类候选命令。
 
-            当前完整业务尚未接线，只产生零底盘和实际关节保持。候选命令仍需经过
-            ActionMux 才成为 FinalAction，ROS发布后也还要靠反馈确认实际执行。
+            当前完整业务尚未接线，只产生短TTL零底盘候选，不把“没有机械臂业务候选”
+            错误解释成17维主动位置保持。``ActionMux`` 仍基于实际反馈生成诊断
+            ``FinalAction``；是否允许发布由独立全局官方发布门决定。
             """
 
             # TODO：未来在这里调用 navigation 和 arm_execution 组装候选；业务模块
             # 只能返回候选，不能直接发布 ROS 话题，也不能在本函数实现算法。
             if snapshot.joints is None or not snapshot.joints.valid:
                 return None, None
-            return self._safe_hold_candidates(snapshot.joints, now_ns)
+            return BaseCommand(
+                0.0, 0.0, now_ns, now_ns + self._command_ttl_ns
+            ), None
 
         def _log_control_warning_on_change(self, reason: str) -> None:
             """只在控制降级原因变化时记录，避免定时器高频刷屏。"""
@@ -792,11 +923,26 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 return
             self._last_control_warning = reason
             if reason:
-                self.get_logger().warning(reason)
+                if self._context_ok():
+                    self.get_logger().warning(reason)
+                else:
+                    # ROS context失效后rosout本身不可用；保留普通Python诊断字段，
+                    # 不再调用logger或任何publisher。
+                    self._last_non_ros_warning = reason
 
         def _publish_emergency_base_stop(self, reason: str) -> None:
             """状态不足以构造安全19维动作时，尽力只停止底盘。"""
 
+            if self._official_publisher is None:
+                self._log_control_warning_on_change(
+                    f"{reason}；official_publish_disabled；未创建或调用官方发布器"
+                )
+                return
+            if not self._context_ok():
+                self._log_control_warning_on_change(
+                    f"{reason}；ROS context已失效，禁止尝试官方紧急发布"
+                )
+                return
             try:
                 self._official_publisher.publish_emergency_base_stop()
                 message = reason
@@ -804,26 +950,75 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 message = f"{reason}；{exc}"
             self._log_control_warning_on_change(message)
 
-        def _publish_final_action(self, action: FinalAction) -> bool:
-            """发布有效动作，并把同一个 FinalAction 作为诊断遥测发送。"""
+        def _publish_final_action(
+            self,
+            action: FinalAction,
+            *,
+            head_publish_authorized: bool = False,
+            safety_exit_authorized: bool = False,
+            diagnostic_only: bool = False,
+        ) -> bool:
+            """按本次调用授权发布有效动作，并始终发送诊断 FinalAction。
 
-            if not action.valid:
+            普通控制周期只有在同周期确实消费了head_yaw-only External Candidate时才传入
+            head授权，且只发布head分组。无候选、候选拒绝、非法mask和已消费旧候选形成
+            的FinalAction都只能作为团队遥测。emergency stop和明确安全退出使用各自
+            独立的安全路径。
+            """
+
+            if diagnostic_only or self._official_publisher is None:
+                published = False
+            elif not self._context_ok():
+                self._log_control_warning_on_change(
+                    "ROS context已失效，禁止尝试官方控制发布"
+                )
+                published = False
+            elif not action.valid:
                 self._publish_emergency_base_stop(
                     f"ActionMux 输出无效，禁止发布19维动作：{action.failure_reason}"
                 )
                 published = False
-            else:
+            elif safety_exit_authorized:
                 try:
                     self._official_publisher.publish(action)
                     published = True
                 except RuntimeError as exc:
                     self._publish_emergency_base_stop(f"官方控制发布失败：{exc}")
                     published = False
+            elif not head_publish_authorized:
+                published = False
+            else:
+                try:
+                    self._official_publisher.publish_head(action)
+                    published = True
+                except RuntimeError as exc:
+                    # head Candidate失败不能顺带授权cmd_vel或其他四组官方话题。
+                    self._log_control_warning_on_change(
+                        f"官方head控制发布失败：{exc}"
+                    )
+                    published = False
             # 遥测记录的是 ActionMux 的同一输出，不代表发布成功、Server接收或实际执行。
             action_message = self._ros.String()
             action_message.data = final_action_to_json(action)
             self._action_pub.publish(action_message)
             return published
+
+        def _context_ok(self) -> bool:
+            """Fail closed when this node's ROS context is absent or already shut down."""
+
+            context = getattr(self, "context", None)
+            ok = getattr(context, "ok", None)
+            if not callable(ok):
+                return False
+            try:
+                return bool(ok())
+            except Exception:  # noqa: BLE001 - context query failure disables publishing
+                return False
+
+        def _official_publish_available(self) -> bool:
+            """Return whether an existing publisher can safely be called now."""
+
+            return self._official_publisher is not None and self._context_ok()
 
         def _control_tick(self) -> None:
             now_ns = self.get_clock().now().nanoseconds
@@ -886,23 +1081,56 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 self._log_external_candidate_decision(external_decision)
 
             if snapshot.failure_reason:
-                # Odom陈旧时不继续普通策略，但可靠JointState仍允许经ActionMux发布零速保持。
+                # Odom陈旧时不继续普通策略；可靠JointState只用于生成诊断保持动作。
                 self._log_control_warning_on_change(
-                    f"机器人状态降级，发布零底盘和实际关节保持：{snapshot.failure_reason}"
+                    f"机器人状态降级，生成零底盘和实际关节保持诊断：{snapshot.failure_reason}"
                 )
             else:
                 self._log_control_warning_on_change("")
             final_action = self._mux.compose(
                 base_command, manipulation_command, joints, status, now_ns
             )
-            published = self._publish_final_action(final_action)
+            candidate_publish_authorized = (
+                external_decision.accepted
+                and external_decision.command is not None
+                and external_decision.command.controlled_mask
+                == (False, True, *([False] * 15))
+            )
+            if external_decision.accepted and not candidate_publish_authorized:
+                self._log_control_warning_on_change(
+                    "External Candidate不是严格head_yaw-only mask，禁止官方发布"
+                )
+            published = self._publish_final_action(
+                final_action,
+                head_publish_authorized=candidate_publish_authorized,
+                diagnostic_only=(
+                    external_decision.accepted and not candidate_publish_authorized
+                ),
+            )
             if external_decision.accepted:
+                head_publish_failure_reason = ""
+                if (
+                    candidate_publish_authorized
+                    and not published
+                    and self._official_publisher is not None
+                ):
+                    head_publish_failure_reason = (
+                        self._official_publisher.last_head_publish_failure_reason
+                    )
                 self._log_external_candidate_decision(
                     replace(
                         external_decision,
                         event="candidate_action_mux_result",
+                        failure_reason=(
+                            external_decision.failure_reason
+                            or head_publish_failure_reason
+                        ),
                         final_action_sequence=final_action.sequence,
-                        official_publish_attempted=final_action.valid,
+                        official_publish_attempted=(
+                            candidate_publish_authorized
+                            and final_action.valid
+                            and self._official_publish_available()
+                        ),
                         official_publish_success=published,
                     )
                 )
@@ -924,33 +1152,33 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 self.get_logger().warning(f"external_candidate_audit:{payload}")
 
         def destroy_node(self) -> Any:
-            """停止定时控制，并在销毁ROS实体前尽力发送安全动作。
+            """取消控制周期、清空pending并销毁节点，不发送任何官方控制消息。
 
-            安全退出只能覆盖正常关闭和可处理异常，无法保证 kill -9、断电或整个容器
-            消失。是否需要重复零速以及 Server watchdog 行为仍待官方确认。
+            Stage 2A从未授权退出时的底盘或关节控制，因此不能把JointState反馈重新当作
+            controller target发布。head target shadow也必须原样保留。父级``_spin``在
+            ROS实体销毁后负责shutdown；context失效时本路径不调用logger或publisher。
             """
 
             if self._destroying:
                 return None
             self._destroying = True
+            context_valid = self._context_ok()
+            errors: list[str] = []
             try:
                 if self._control_timer is not None:
                     self._control_timer.cancel()
-                now_ns = self.get_clock().now().nanoseconds
+            except Exception as exc:  # noqa: BLE001 - 仍必须继续清空pending并销毁
+                errors.append(f"取消control timer失败：{exc}")
+            try:
+                # context失效后不再调用ROS clock；consumer只需一个诊断时间戳。
+                now_ns = self.get_clock().now().nanoseconds if context_valid else 0
                 self._external_candidate.shutdown(now_ns)
-                joints = self._fresh_control_state(self._joint_cache, now_ns)
-                if joints is not None and joints.valid:
-                    base_command, hold = self._safe_hold_candidates(joints, now_ns)
-                    final_action = self._mux.compose(
-                        base_command, hold, joints, self._fsm.status(now_ns), now_ns
-                    )
-                    self._publish_final_action(final_action)
-                else:
-                    self._publish_emergency_base_stop(
-                        "节点退出时没有新鲜有效JointState，只能尽力发布底盘零速度"
-                    )
-            except Exception as exc:  # noqa: BLE001 - 必须记录，但绝不能阻止父节点销毁
-                self.get_logger().error(f"安全退出动作失败：{exc}")
+            except Exception as exc:  # noqa: BLE001 - 记录后仍继续父节点销毁
+                errors.append(f"清空External Candidate失败：{exc}")
+            if errors:
+                self._destroy_failure_reason = "；".join(errors)
+                if self._context_ok():
+                    self.get_logger().error(self._destroy_failure_reason)
             return super().destroy_node()
 
     return _TeamClientNode
@@ -1372,6 +1600,96 @@ def _action_mux_config(config: dict[str, Any]) -> ActionMuxConfig:
         joint_lower=tuple(float(value) for value in action["joint_lower"]),
         joint_upper=tuple(float(value) for value in action["joint_upper"]),
     )
+
+
+def _validated_control_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Validate the fail-closed global official publish gate."""
+
+    control = config.get("control")
+    if not isinstance(control, dict):
+        raise RuntimeError("control 配置必须是映射且显式包含三道全局发布门")
+    required = ("observe_only", "enable_official_publish", "simulation_only")
+    missing = [name for name in required if name not in control]
+    if missing:
+        raise RuntimeError(f"control 配置缺少字段：{missing}")
+    invalid = [name for name in required if type(control[name]) is not bool]
+    if invalid:
+        raise RuntimeError(f"control 配置字段必须为严格 bool：{invalid}")
+    normalized: dict[str, Any] = {name: control[name] for name in required}
+    if not normalized["simulation_only"]:
+        raise RuntimeError("control.simulation_only=false 被安全策略拒绝")
+    normalized["head_target_tracking"] = _validated_head_target_tracking_config(
+        control.get("head_target_tracking")
+    )
+    return normalized
+
+
+def _validated_head_target_tracking_config(value: object) -> dict[str, Any]:
+    """严格验证fresh-reset专用的head controller-target shadow配置。"""
+
+    if not isinstance(value, dict):
+        raise RuntimeError("control.head_target_tracking必须是显式映射")
+    bool_fields = (
+        "enabled",
+        "require_fresh_reset",
+        "fresh_reset_confirmed",
+        "require_exclusive_writer",
+    )
+    numeric_fields = ("initial_yaw_target", "initial_pitch_target")
+    required = (*bool_fields, *numeric_fields)
+    missing = [name for name in required if name not in value]
+    if missing:
+        raise RuntimeError(f"control.head_target_tracking缺少字段：{missing}")
+    unknown = sorted(set(value) - set(required))
+    if unknown:
+        raise RuntimeError(f"control.head_target_tracking存在未知字段：{unknown}")
+    invalid_bool = [name for name in bool_fields if type(value[name]) is not bool]
+    if invalid_bool:
+        raise RuntimeError(f"head target tracking字段必须为严格bool：{invalid_bool}")
+    if not value["require_fresh_reset"]:
+        raise RuntimeError("head target tracking必须require_fresh_reset=true")
+    if not value["require_exclusive_writer"]:
+        raise RuntimeError("head target tracking必须require_exclusive_writer=true")
+    targets: dict[str, float] = {}
+    for name in numeric_fields:
+        raw = value[name]
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            raise RuntimeError(f"{name}必须是有限实数且不能是bool")
+        number = float(raw)
+        if not math.isfinite(number):
+            raise RuntimeError(f"{name}必须是有限实数")
+        targets[name] = number
+    if targets != {"initial_yaw_target": 0.0, "initial_pitch_target": 0.0}:
+        raise RuntimeError("Stage 2A初始head controller target必须严格为[0.0,0.0]")
+    return {
+        **{name: value[name] for name in bool_fields},
+        **targets,
+    }
+
+
+def _official_publish_enabled(control: dict[str, bool]) -> bool:
+    """Only the explicit simulation-only actuation combination opens the gate."""
+
+    return (
+        not control["observe_only"]
+        and control["enable_official_publish"]
+        and control["simulation_only"]
+    )
+
+
+def _rclpy_context_ok(ros: SimpleNamespace, node: Optional[Any]) -> bool:
+    """Query rclpy context without treating an exception as permission to publish/shutdown."""
+
+    context = getattr(node, "context", None) if node is not None else None
+    try:
+        return bool(ros.rclpy.ok(context=context))
+    except TypeError:
+        try:
+            return bool(ros.rclpy.ok())
+        except Exception:  # noqa: BLE001 - failed query is fail-closed
+            return False
+    except Exception:  # noqa: BLE001 - failed query is fail-closed
+        return False
 
 
 def _external_candidate_subscription_enabled(config: ExternalCandidateConfig) -> bool:

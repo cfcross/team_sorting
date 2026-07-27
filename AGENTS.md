@@ -118,6 +118,19 @@ ros_nodes 组装上述模块并连接 ROS2
 
 ## 7. 安全与失败规则
 
+- `team_client_node` 默认必须处于全局 observe-only 模式：可以计算并发布团队诊断遥测，
+  但不得创建或调用 `OfficialCommandPublisher`。External Candidate 的门不能替代此门。
+- 只有 `observe_only=false`、`enable_official_publish=true`、`simulation_only=true` 同时
+  成立才允许创建唯一官方发布器；observe-only优先关闭，非仿真配置必须拒绝。
+- Stage 2A head controller-target shadow默认关闭，只限本节点与官方仿真Server共同启动并
+  明确确认fresh reset、初值严格为`[0.0, 0.0]`且head话题唯一写入者的受控场景。
+  `/joint_states`是物理反馈，禁止据此恢复未知controller target；节点单独重启、Server
+  未reset或出现其他head publisher时必须重新授权并fail closed。
+- 当前Stage 2A退出路径只能取消timer、清空External Candidate pending并销毁ROS实体；
+  禁止用JointState拼接全量hold，禁止自动发布cmd_vel或任何关节controller target。
+  emergency base stop接口仅供未来明确授权的底盘故障路径，不能由普通destroy调用。
+- “没有机械臂业务候选”必须表示为 `ManipulationCommand=None`，不能默认转换为17维
+  `controlled_mask=True`的主动位置保持。显式主动保持能力可以保留，但必须由授权场景调用。
 - 官方依赖、资源或消息字段缺失时必须清晰失败；未实现算法必须抛出明确的 `NotImplementedError`，或返回 `valid/success=False` 及原因。禁止伪造结果或静默降级。
 - 禁止用全零关节目标表示机械臂安全停止。
 - 底盘命令过期后必须归零；机械臂命令过期后必须用实际反馈安全保持。
