@@ -93,6 +93,37 @@ action_mux:
     [0.87, 0.50, 0.16, 3.14, 2.50, 3.14, 2.60, 3.14, 2.60,
      1.00, 3.14, 2.50, 3.14, 2.60, 3.14, 2.60, 1.00]
 
+# Stage 2A 外部安全Candidate consumer。三道执行门默认全部关闭；enabled=false时
+# team_client_node连订阅都不创建。这里仅支持adapter显式Trigger产生的fixed_head_yaw，
+# 不接收或映射pi05原生8维动作。
+external_candidate:
+  enabled: false
+  enable_actuation: false
+  simulation_only: true
+  topic: "/mmk2_pi05_adapter/safe_candidate"
+  schema_version: 1
+  expected_source: "fixed_safe_candidate"
+  expected_mode: "fixed_head_yaw"
+  allowed_controlled_indices: [3]
+  candidate_ttl_ms: 250.0
+  instruction_ttl_ms: 1500.0
+  joint_state_ttl_ms: 250.0
+  watchdog_timeout_ms: 300.0
+  max_joint_delta_rad: 0.01
+  max_joint_velocity_rad_s: 0.20
+  nominal_control_period_s: 0.05
+  # 仅为Stage 2仿真临时安全边界，不是官方MMK2物理限位；正式微动前必须在官方镜像验证。
+  provisional_head_yaw_lower_rad: -0.25
+  provisional_head_yaw_upper_rad: 0.25
+  require_unique_request_id: true
+  require_task_identity_match: true
+  require_generation_binding: true
+  allow_generation_binding: false
+  simulation_publish_enabled: false
+  # 必须由启动方显式配置，consumer绝不从Candidate反向采信episode_id。
+  expected_episode_id: ""
+  request_id_cache_size: 128
+
 recorder:
   # 普通launch默认不创建Recorder；record_data:=true时launch创建节点并显式覆盖为true。
   enabled: false

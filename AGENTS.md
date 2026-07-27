@@ -44,7 +44,7 @@
 或绕过现有控制链的新业务目录。
 未经全队评审，禁止修改：
 
-- 21 文件目录结构；
+- 22 文件目录结构（含经队长批准的 `team_sorting/external_candidate.py`）；
 - `perception_node`、`team_client_node`、`dataset_recorder_node` 三个 ROS2 节点；
 - 十个业务文件的职责边界；
 - 公共接口集中在 `interfaces.py`；
@@ -70,6 +70,7 @@
 | `team_sorting/arm_execution.py` | 机械臂2 | 轨迹插值、局部状态、试抬、验证与恢复 | 重新实现 IK、全局任务选择、官方话题发布 |
 | `team_sorting/fsm.py` | 系统/FSM | 唯一任务解析、状态转换、重试与失败路径 | ROS 发布、导航或机械臂算法 |
 | `team_sorting/action_mux.py` | 控制安全 | 19 维仲裁、TTL、限幅、安全保持 | 轨迹规划、FSM 决策、ROS 发布 |
+| `team_sorting/external_candidate.py` | 控制安全/ROS 集成 | 默认关闭的外部Candidate严格解码、身份/新鲜度/TTL/one-shot安全消费及现有`ManipulationCommand`转换 | 导入rclpy、发布ROS、生成FinalAction、修改FSM、绕过ActionMux、接收pi05原生8维动作 |
 | `team_sorting/recorder.py` | 数据 | Episode 元数据、团队遥测、裁判原文、rosbag 命令辅助 | 参与控制、训练模型、逐帧复制图像 |
 | `team_sorting/ros_nodes.py` | ROS 集成 | 三节点 I/O、缓存、转换、组装、唯一官方发布 | YOLO、导航、IK、轨迹算法 |
 | `config/config.yaml` | ROS 集成 | 可部署参数、话题、限幅和记录配置 | 写入未确认规则或开发者绝对路径 |

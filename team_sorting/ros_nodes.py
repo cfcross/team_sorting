@@ -82,7 +82,9 @@ _create_recorder_node()
 from __future__ import annotations
 
 from collections import deque
+from dataclasses import replace
 import importlib
+import json
 import math
 import os
 from pathlib import Path
@@ -93,6 +95,11 @@ from typing import Any, Optional
 
 from .action_mux import ActionMux, ActionMuxConfig
 from .arm_execution import ArmExecutionController
+from .external_candidate import (
+    ExternalCandidateConfig,
+    ExternalCandidateConsumer,
+    ExternalCandidateDecision,
+)
 from .fsm import FSMEvent, GlobalFSM, InstructionParser
 from .interfaces import (
     BaseCommand,
@@ -518,6 +525,17 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             self._mux = ActionMux(_action_mux_config(config))
             self._arm_execution = ArmExecutionController()
             self._mapper = JointStateMapper(config.get("joint_aliases", {}))
+            try:
+                self._external_candidate_config = ExternalCandidateConfig.from_mapping(
+                    config.get("external_candidate", {})
+                )
+            except ValueError as exc:
+                raise RuntimeError(f"external_candidate 配置无效：{exc}") from exc
+            self._external_candidate = ExternalCandidateConsumer(
+                self._external_candidate_config
+            )
+            self._external_candidate_subscription: Optional[Any] = None
+            self._last_control_tick_ns: Optional[int] = None
 
             self._official_publisher = OfficialCommandPublisher(
                 self, topics["official_commands"], ros_deps
@@ -525,6 +543,13 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             self._action_pub = self.create_publisher(ros.String, topics["final_action"], 10)
             self._fsm_pub = self.create_publisher(ros.String, topics["fsm_status"], 10)
             self.create_subscription(ros.String, topics["instruction"], self._on_instruction, 10)
+            if _external_candidate_subscription_enabled(self._external_candidate_config):
+                self._external_candidate_subscription = self.create_subscription(
+                    ros.String,
+                    self._external_candidate_config.topic,
+                    self._on_external_candidate,
+                    10,
+                )
             self.create_subscription(ros.Odometry, topics["odom"], self._on_odom, 30)
             self.create_subscription(ros.JointState, topics["joint_states"], self._on_joints, 30)
             self.create_subscription(
@@ -545,6 +570,11 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 # 才能在正式规则发布后替换策略而不改 InstructionParser。
                 self._parsed_tasks = tasks
                 selected_task = self._select_task(tasks)
+                # 每次合法广播都刷新 consumer 自己的指令活性时间；下面的 FSM 语义去重
+                # 保持原样，不会重复提交相同任务。
+                self._external_candidate.update_instruction(
+                    message.data, selected_task.task_id, now_ns
+                )
                 selected_fingerprint = self._task_semantic_fingerprint(selected_task)
                 if (
                     self._fsm.task is not None
@@ -564,6 +594,19 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                     self._submit_pending_task(now_ns)
             except ValueError as exc:
                 self.get_logger().error(f"任务解析失败：{exc}")
+
+        def _on_external_candidate(self, message: Any) -> None:
+            """Validate and reserve one candidate; never creates or publishes an action."""
+
+            now_ns = self.get_clock().now().nanoseconds
+            try:
+                decision = self._external_candidate.receive(message.data, now_ns)
+            except Exception as exc:  # noqa: BLE001 - callback must fail closed
+                self.get_logger().error(
+                    f"External Candidate回调内部失败，已拒绝：{type(exc).__name__}: {exc}"
+                )
+                return
+            self._log_external_candidate_decision(decision)
 
         @staticmethod
         def _task_semantic_fingerprint(task: TaskSpec) -> tuple[Any, ...]:
@@ -784,6 +827,15 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
 
         def _control_tick(self) -> None:
             now_ns = self.get_clock().now().nanoseconds
+            actual_dt_s = (
+                None
+                if self._last_control_tick_ns is None
+                else (now_ns - self._last_control_tick_ns) / 1e9
+            )
+            self._last_control_tick_ns = now_ns
+            watchdog_decision = self._external_candidate.watchdog(now_ns)
+            if watchdog_decision is not None:
+                self._log_external_candidate_decision(watchdog_decision)
             base = self._fresh_control_state(self._base_cache, now_ns)
             joints = self._fresh_control_state(self._joint_cache, now_ns)
             self._check_readiness(now_ns, base, joints)
@@ -821,6 +873,18 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 )
                 return
 
+            external_decision = self._external_candidate.take(
+                now_ns=now_ns,
+                actual_joints=joints,
+                fsm_status=status,
+                actual_dt_s=actual_dt_s,
+                existing_command=manipulation_command,
+            )
+            if external_decision.accepted:
+                manipulation_command = external_decision.command
+            elif external_decision.failure_reason != "no_pending_candidate":
+                self._log_external_candidate_decision(external_decision)
+
             if snapshot.failure_reason:
                 # Odom陈旧时不继续普通策略，但可靠JointState仍允许经ActionMux发布零速保持。
                 self._log_control_warning_on_change(
@@ -831,7 +895,33 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             final_action = self._mux.compose(
                 base_command, manipulation_command, joints, status, now_ns
             )
-            self._publish_final_action(final_action)
+            published = self._publish_final_action(final_action)
+            if external_decision.accepted:
+                self._log_external_candidate_decision(
+                    replace(
+                        external_decision,
+                        event="candidate_action_mux_result",
+                        final_action_sequence=final_action.sequence,
+                        official_publish_attempted=final_action.valid,
+                        official_publish_success=published,
+                    )
+                )
+
+        def _log_external_candidate_decision(
+            self, decision: ExternalCandidateDecision
+        ) -> None:
+            """Emit versioned strict JSON diagnostics without file I/O or control effects."""
+
+            payload = json.dumps(
+                decision.audit_dict(),
+                ensure_ascii=False,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            if decision.accepted:
+                self.get_logger().info(f"external_candidate_audit:{payload}")
+            else:
+                self.get_logger().warning(f"external_candidate_audit:{payload}")
 
         def destroy_node(self) -> Any:
             """停止定时控制，并在销毁ROS实体前尽力发送安全动作。
@@ -847,6 +937,7 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 if self._control_timer is not None:
                     self._control_timer.cancel()
                 now_ns = self.get_clock().now().nanoseconds
+                self._external_candidate.shutdown(now_ns)
                 joints = self._fresh_control_state(self._joint_cache, now_ns)
                 if joints is not None and joints.valid:
                     base_command, hold = self._safe_hold_candidates(joints, now_ns)
@@ -1281,6 +1372,12 @@ def _action_mux_config(config: dict[str, Any]) -> ActionMuxConfig:
         joint_lower=tuple(float(value) for value in action["joint_lower"]),
         joint_upper=tuple(float(value) for value in action["joint_upper"]),
     )
+
+
+def _external_candidate_subscription_enabled(config: ExternalCandidateConfig) -> bool:
+    """Keep the ROS subscription absent unless the first gate is explicitly enabled."""
+
+    return config.enabled
 
 
 def _bounds_from_config(values: list[float]) -> Bounds3D:

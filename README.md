@@ -10,6 +10,26 @@
 > 当前定位是“可导入、可测试、边界清晰的客户端骨架”，不是已经能完成比赛的成品。
 > 完整三维估计、导航、抓放规划、机械臂执行和比赛闭环仍未实现。
 
+### Stage 2A External Candidate Consumer
+
+当前代码包含对 adapter 提交
+`5fc0f2699645bc3735422e0841383b38a95d4b38` 的版本化 ROS String Candidate 的
+默认关闭 consumer。它只接受显式 Trigger 产生的 `fixed_head_yaw` 安全 Candidate，
+严格复核 JSON、任务身份、指令/JointState 新鲜度、ROS 时间、TTL、generation、request
+去重、单周期 delta、速度和临时仿真限位，再一次性转换为现有
+`ManipulationCommand`。pi05 原生 8D 动作没有被使用或映射。
+
+`enabled`、`enable_actuation` 和临时第三道门 `simulation_publish_enabled` 默认均为
+`false`；默认配置不创建外部 Candidate 订阅，也不会让它进入 ActionMux。即使显式启用，
+Candidate 也不能绕过现有 `ActionMux -> FinalAction[19] -> OfficialCommandPublisher`
+链路。当前阶段只完成 consumer 代码与测试，不代表仿真微动已经完成；head-yaw 临时边界
+也不是官方物理限位，正式运动前仍须在官方镜像验证。
+
+防重放状态在 Candidate 成功进入单元素 pending 槽时即生效：generation 在此时绑定、
+request ID 在此时记为已使用。即使 Candidate 随后在控制周期因 JointState、delta 或临时
+限位检查失败，这两项状态也不会回退或允许重放；这只是 fail-closed 防重放语义，不表示
+Candidate 已执行、已发布或已被机器人采用。
+
 ## 2. 官方仓库与团队仓库的边界
 
 官方工程提供场景、裁判、传感器、机器人模型、YOLO、运动学和控制入口；团队仓库负责把
