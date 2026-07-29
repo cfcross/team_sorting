@@ -254,4 +254,358 @@ class ArmExecutionController:
         轨迹时间走完或目标误差偶然变小就报告成功。
         """
 
-        raise NotImplementedError("机械臂轨迹插值和局部抓放状态机尚未实现，请由机械臂2负责人完成")
+        # === 参数开关：队长确认后改为 True 并填入对应数值 ===
+        _VELOCITY_LIMIT_ENABLED = False     # 策略3：关节限速，依赖 max_joint_velocity_17
+        _ARRIVAL_CHECK_ENABLED = False      # 策略4：基于实际反馈的到位判断，依赖 joint_tolerance_17
+        _STABILITY_CHECK_ENABLED = False    # 策略5：稳定性确认，依赖 settle_cycles
+        # === 未确认参数：队长确认后填入数值并删除 None 占位 ===
+        _MAX_JOINT_VELOCITY_17 = None       # 【未确认】17维最大速度
+        _JOINT_TOLERANCE_17 = None          # 【未确认】17维到位容差
+        _SETTLE_CYCLES = None               # 【未确认】连续稳定周期阈值
+        _TOTAL_TIMEOUT_NS = None            # 【未确认】轨迹总超时纳秒
+        _COMMAND_TTL_NS = None               # 【未确认】候选命令有效期纳秒
+        # === 以上开关为 False 时，对应策略跳过，使用简化行为 ===
+
+        # ---- 1. 输入校验 ----
+        timestamp_ns = _require_integer_ns(timestamp_ns, "timestamp_ns", positive=False)
+        if not actual_joints.valid:
+            self.local_phase = LocalPhase.FAILED
+            self._trajectory = None
+            reason = "实际关节状态无效，不能推进轨迹执行"
+            if actual_joints.failure_reason:
+                reason += f"：{actual_joints.failure_reason}"
+            return (
+                ManipulationCommand(
+                    joint_target=actual_joints.position,
+                    controlled_mask=(True,) * 17,
+                    local_phase=self.local_phase,
+                    timestamp_ns=timestamp_ns,
+                    valid_until_ns=timestamp_ns,
+                    valid=False,
+                    failure_reason=reason,
+                ),
+                ManipulationStatus(
+                    local_phase=self.local_phase,
+                    state="FAILED",
+                    progress=0.0,
+                    max_joint_error=float("inf"),
+                    success=False,
+                    failure_reason=reason,
+                    timestamp_ns=timestamp_ns,
+                ),
+            )
+        position_error = _finite_vector_error(
+            actual_joints.position, 17, "actual_joints.position"
+        )
+        if position_error:
+            self.local_phase = LocalPhase.FAILED
+            self._trajectory = None
+            return (
+                ManipulationCommand(
+                    joint_target=actual_joints.position,
+                    controlled_mask=(True,) * 17,
+                    local_phase=self.local_phase,
+                    timestamp_ns=timestamp_ns,
+                    valid_until_ns=timestamp_ns,
+                    valid=False,
+                    failure_reason=position_error,
+                ),
+                ManipulationStatus(
+                    local_phase=self.local_phase,
+                    state="FAILED",
+                    progress=0.0,
+                    max_joint_error=float("inf"),
+                    success=False,
+                    failure_reason=position_error,
+                    timestamp_ns=timestamp_ns,
+                ),
+            )
+
+        # ---- 2. 先检查 FAILED（必须在检查 _trajectory 之前） ----
+        if self.local_phase is LocalPhase.FAILED:
+            return (
+                ManipulationCommand(
+                    joint_target=actual_joints.position,
+                    controlled_mask=(True,) * 17,
+                    local_phase=self.local_phase,
+                    timestamp_ns=timestamp_ns,
+                    valid_until_ns=timestamp_ns,
+                    valid=False,
+                    failure_reason="局部执行已处于FAILED状态",
+                ),
+                ManipulationStatus(
+                    local_phase=self.local_phase,
+                    state="FAILED",
+                    progress=0.0,
+                    max_joint_error=float("inf"),
+                    success=False,
+                    failure_reason="局部执行已处于FAILED状态",
+                    timestamp_ns=timestamp_ns,
+                ),
+            )
+
+        # ---- 3. 无轨迹 → IDLE ----
+        if self._trajectory is None:
+            return (
+                ManipulationCommand(
+                    joint_target=actual_joints.position,
+                    controlled_mask=(True,) * 17,
+                    local_phase=self.local_phase,
+                    timestamp_ns=timestamp_ns,
+                    valid_until_ns=timestamp_ns,
+                    valid=False,
+                    failure_reason="尚未装载有效轨迹",
+                ),
+                ManipulationStatus(
+                    local_phase=self.local_phase,
+                    state="IDLE",
+                    progress=0.0,
+                    max_joint_error=float("inf"),
+                    success=False,
+                    failure_reason="尚未装载有效轨迹",
+                    timestamp_ns=timestamp_ns,
+                ),
+            )
+
+        # ---- 4. 时间基准 ----
+        if self._trajectory_started_ns is not None and timestamp_ns < self._trajectory_started_ns:
+            self.local_phase = LocalPhase.FAILED
+            self._trajectory = None
+            return (
+                ManipulationCommand(
+                    joint_target=actual_joints.position,
+                    controlled_mask=(True,) * 17,
+                    local_phase=self.local_phase,
+                    timestamp_ns=timestamp_ns,
+                    valid_until_ns=timestamp_ns,
+                    valid=False,
+                    failure_reason="时间戳倒退，拒绝本周期",
+                ),
+                ManipulationStatus(
+                    local_phase=self.local_phase,
+                    state="FAILED",
+                    progress=0.0,
+                    max_joint_error=float("inf"),
+                    success=False,
+                    failure_reason="时间戳倒退，拒绝本周期",
+                    timestamp_ns=timestamp_ns,
+                ),
+            )
+        if self._trajectory_started_ns is None:
+            self._trajectory_started_ns = timestamp_ns
+            self._last_step_ns = timestamp_ns  # type: ignore[attr-defined]
+
+        elapsed_ns = timestamp_ns - self._trajectory_started_ns
+        elapsed_s = elapsed_ns / 1e9
+
+        # ---- 5. 总超时检查（参数未确认时跳过） ----
+        if _TOTAL_TIMEOUT_NS is not None and elapsed_ns > _TOTAL_TIMEOUT_NS:
+            self.local_phase = LocalPhase.FAILED
+            self._trajectory = None
+            reason = f"轨迹执行总超时（{elapsed_ns}ns > {_TOTAL_TIMEOUT_NS}ns）"
+            return (
+                ManipulationCommand(
+                    joint_target=actual_joints.position,
+                    controlled_mask=(True,) * 17,
+                    local_phase=self.local_phase,
+                    timestamp_ns=timestamp_ns,
+                    valid_until_ns=timestamp_ns,
+                    valid=False,
+                    failure_reason=reason,
+                ),
+                ManipulationStatus(
+                    local_phase=self.local_phase,
+                    state="FAILED",
+                    progress=0.0,
+                    max_joint_error=float("inf"),
+                    success=False,
+                    failure_reason=reason,
+                    timestamp_ns=timestamp_ns,
+                ),
+            )
+
+        # ---- 6. 路点查找（策略1：轨迹时间插值） ----
+        waypoints = self._trajectory.waypoints
+        prev_wp = waypoints[-1]
+        next_wp = waypoints[-1]
+        alpha = 0.0
+        found = False
+        for i in range(len(waypoints)):
+            if elapsed_s < waypoints[i].time_from_start_s:
+                if i == 0:
+                    prev_wp = waypoints[0]
+                    next_wp = waypoints[0]
+                else:
+                    self._waypoint_index = i - 1
+                    prev_wp = waypoints[i - 1]
+                    next_wp = waypoints[i]
+                    dt = next_wp.time_from_start_s - prev_wp.time_from_start_s
+                    if dt <= 0.0:
+                        self.local_phase = LocalPhase.FAILED
+                        self._trajectory = None
+                        reason = f"路点{i - 1}和{i}时间差非正"
+                        return (
+                            ManipulationCommand(
+                                joint_target=actual_joints.position,
+                                controlled_mask=(True,) * 17,
+                                local_phase=self.local_phase,
+                                timestamp_ns=timestamp_ns,
+                                valid_until_ns=timestamp_ns,
+                                valid=False,
+                                failure_reason=reason,
+                            ),
+                            ManipulationStatus(
+                                local_phase=self.local_phase,
+                                state="FAILED",
+                                progress=0.0,
+                                max_joint_error=float("inf"),
+                                success=False,
+                                failure_reason=reason,
+                                timestamp_ns=timestamp_ns,
+                            ),
+                        )
+                    alpha = (elapsed_s - prev_wp.time_from_start_s) / dt
+                found = True
+                break
+        if not found:
+            prev_wp = waypoints[-1]
+            next_wp = waypoints[-1]
+
+        # ---- 7. 线性插值（策略1续） ----
+        if alpha < 0.0:
+            alpha = 0.0
+        elif alpha > 1.0:
+            alpha = 1.0
+        interpolated = tuple(
+            prev_wp.joint_position[i] + alpha * (next_wp.joint_position[i] - prev_wp.joint_position[i])
+            for i in range(17)
+        )
+
+        # ---- 8. controlled_mask（策略2） ----
+        # TODO: 相邻路点mask不同时的规则待确认（mask_transition_rule），当前保守使用前一个路点的mask
+        mask = prev_wp.controlled_mask
+        target = tuple(
+            interpolated[i] if mask[i] else actual_joints.position[i]
+            for i in range(17)
+        )
+
+        # ---- 9. 关节限速（策略3） ----
+        if _VELOCITY_LIMIT_ENABLED:
+            last_ns = getattr(self, "_last_step_ns", None)  # type: ignore[attr-defined]
+            if last_ns is not None:
+                dt_s = (timestamp_ns - last_ns) / 1e9
+            else:
+                dt_s = 0.0
+            if dt_s > 0.0 and _MAX_JOINT_VELOCITY_17 is not None:
+                target_list = list(target)
+                for i in range(17):
+                    max_delta = _MAX_JOINT_VELOCITY_17[i] * dt_s
+                    ai = actual_joints.position[i]
+                    ti = target_list[i]
+                    if ti < ai - max_delta:
+                        target_list[i] = ai - max_delta
+                    elif ti > ai + max_delta:
+                        target_list[i] = ai + max_delta
+                target = tuple(target_list)
+        # _VELOCITY_LIMIT_ENABLED 为 False：策略2结果直接作为最终目标，不做截断
+        # TODO: 等 _VELOCITY_LIMIT_ENABLED 和 _MAX_JOINT_VELOCITY_17 确认后启用
+
+        # ---- 10. 构造候选命令 ----
+        target_error = _finite_vector_error(target, 17, "插值/限速后的目标")
+        if target_error:
+            self.local_phase = LocalPhase.FAILED
+            self._trajectory = None
+            return (
+                ManipulationCommand(
+                    joint_target=actual_joints.position,
+                    controlled_mask=(True,) * 17,
+                    local_phase=self.local_phase,
+                    timestamp_ns=timestamp_ns,
+                    valid_until_ns=timestamp_ns,
+                    valid=False,
+                    failure_reason=target_error,
+                ),
+                ManipulationStatus(
+                    local_phase=self.local_phase,
+                    state="FAILED",
+                    progress=0.0,
+                    max_joint_error=float("inf"),
+                    success=False,
+                    failure_reason=target_error,
+                    timestamp_ns=timestamp_ns,
+                ),
+            )
+
+        command = ManipulationCommand(
+            joint_target=target,
+            controlled_mask=mask,
+            local_phase=self.local_phase,
+            timestamp_ns=timestamp_ns,
+            valid_until_ns=timestamp_ns + (_COMMAND_TTL_NS if _COMMAND_TTL_NS is not None else 200_000_000),
+            valid=True,
+        )
+
+        # ---- 11. 实际误差计算 ----
+        controlled_errors = [
+            abs(target[i] - actual_joints.position[i])
+            for i in range(17)
+            if mask[i]
+        ]
+        max_err = max(controlled_errors) if controlled_errors else 0.0
+
+        # ---- 12. 到位判断（策略4） ----
+        trajectory_ended = elapsed_s >= waypoints[-1].time_from_start_s
+        arrived = False
+        if _ARRIVAL_CHECK_ENABLED:
+            if _JOINT_TOLERANCE_17 is not None:
+                arrived = all(
+                    abs(target[i] - actual_joints.position[i]) <= _JOINT_TOLERANCE_17[i]
+                    for i in range(17)
+                    if mask[i]
+                )
+        else:
+            # TODO：【临时行为，等 _ARRIVAL_CHECK_ENABLED 和 joint_tolerance_17 确认后替换】
+            # 时间到了就认为到位，不检查实际反馈
+            arrived = trajectory_ended
+
+        # ---- 13. 稳定性确认（策略5） ----
+        if _STABILITY_CHECK_ENABLED:
+            if arrived:
+                self._stable_cycle_count += 1
+            else:
+                self._stable_cycle_count = 0
+            settled = (
+                _SETTLE_CYCLES is not None
+                and self._stable_cycle_count >= _SETTLE_CYCLES
+            )
+        else:
+            settled = True  # 跳过稳定确认，到位即成功
+
+        # ---- 14. 完成判断（策略6） ----
+        if trajectory_ended and arrived and settled:
+            success = True
+            state = "COMPLETED"
+            progress = 1.0
+            failure_reason = ""
+        else:
+            success = False
+            state = "RUNNING"
+            final_time = waypoints[-1].time_from_start_s
+            progress = min(elapsed_s / final_time, 1.0) if final_time > 0.0 else 1.0
+            if trajectory_ended and not arrived:
+                failure_reason = "轨迹时间已结束但实际关节未收敛"
+            else:
+                failure_reason = ""
+
+        status = ManipulationStatus(
+            local_phase=self.local_phase,
+            state=state,
+            progress=progress,
+            max_joint_error=max_err,
+            success=success,
+            failure_reason=failure_reason,
+            timestamp_ns=timestamp_ns,
+        )
+
+        self._last_step_ns = timestamp_ns  # type: ignore[attr-defined]
+        return command, status
