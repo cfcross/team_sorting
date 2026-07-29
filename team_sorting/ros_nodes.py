@@ -90,6 +90,7 @@ import os
 from pathlib import Path
 import signal
 import subprocess
+import time
 from types import SimpleNamespace
 from typing import Any, Mapping, Optional
 
@@ -132,6 +133,7 @@ from .navigation import Bounds3D, classify_slot_type
 from .perception_2d import OfficialYoloAdapter
 from .perception_3d import CameraTransformProvider, Perception3DEstimator
 from .recorder import EpisodeRecorder
+from .recording_contracts import ActionPairingConfig
 
 
 class TimestampedCache:
@@ -1633,9 +1635,19 @@ def _create_recorder_node(ros: SimpleNamespace) -> type:
                 )
             topics = config["topics"]
             self._parser = InstructionParser()
-            self._recorder = EpisodeRecorder(recorder_config["root_dir"])
+            try:
+                pairing_config = ActionPairingConfig.from_mapping(
+                    recorder_config.get("action_pairing")
+                )
+            except ValueError as exc:
+                raise RuntimeError(f"Recorder action pairing配置无效：{exc}") from exc
+            self._recorder = EpisodeRecorder(
+                recorder_config["root_dir"], pairing_config
+            )
             self._rosbag_process: Optional[Any] = None
             self._rosbag_failure = ""
+            self._pairing_timer: Optional[Any] = None
+            self._destroyed = False
             now_ns = self.get_clock().now().nanoseconds
             episode_id = EpisodeRecorder.make_episode_id(recorder_config["episode_prefix"])
             self._recorder.start(
@@ -1657,6 +1669,17 @@ def _create_recorder_node(ros: SimpleNamespace) -> type:
                         raise RuntimeError(f"ros2 bag record 启动后立即退出，退出码={exit_code}")
                     self.create_timer(1.0, self._monitor_rosbag)
                 self.create_subscription(ros.String, topics["final_action"], self._on_action, 50)
+                if pairing_config.enabled:
+                    self.create_subscription(
+                        ros.String,
+                        topics["action_dispatch"],
+                        self._on_action_dispatch,
+                        50,
+                    )
+                    self._pairing_timer = self.create_timer(
+                        pairing_config.prune_period_sec,
+                        self._prune_action_pairs,
+                    )
                 self.create_subscription(ros.String, topics["fsm_status"], self._on_fsm, 50)
                 self.create_subscription(
                     ros.String, topics["instruction"], self._on_instruction, 10
@@ -1681,6 +1704,10 @@ def _create_recorder_node(ros: SimpleNamespace) -> type:
                 # 避免留下无人管理的录制进程或看似仍在进行的 Episode。
                 cleanup_errors: list[str] = []
                 try:
+                    self._stop_pairing_timer_and_close()
+                except Exception as cleanup_exc:  # noqa: BLE001 - 汇总到初始化错误
+                    cleanup_errors.append(f"关闭 action pairing 失败：{cleanup_exc}")
+                try:
                     self._stop_rosbag()
                 except Exception as cleanup_exc:  # noqa: BLE001 - 汇总到初始化错误
                     cleanup_errors.append(f"停止 rosbag 失败：{cleanup_exc}")
@@ -1694,9 +1721,56 @@ def _create_recorder_node(ros: SimpleNamespace) -> type:
 
         def _on_action(self, message: Any) -> None:
             try:
-                self._recorder.record_final_action(final_action_from_json(message.data))
+                if self._recorder.action_pairing_enabled:
+                    issue_types = self._recorder.ingest_final_action_payload(
+                        message.data,
+                        self.get_clock().now().nanoseconds,
+                        time.monotonic_ns(),
+                    )
+                    if issue_types:
+                        self.get_logger().warning(
+                            f"FinalAction pairing诊断：{','.join(issue_types)}"
+                        )
+                else:
+                    self._recorder.record_final_action(final_action_from_json(message.data))
             except (ValueError, RuntimeError) as exc:
                 self.get_logger().error(f"记录 FinalAction 失败：{exc}")
+
+        def _on_action_dispatch(self, message: Any) -> None:
+            try:
+                issue_types = self._recorder.ingest_action_dispatch_payload(
+                    message.data,
+                    self.get_clock().now().nanoseconds,
+                    time.monotonic_ns(),
+                )
+                if issue_types:
+                    self.get_logger().warning(
+                        f"ActionDispatch pairing诊断：{','.join(issue_types)}"
+                    )
+            except RuntimeError as exc:
+                self.get_logger().error(f"记录 ActionDispatch 失败：{exc}")
+
+        def _prune_action_pairs(self) -> None:
+            try:
+                issue_types = self._recorder.prune_action_pairs(
+                    self.get_clock().now().nanoseconds,
+                    time.monotonic_ns(),
+                )
+                if issue_types:
+                    self.get_logger().warning(
+                        f"Action pairing超时清理：{','.join(issue_types)}"
+                    )
+            except RuntimeError as exc:
+                self.get_logger().error(f"Action pairing定时清理失败：{exc}")
+
+        def _stop_pairing_timer_and_close(self) -> None:
+            if self._pairing_timer is not None:
+                self._pairing_timer.cancel()
+                self._pairing_timer = None
+            self._recorder.close_action_pairing(
+                self.get_clock().now().nanoseconds,
+                time.monotonic_ns(),
+            )
 
         def _on_fsm(self, message: Any) -> None:
             try:
@@ -1778,7 +1852,16 @@ def _create_recorder_node(ros: SimpleNamespace) -> type:
             ``RuntimeError``；正式 Episode 边界仍待赛事方确认。
             """
 
+            if self._destroyed and self._recorder.metadata is None:
+                return None
+            already_destroyed = self._destroyed
+            self._destroyed = True
             errors: list[str] = []
+            try:
+                # 必须先停止独立 prune timer，避免与 orphan/文件关闭路径并发。
+                self._stop_pairing_timer_and_close()
+            except Exception as exc:  # noqa: BLE001 - 仍需停止bag并销毁节点
+                errors.append(f"关闭 action pairing 失败：{exc}")
             try:
                 self._stop_rosbag()
             except Exception as exc:  # noqa: BLE001 - 仍需完成元数据并销毁节点
@@ -1788,7 +1871,7 @@ def _create_recorder_node(ros: SimpleNamespace) -> type:
                     self._recorder.finish(self.get_clock().now().nanoseconds)
             except Exception as exc:  # noqa: BLE001 - 销毁后仍要报告元数据错误
                 errors.append(f"结束 Episode 失败：{exc}")
-            result = super().destroy_node()
+            result = None if already_destroyed else super().destroy_node()
             if errors:
                 raise RuntimeError("；".join(errors))
             return result

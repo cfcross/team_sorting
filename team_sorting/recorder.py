@@ -39,6 +39,8 @@ from pathlib import Path
 import re
 import shutil
 import tempfile
+import time
+from threading import RLock
 from typing import Any, Mapping, Optional, Sequence
 
 from .interfaces import (
@@ -49,6 +51,15 @@ from .interfaces import (
     fsm_status_to_json,
 )
 from .fsm import InstructionParser
+from .recording_contracts import (
+    ActionDispatchPairer,
+    ActionPairingConfig,
+    PairingPlan,
+    action_pairing_issue_to_json,
+    recorded_action_frame_to_json,
+    strict_action_dispatch_from_json,
+    strict_final_action_from_json,
+)
 
 
 _SAFE_PATH_COMPONENT = re.compile(r"[A-Za-z0-9_.-]+")
@@ -172,10 +183,21 @@ class EpisodeRecorder:
     rosbag 没有丢消息，更不能作为bag完整性的唯一证据。
     """
 
-    def __init__(self, root_dir: str | Path) -> None:
+    def __init__(
+        self,
+        root_dir: str | Path,
+        action_pairing_config: Optional[ActionPairingConfig] = None,
+    ) -> None:
         self.root_dir = Path(root_dir).expanduser()
         self.metadata: Optional[EpisodeMetadata] = None
         self.episode_dir: Optional[Path] = None
+        self._action_lock = RLock()
+        self._action_pairing_config = (
+            action_pairing_config
+            if action_pairing_config is not None and action_pairing_config.enabled
+            else None
+        )
+        self._action_pairer: Optional[ActionDispatchPairer] = None
 
     def check_root(self) -> Path:
         """检查并创建数据根目录。
@@ -273,6 +295,11 @@ class EpisodeRecorder:
             raise
         self.episode_dir = episode_dir
         self.metadata = candidate
+        self._action_pairer = (
+            ActionDispatchPairer(self._action_pairing_config)
+            if self._action_pairing_config is not None
+            else None
+        )
         return episode_dir
 
     def record_final_action(self, action: FinalAction) -> None:
@@ -287,9 +314,235 @@ class EpisodeRecorder:
         猜测并删除数据。Episode未开始或文件写入失败时抛出异常。
         """
 
-        path = self._active_path("final_actions.jsonl")
-        self._append_line(path, final_action_to_json(action))
-        self._count("/team/final_action")
+        with self._action_lock:
+            path = self._active_path("final_actions.jsonl")
+            self._append_line(path, final_action_to_json(action))
+            self._count("/team/final_action")
+
+    @property
+    def action_pairing_enabled(self) -> bool:
+        """返回本 Recorder 是否启用了 V1 配对；不创建文件或产生控制副作用。"""
+
+        return self._action_pairer is not None
+
+    def ingest_final_action_payload(
+        self,
+        raw_payload: object,
+        recorder_timestamp_ns: int,
+        received_monotonic_ns: int,
+    ) -> tuple[str, ...]:
+        """严格接收 FinalAction，首条合法原文兼容落盘并交给异步配对器。
+
+        返回本次产生的 issue_type 元组，供 ROS 日志诊断；无效消息只写 issue，不抛出
+        解析异常。落盘失败仍抛出 ``RuntimeError``，避免静默宣称已记录。
+        """
+
+        with self._action_lock:
+            pairer = self._require_action_pairer()
+            self._active_metadata()
+            try:
+                action = strict_final_action_from_json(raw_payload)  # type: ignore[arg-type]
+            except ValueError as exc:
+                plan = pairer.prepare_invalid_payload(
+                    "final_action",
+                    raw_payload,
+                    str(exc),
+                    recorder_timestamp_ns,
+                    received_monotonic_ns,
+                )
+                self._persist_pairing_plan(plan)
+                assert plan.issue is not None
+                return (plan.issue.issue_type,)
+            plan = pairer.prepare_final_action(
+                action,
+                raw_payload,  # type: ignore[arg-type]
+                recorder_timestamp_ns,
+                received_monotonic_ns,
+            )
+            return self._persist_ingest_plan(
+                plan, recorder_timestamp_ns, received_monotonic_ns
+            )
+
+    def ingest_action_dispatch_payload(
+        self,
+        raw_payload: object,
+        recorder_timestamp_ns: int,
+        received_monotonic_ns: int,
+    ) -> tuple[str, ...]:
+        """严格接收 Dispatch；首条合法记录立即落盘，不等待 FinalAction。"""
+
+        with self._action_lock:
+            pairer = self._require_action_pairer()
+            self._active_metadata()
+            try:
+                if not isinstance(raw_payload, str):
+                    raise ValueError("ActionDispatchRecord必须是JSON字符串")
+                dispatch = strict_action_dispatch_from_json(raw_payload)
+            except ValueError as exc:
+                plan = pairer.prepare_invalid_payload(
+                    "action_dispatch",
+                    raw_payload,
+                    str(exc),
+                    recorder_timestamp_ns,
+                    received_monotonic_ns,
+                )
+                self._persist_pairing_plan(plan)
+                assert plan.issue is not None
+                return (plan.issue.issue_type,)
+            plan = pairer.prepare_dispatch(
+                dispatch,
+                raw_payload,  # type: ignore[arg-type]
+                recorder_timestamp_ns,
+                received_monotonic_ns,
+            )
+            return self._persist_ingest_plan(
+                plan, recorder_timestamp_ns, received_monotonic_ns
+            )
+
+    def prune_action_pairs(
+        self, recorder_timestamp_ns: int, current_monotonic_ns: int
+    ) -> tuple[str, ...]:
+        """由独立定时器按本地 monotonic 时间淘汰超时 pending。"""
+
+        with self._action_lock:
+            if self._action_pairer is None or self.metadata is None:
+                return ()
+            issue_types = list(
+                self._persist_ready_pairs(recorder_timestamp_ns, current_monotonic_ns)
+            )
+            issue_types.extend(
+                self._persist_capacity_plans(recorder_timestamp_ns, current_monotonic_ns)
+            )
+            while True:
+                plan = self._action_pairer.prepare_prune(
+                    recorder_timestamp_ns, current_monotonic_ns
+                )
+                if plan is None:
+                    break
+                self._persist_pairing_plan(plan)
+                assert plan.issue is not None
+                issue_types.append(plan.issue.issue_type)
+            return tuple(issue_types)
+
+    def close_action_pairing(
+        self, recorder_timestamp_ns: int, current_monotonic_ns: Optional[int] = None
+    ) -> tuple[str, ...]:
+        """把剩余 pending 写成 shutdown orphan；可安全重复调用。"""
+
+        with self._action_lock:
+            if self._action_pairer is None or self.metadata is None:
+                return ()
+            monotonic_ns = time.monotonic_ns() if current_monotonic_ns is None else current_monotonic_ns
+            issue_types = list(
+                self._persist_ready_pairs(recorder_timestamp_ns, monotonic_ns)
+            )
+            while True:
+                plan = self._action_pairer.prepare_shutdown(
+                    recorder_timestamp_ns, monotonic_ns
+                )
+                if plan.operation in {"close", "already_closed"}:
+                    self._action_pairer.commit(plan)
+                    break
+                self._persist_pairing_plan(plan)
+                assert plan.issue is not None
+                issue_types.append(plan.issue.issue_type)
+            return tuple(issue_types)
+
+    def _require_action_pairer(self) -> ActionDispatchPairer:
+        if self._action_pairer is None:
+            raise RuntimeError("Recorder action pairing未启用")
+        return self._action_pairer
+
+    def _persist_ingest_plan(
+        self,
+        plan: PairingPlan,
+        recorder_timestamp_ns: int,
+        received_monotonic_ns: int,
+    ) -> tuple[str, ...]:
+        pairer = self._require_action_pairer()
+        issue_types: list[str] = []
+        if plan.operation == "diagnostic":
+            self._persist_pairing_plan(plan)
+            assert plan.issue is not None
+            return (plan.issue.issue_type,)
+        if plan.operation == "raw_insert":
+            self._persist_pairing_plan(plan)
+        elif plan.operation != "resume":
+            raise RuntimeError(f"不支持的ingest PairingPlan：{plan.operation}")
+        if plan.sequence is None:
+            raise RuntimeError("ingest PairingPlan缺少sequence")
+        pair_plan = pairer.prepare_pair(
+            plan.sequence, recorder_timestamp_ns, received_monotonic_ns
+        )
+        if pair_plan is not None:
+            self._persist_pairing_plan(pair_plan)
+            if pair_plan.issue is not None:
+                issue_types.append(pair_plan.issue.issue_type)
+            return tuple(issue_types)
+        issue_types.extend(
+            self._persist_capacity_plans(
+                recorder_timestamp_ns, received_monotonic_ns
+            )
+        )
+        pairer.acknowledge(plan.side, plan.sequence)
+        return tuple(issue_types)
+
+    def _persist_ready_pairs(
+        self, recorder_timestamp_ns: int, completed_monotonic_ns: int
+    ) -> tuple[str, ...]:
+        pairer = self._require_action_pairer()
+        issue_types: list[str] = []
+        for sequence in pairer.ready_sequences:
+            plan = pairer.prepare_pair(
+                sequence, recorder_timestamp_ns, completed_monotonic_ns
+            )
+            if plan is None:
+                continue
+            self._persist_pairing_plan(plan)
+            if plan.issue is not None:
+                issue_types.append(plan.issue.issue_type)
+        return tuple(issue_types)
+
+    def _persist_capacity_plans(
+        self, recorder_timestamp_ns: int, current_monotonic_ns: int
+    ) -> tuple[str, ...]:
+        pairer = self._require_action_pairer()
+        issue_types: list[str] = []
+        while True:
+            plan = pairer.prepare_capacity(
+                recorder_timestamp_ns, current_monotonic_ns
+            )
+            if plan is None:
+                return tuple(issue_types)
+            self._persist_pairing_plan(plan)
+            assert plan.issue is not None
+            issue_types.append(plan.issue.issue_type)
+
+    def _persist_pairing_plan(self, plan: PairingPlan) -> None:
+        if plan.raw_json is not None:
+            if plan.side == "final_action":
+                path = self._active_path("final_actions.jsonl")
+                topic = "/team/final_action"
+            elif plan.side == "action_dispatch":
+                path = self._active_path("action_dispatches.jsonl")
+                topic = "/team/action_dispatch"
+            else:
+                raise RuntimeError("raw PairingPlan side无效")
+            self._append_line(path, plan.raw_json)
+            self._count(topic)
+        elif plan.frame is not None:
+            self._append_line(
+                self._active_path("action_frames.jsonl"),
+                recorded_action_frame_to_json(plan.frame),
+            )
+        elif plan.issue is not None:
+            self._append_line(
+                self._active_path("action_pairing_issues.jsonl"),
+                action_pairing_issue_to_json(plan.issue),
+            )
+        else:
+            raise RuntimeError("PairingPlan没有可持久化产物")
+        self._require_action_pairer().commit(plan)
 
     def record_fsm_status(self, status: FSMStatus) -> None:
         """追加一条 FSM 状态遥测。
@@ -468,6 +721,9 @@ class EpisodeRecorder:
         ended_at_ns = _require_integer(ended_at_ns, "ended_at_ns", nonnegative=True)
         if ended_at_ns < metadata.started_at_ns:
             raise ValueError("Episode 结束时间不能早于开始时间")
+        # JSONL 每次追加均由 with 块完成 flush/close；此处先终止有界配对状态并把
+        # remaining pending 写成结构化 orphan，再提交 Episode 结束元数据。
+        self.close_action_pairing(ended_at_ns)
         candidate = deepcopy(metadata)
         candidate.ended_at_ns = ended_at_ns
         # 只有原子metadata更新成功后才释放活动状态；失败时调用方仍可诊断或重试。

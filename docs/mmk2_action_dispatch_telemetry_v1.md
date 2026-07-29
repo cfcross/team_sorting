@@ -51,5 +51,7 @@ requested维度；拒绝、过期或安全覆盖不得保留commanded/clipped。
 接收、controller target锁存或机器人执行，因此 `controller_accepted` 和
 `execution_confirmed`始终为null。
 
-本轮不修改Recorder，也不把`/team/action_dispatch`加入Recorder订阅或rosbag列表。待契约
-通过运行时验证后，下一步才可评审Recorder旁路落盘；任何落盘仍不得参与控制。
+Recorder现已通过`topics.action_dispatch`订阅该团队遥测并进行旁路落盘/严格配对，但
+仍不把`/team/action_dispatch`加入rosbag列表。记录侧规则见
+[`mmk2_recorder_action_pairing_v1.md`](mmk2_recorder_action_pairing_v1.md)；任何落盘和
+配对都不得参与控制，也不得把本地调用事实提升为执行确认。

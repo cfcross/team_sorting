@@ -73,7 +73,7 @@
 | `team_sorting/action_mux.py` | 控制安全 | 19 维仲裁、TTL、限幅、安全保持 | 轨迹规划、FSM 决策、ROS 发布 |
 | `team_sorting/controller_manifest.py` | 架构/控制安全 | 从`ACTION_NAMES`派生的版本化控制元数据、运行时范围与配置一致性校验 | ROS发布、动作仲裁、执行确认、第二套动作顺序 |
 | `team_sorting/external_candidate.py` | 控制安全/ROS 集成 | 默认关闭的外部Candidate严格解码、身份/新鲜度/TTL/one-shot安全消费及现有`ManipulationCommand`转换 | 导入rclpy、发布ROS、生成FinalAction、修改FSM、绕过ActionMux、接收pi05原生8维动作 |
-| `team_sorting/recorder.py` | 数据 | Episode 元数据、团队遥测、裁判原文、rosbag 命令辅助 | 参与控制、训练模型、逐帧复制图像 |
+| `team_sorting/recorder.py`、`team_sorting/recording_contracts.py` | 数据 | Episode 元数据、团队遥测、动作/dispatch严格配对、裁判原文、rosbag 命令辅助 | 参与控制、训练模型、逐帧复制图像 |
 | `team_sorting/ros_nodes.py` | ROS 集成 | 三节点 I/O、缓存、转换、组装、唯一官方发布 | YOLO、导航、IK、轨迹算法 |
 | `config/config.yaml` | ROS 集成 | 可部署参数、话题、限幅和记录配置 | 写入未确认规则或开发者绝对路径 |
 | `launch/team.launch.xml` | ROS 集成 | 三节点启动及现有启动参数 | 新增架构节点或业务算法 |
@@ -110,7 +110,7 @@
 interfaces
   ↑
   ├─ perception_2d / perception_3d / navigation / arm_planning
-  └─ arm_execution / fsm / controller_manifest / action_mux / recorder
+  └─ arm_execution / fsm / controller_manifest / action_mux / recording_contracts / recorder
 ros_nodes 组装上述模块并连接 ROS2
 ```
 
@@ -162,6 +162,10 @@ ros_nodes 组装上述模块并连接 ROS2
 - Recorder 禁止为了落盘逐帧复制或重新编码完整图像。
 - `perception_node` 为推理和几何计算进行必要的图像转换不受上述限制。
 - Recorder 只负责采集，禁止在其中实现 ACT/VLA 训练或控制决策。
+- Recorder 配对只能按严格 sequence 和 timestamp 关联 FinalAction/ActionDispatch；不得
+  邻近猜测、补造缺失侧或把配对成功提升为 controller 接受/机器人执行确认。
+- Recorder 配对状态只能在对应 raw/Frame/Issue JSONL 追加成功后提交；写入失败必须保留
+  可重试上下文，终态 sequence 即使近期 digest 淘汰也不得在同一 Episode 重开。
 
 ## 9. 禁止硬编码
 

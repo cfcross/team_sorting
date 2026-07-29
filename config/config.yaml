@@ -60,8 +60,8 @@ topics:
   joint_states: "/joint_states"
   # 团队三维估计：PerceptionNode发布，TeamClientNode消费。
   object_estimates: "/team/object_estimates"
-  # 团队遥测：TeamClientNode发布。Recorder当前仍只订阅既有FinalAction/FSM话题；
-  # action_dispatch是严格诊断契约，本轮不修改Recorder订阅。
+  # 团队遥测：TeamClientNode发布。Recorder订阅FinalAction/FSM，并在下方配对功能
+  # 启用时从同一配置入口订阅action_dispatch；两条动作遥测都不是执行确认。
   final_action: "/team/final_action"
   action_dispatch: "/team/action_dispatch"
   fsm_status: "/team/fsm_status"
@@ -155,6 +155,14 @@ recorder:
   root_dir: "./team_sorting_dataset"
   # EpisodeRecorder生成可读且安全的Episode目录名前缀。
   episode_prefix: "episode"
+  # Recorder旁路配对只关联已经产生的团队遥测，不参与ActionMux、FSM或官方发布。
+  action_pairing:
+    enabled: true
+    max_pending_per_side: 256
+    max_completed_sequences: 1024
+    max_wait_ns: 2000000000
+    prune_period_sec: 0.5
+    raw_payload_preview_chars: 2048
   # rosbag原样保存高带宽传感器、团队遥测和裁判信息；列表必须非空、无重复且以/开头。
   rosbag_topics:
     - "/material/instruction"                         # 原始任务消息

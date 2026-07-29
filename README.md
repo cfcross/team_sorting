@@ -159,7 +159,8 @@ ROS 2 节点可以理解为一个独立运行、通过话题交换消息的程�
 
 ### `dataset_recorder_node`
 
-- **订阅**：`/team/final_action`、`/team/fsm_status`、`/material/instruction`，以及
+- **订阅**：`/team/final_action`、`/team/action_dispatch`、`/team/fsm_status`、
+  `/material/instruction`，以及
   `/referee/taskinfo`、`/referee/gameinfo`、`/referee/score`。配置中的原始传感器和
   `/team/object_estimates` 由它管理的外部 `ros2 bag record` 进程订阅。
 - **发布**：无控制话题；输出是 Episode 目录中的 `rosbag/`、JSONL 和 `metadata.json`。
@@ -353,7 +354,10 @@ Episode 是一次连续采集片段。当前临时边界是 recorder 节点启�
 | Odom、JointState | rosbag | 保留原消息、时间和 frame |
 | `ObjectEstimate3D` | rosbag 中的 `/team/object_estimates` | 保存团队感知输出 |
 | global/local phase | `fsm_status.jsonl`，同时话题进入 rosbag | 来自 `FSMStatus` |
-| `FinalAction[19]` | `final_actions.jsonl`，同时话题进入 rosbag | 保存 `ActionMux` 的唯一最终输出；训练前还要核对 `valid` 和发布状态 |
+| `FinalAction[19]` | `final_actions.jsonl`，同时话题进入 rosbag | 保存 `ActionMux` 的唯一最终输出；格式保持兼容，训练前还要核对 `valid` 和发布状态 |
+| `ActionDispatchRecord` | `action_dispatches.jsonl` | 首条合法 dispatch 立即保存；本轮不把该话题加入 rosbag 列表 |
+| 严格动作配对 | `action_frames.jsonl` | 同 sequence、同 timestamp 的两条遥测结构化配对，不是执行确认 |
+| 配对异常 | `action_pairing_issues.jsonl` | 无效、重复、冲突、超时、容量淘汰与关闭孤儿 |
 | referee 信息 | `metadata.json`，同时进入 rosbag | 原样记录 taskinfo、gameinfo、score，能解析 JSON 时附解析值 |
 | success / score 等结果 | FSM JSONL、referee metadata | `FSMStatus.success` 和 score 已有记录链；官方 Episode 级 success/final result 的来源与接线待确认 |
 
@@ -361,7 +365,8 @@ Episode 是一次连续采集片段。当前临时边界是 recorder 节点启�
 
 - **rosbag** 是 ROS 2 原始消息包，保存 RGB、Depth 等高带宽话题，也保留原消息类型、
   时间戳和坐标系。
-- **JSONL** 是“一行一个 JSON 对象”，便于逐周期读取；这里只保存最终动作和 FSM 状态。
+- **JSONL** 是“一行一个 JSON 对象”，便于逐周期读取；保存 FSM、两条原始合法动作
+  遥测、严格配对 Frame 和配对 Issue。
 - **metadata** 是一个 Episode 的摘要，保存任务原文、`TaskSpec`、裁判消息、bag 状态、
   话题计数和可选最终结果。
 
@@ -372,6 +377,12 @@ Episode 是一次连续采集片段。当前临时边界是 recorder 节点启�
 未插值的路点也不是当时的实发动作，三者都不能替代训练标签。裁判 success/score 是
 Episode 级结果，不能复制成每一帧的真值标签。当前仓库只负责可靠记录，不负责 ACT/VLA
 的数据清洗、训练或在线推理。
+
+Recorder 的任意到达顺序、严格关联、重复/冲突、monotonic 超时、容量淘汰和 shutdown
+orphan 规则见
+[`docs/mmk2_recorder_action_pairing_v1.md`](docs/mmk2_recorder_action_pairing_v1.md)。
+`action_frames.jsonl` 仅证明 Recorder 收到一致的两条内部遥测，不证明 controller 接受
+或机器人执行，也不自动成为训练样本。
 
 ## 11. 配置与正式话题
 
@@ -415,6 +426,11 @@ Episode 级结果，不能复制成每一帧的真值标签。当前仓库只负
 | `recorder.enabled` | `false` | 默认不启动记录 |
 | `recorder.record_rosbag` | `true` | 启动 Recorder 时同时管理 rosbag |
 | `recorder.root_dir` | `./team_sorting_dataset` | Episode 根目录 |
+| `recorder.action_pairing.enabled` | `true` | 订阅并严格配对 FinalAction/Dispatch 内部遥测 |
+| `recorder.action_pairing.max_pending_per_side` | `256` | 每侧等待表容量 |
+| `recorder.action_pairing.max_completed_sequences` | `1024` | 近期终态 digest LRU 容量；精确终态区间账本另行阻止旧 sequence 重开 |
+| `recorder.action_pairing.max_wait_ns` | `2000000000` | 本地 monotonic 最大等待时间 |
+| `recorder.action_pairing.prune_period_sec` | `0.5` | 独立清理定时器周期 |
 
 官方 `mono16` 深度图的原始数值单位按当前代码和测试约定为毫米，因此乘
 `depth_unit_scale_m=0.001` 转为米。例如原始值 `1200` 表示 `1.2 m`。
