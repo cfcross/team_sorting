@@ -94,6 +94,7 @@ from types import SimpleNamespace
 from typing import Any, Optional
 
 from .action_mux import ActionMux, ActionMuxConfig
+from .controller_manifest import validate_controller_config
 from .arm_execution import ArmExecutionController
 from .external_candidate import (
     ExternalCandidateConfig,
@@ -512,6 +513,10 @@ def _load_config() -> dict[str, Any]:
         raise RuntimeError(f"读取配置失败 {path}: {exc}") from exc
     if not isinstance(data, dict):
         raise RuntimeError(f"配置顶层必须是映射：{path}")
+    try:
+        validate_controller_config(data)
+    except ValueError as exc:
+        raise RuntimeError(f"配置与MMK2 Controller Manifest V1不一致 {path}: {exc}") from exc
     return data
 
 

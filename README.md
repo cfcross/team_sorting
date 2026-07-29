@@ -183,6 +183,7 @@ Recorder 是旁路观察者。即使不启动它，控制链也应独立工作�
 | `arm_execution.py` | 轨迹插值、局部抓放状态、试抬和恢复接口 | `JointTrajectory`、`RobotJointState`、时间 | `ManipulationCommand`、执行状态 | 机械臂2 |
 | `fsm.py` | 唯一任务解析、全局阶段转换和重试策略 | 原始任务 JSON、业务事件 | `TaskSpec`、`FSMStatus` | 系统/FSM |
 | `action_mux.py` | 候选动作仲裁、TTL、限幅和安全保持 | 底盘/机械臂建议、实际关节、FSM 状态 | 唯一 `FinalAction[19]` | 控制安全 |
+| `controller_manifest.py` | 版本化控制接口事实与配置一致性校验 | `ACTION_NAMES`、运行时实测范围、配置 | 不可变 `MMK2_CONTROLLER_MANIFEST_V1` | 架构/控制安全 |
 | `recorder.py` | Episode 元数据、团队遥测和 rosbag 命令辅助 | 任务、FSM、最终动作、裁判消息 | metadata、JSONL、rosbag 路径 | 数据 |
 | `ros_nodes.py` | 三节点 I/O、缓存、ROS 消息转换、模块组装和官方发布 | ROS 2 消息、`config.yaml` | ROS 2 消息和节点生命周期 | ROS 集成 |
 
@@ -285,6 +286,11 @@ Referee taskinfo / gameinfo / score
 ## 8. 19 维动作
 
 固定顺序由 `interfaces.ACTION_NAMES` 统一定义：
+
+对应的单位、语义、官方话题、运行时 `ctrlrange`、Server订阅QoS和团队安全范围冻结在
+`controller_manifest.MMK2_CONTROLLER_MANIFEST_V1`；Manifest中的名称仍从
+`ACTION_NAMES`派生，不是第二套动作顺序。详细实测边界见
+[`docs/mmk2_controller_manifest_v1.md`](docs/mmk2_controller_manifest_v1.md)。
 
 | 索引 | 含义 |
 |---|---|
@@ -519,7 +525,7 @@ ros2 launch team_sorting team.launch.xml record_data:=true
 | 机械臂1 | `arm_planning.py`、相关几何测试 | 物体中心、任务、实际关节、末端目标 | `IKResult`、`JointTrajectory` | 把 IK 当反馈、直接发布关节命令、执行状态机 |
 | 机械臂2 | `arm_execution.py` | 轨迹、实际关节、时间 | `ManipulationCommand`、执行/验证状态 | 重新做 IK、绕过 `ActionMux`、用全零冒充保持 |
 | 系统/FSM | `fsm.py`、`tests/test_fsm_mux_recording.py` 中 FSM 测试 | 原始任务、真实业务事件 | `TaskSpec`、`FSMStatus`、重试/失败路径 | 直接控制硬件、绕过唯一任务解析入口 |
-| 控制安全 | `action_mux.py`、动作/TTL 测试 | 两类候选命令、实际关节、FSM 状态 | 唯一 `FinalAction[19]` | 规划轨迹、发布 ROS 话题、定义第二套动作顺序 |
+| 控制安全 | `action_mux.py`、`controller_manifest.py`、动作/TTL/Manifest测试 | 两类候选命令、实际关节、FSM 状态、运行时控制事实 | 唯一 `FinalAction[19]`、版本化安全元数据 | 规划轨迹、发布 ROS 话题、定义第二套动作顺序 |
 | 数据 | `recorder.py`、记录测试 | 任务、FSM、最终动作、裁判消息 | metadata、JSONL、rosbag 命令 | 参与控制、逐帧复制图像、把裁判结果扩成帧标签 |
 | ROS 集成 | `ros_nodes.py`、`config/config.yaml`、`launch/team.launch.xml` | ROS 消息、配置、业务对象 | 三节点 I/O、缓存、转换、唯一官方发布 | 在适配层实现 YOLO/导航/IK/轨迹算法 |
 

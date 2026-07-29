@@ -59,6 +59,7 @@ from .interfaces import (
     ManipulationCommand,
     RobotJointState,
 )
+from .controller_manifest import MMK2_CONTROLLER_MANIFEST_V1
 
 
 # 动作安全配置
@@ -111,19 +112,17 @@ class ActionMuxConfig:
     def conservative_defaults(cls) -> "ActionMuxConfig":
         """构造当前第一版保守默认边界，避免缺少配置时完全失去边界保护。
 
-        这些数值不是官方 MMK2 最终限位，也不能因为函数名包含 ``defaults`` 就被视为
-        比赛规则。正式仿真前必须与模型、运行配置和官方控制接口逐项核对：17 维关节
-        顺序、slide 上下限、头部关节限位、左右臂各关节限位、夹爪控制范围，以及底盘
-        最大安全线速度和角速度。
+        数值来自版本化 Controller Manifest：非底盘范围不超过固定场景Server运行时
+        ``ctrlrange``，双臂六轴还保留原团队范围的交集；底盘仍是团队保守速度上限。
+        Manifest 只描述安全边界，不证明发布、Server接收或机器人实际执行。
         """
 
-        arm_lower = (-3.14, -2.50, -3.14, -2.60, -3.14, -2.60)
-        arm_upper = (3.14, 2.50, 3.14, 2.60, 3.14, 2.60)
+        actions = MMK2_CONTROLLER_MANIFEST_V1.actions
         return cls(
-            max_abs_base_v=0.25,
-            max_abs_base_w=0.50,
-            joint_lower=(-0.04, -0.50, -1.18, *arm_lower, 0.0, *arm_lower, 0.0),
-            joint_upper=(0.87, 0.50, 0.16, *arm_upper, 1.0, *arm_upper, 1.0),
+            max_abs_base_v=actions[0].safe_max,
+            max_abs_base_w=actions[1].safe_max,
+            joint_lower=tuple(action.safe_min for action in actions[2:]),
+            joint_upper=tuple(action.safe_max for action in actions[2:]),
         )
 
 
