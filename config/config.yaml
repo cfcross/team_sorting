@@ -60,8 +60,10 @@ topics:
   joint_states: "/joint_states"
   # 团队三维估计：PerceptionNode发布，TeamClientNode消费。
   object_estimates: "/team/object_estimates"
-  # 团队遥测：TeamClientNode发布，Recorder订阅；不能另拼第二份FinalAction。
+  # 团队遥测：TeamClientNode发布。Recorder当前仍只订阅既有FinalAction/FSM话题；
+  # action_dispatch是严格诊断契约，本轮不修改Recorder订阅。
   final_action: "/team/final_action"
+  action_dispatch: "/team/action_dispatch"
   fsm_status: "/team/fsm_status"
   # 唯一官方动作出口：只允许OfficialCommandPublisher向官方控制器发布这五项。
   # 当前字符串与本机官方源码一致，仍须在正式Docker用ros2 topic list/info核对类型和连接。

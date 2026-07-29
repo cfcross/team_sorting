@@ -92,6 +92,9 @@
 - `ObjectEstimate3D` 是物体中心估计；`place_world_xyz` 是目标物体中心。两者都不是夹爪末端位姿。
 - `BaseCommand` 和 `ManipulationCommand` 只是候选建议；`FinalAction` 是 `ActionMux` 的输出。
 - `FinalAction.values` 必须严格包含 19 项，禁止复制、重排或重新定义索引。
+- `ActionMuxDecision`只能由同一次ActionMux仲裁产生；禁止从`FinalAction`或failure_reason反推mask。
+- `ActionDispatchRecord`只能在官方publisher边界记录精确payload；本地调用成功不得提升为
+  controller accepted或execution confirmed，未发送维度必须为null而不是补零。
 
 19 维顺序只作边界提示，完整定义以 `interfaces.ACTION_NAMES` 为准：
 
@@ -147,6 +150,8 @@ ros_nodes 组装上述模块并连接 ROS2
 
 - `ActionMux` 每个控制周期只能生成一次 `FinalAction`。
 - 官方控制拆分和 `/team/final_action` 遥测必须使用同一对象。
+- 每个已生成`FinalAction`的控制周期还必须发布一条稳定关联的`/team/action_dispatch`；
+  observe-only也必须记录none模式，但该团队话题不得触发任何官方控制。
 - 禁止为 Recorder 重新拼接第二份 19 维动作。
 - `valid=False` 的 `FinalAction` 可以记录用于诊断，但禁止直接作为专家训练动作。
 - 只有 `valid=True` 且进入 `OfficialCommandPublisher` 发布链路的动作，才可视为候选专家动作。

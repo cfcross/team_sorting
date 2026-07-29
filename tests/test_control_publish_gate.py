@@ -32,7 +32,11 @@ OFFICIAL_TOPICS = {
     "/left_arm_forward_position_controller/commands",
     "/right_arm_forward_position_controller/commands",
 }
-TEAM_TELEMETRY_TOPICS = {"/team/final_action", "/team/fsm_status"}
+TEAM_TELEMETRY_TOPICS = {
+    "/team/action_dispatch",
+    "/team/final_action",
+    "/team/fsm_status",
+}
 
 
 class _Context:
@@ -286,6 +290,20 @@ def test_simulation_only_false_is_rejected_before_publishers_are_created() -> No
         )
 
 
+@pytest.mark.parametrize("value", [None, "/team/wrong_dispatch"])
+def test_action_dispatch_topic_is_strictly_validated_before_node_publishers(
+    value: str | None,
+) -> None:
+    ros = _ros()
+    config = _config(observe_only=False, enable_official_publish=True)
+    if value is None:
+        config["topics"].pop("action_dispatch")
+    else:
+        config["topics"]["action_dispatch"] = value
+    with pytest.raises(RuntimeError, match="action_dispatch"):
+        _create_team_client_node(ros)(config, ros)
+
+
 def test_default_candidate_computation_has_no_active_manipulation_hold() -> None:
     node = _node()
     node._arm_execution.create_hold_command = lambda *_args: pytest.fail(
@@ -302,7 +320,7 @@ def test_default_candidate_computation_has_no_active_manipulation_hold() -> None
     assert manipulation_command is None
 
 
-def test_default_control_tick_publishes_only_fsm_and_final_action_telemetry() -> None:
+def test_default_control_tick_publishes_only_team_diagnostic_telemetry() -> None:
     node = _node()
     _prime_control_state(node)
     node._arm_execution.create_hold_command = lambda *_args: pytest.fail(
@@ -313,9 +331,17 @@ def test_default_control_tick_publishes_only_fsm_and_final_action_telemetry() ->
 
     assert len(node.publishers["/team/fsm_status"].messages) == 1
     assert len(node.publishers["/team/final_action"].messages) == 1
+    assert len(node.publishers["/team/action_dispatch"].messages) == 1
     assert not OFFICIAL_TOPICS.intersection(node.publishers)
     payload = json.loads(node.publishers["/team/final_action"].messages[0].data)
     assert payload["action"] == [0.0] * 19
+    dispatch = json.loads(node.publishers["/team/action_dispatch"].messages[0].data)
+    assert dispatch["calculated"] is True
+    assert dispatch["publish_enabled"] is False
+    assert dispatch["publisher_created"] is False
+    assert dispatch["publish_attempted"] is False
+    assert dispatch["dispatch_mode"] == "none"
+    assert dispatch["dispatched_action"] == [None] * 19
 
 
 def test_enabled_official_gate_without_candidate_does_not_publish_control() -> None:
@@ -327,6 +353,7 @@ def test_enabled_official_gate_without_candidate_does_not_publish_control() -> N
     assert _official_message_count(node) == 0
     assert len(node.publishers["/team/fsm_status"].messages) == 1
     assert len(node.publishers["/team/final_action"].messages) == 1
+    assert len(node.publishers["/team/action_dispatch"].messages) == 1
 
 
 def test_one_accepted_candidate_authorizes_exactly_one_control_cycle() -> None:
@@ -367,6 +394,22 @@ def test_one_accepted_candidate_authorizes_exactly_one_control_cycle() -> None:
         node.publishers["/team/final_action"].messages[0].data
     )
     assert final_payload["action"][3:5] == [0.001, 0.002624]
+    dispatch_payload = json.loads(
+        node.publishers["/team/action_dispatch"].messages[0].data
+    )
+    assert dispatch_payload["dispatch_mode"] == "head_only"
+    assert dispatch_payload["dispatched_action"][3:5] == [0.001, 0.0]
+    assert dispatch_payload["dispatched_mask"] == [
+        False,
+        False,
+        False,
+        True,
+        True,
+        *([False] * 14),
+    ]
+    assert dispatch_payload["attempted_groups"] == ["head"]
+    assert dispatch_payload["controller_accepted"] is None
+    assert dispatch_payload["execution_confirmed"] is None
     assert all(
         len(node.publishers[topic].messages) == 0
         for topic in OFFICIAL_TOPICS
@@ -383,6 +426,7 @@ def test_one_accepted_candidate_authorizes_exactly_one_control_cycle() -> None:
     )
     assert len(node.publishers["/team/fsm_status"].messages) == 2
     assert len(node.publishers["/team/final_action"].messages) == 2
+    assert len(node.publishers["/team/action_dispatch"].messages) == 2
 
 
 def test_head_shadow_starts_at_confirmed_reset_target() -> None:
@@ -523,10 +567,13 @@ def test_accepted_candidate_with_non_head_only_mask_fails_closed() -> None:
 
 def test_publish_final_action_without_official_publisher_is_diagnostic_only() -> None:
     node = _node()
-    action = ActionMux().compose(None, None, _joints(), node._fsm.status(NOW), NOW)
+    action, decision = ActionMux().compose_with_decision(
+        None, None, _joints(), node._fsm.status(NOW), NOW
+    )
 
-    assert node._publish_final_action(action) is False
+    assert node._publish_final_action(action, decision=decision) is False
     assert len(node.publishers["/team/final_action"].messages) == 1
+    assert len(node.publishers["/team/action_dispatch"].messages) == 1
     assert not OFFICIAL_TOPICS.intersection(node.publishers)
 
 

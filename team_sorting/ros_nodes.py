@@ -91,7 +91,7 @@ from pathlib import Path
 import signal
 import subprocess
 from types import SimpleNamespace
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 from .action_mux import ActionMux, ActionMuxConfig
 from .controller_manifest import validate_controller_config
@@ -103,10 +103,15 @@ from .external_candidate import (
 )
 from .fsm import FSMEvent, GlobalFSM, InstructionParser
 from .interfaces import (
+    ActionDispatchRecord,
+    ActionMuxDecision,
     BaseCommand,
     BaseState,
     CameraIntrinsics,
     DepthFrame,
+    DispatchGroupRecord,
+    DispatchMode,
+    Float64MultiArrayExactPayload,
     FSMStatus,
     FinalAction,
     ManipulationCommand,
@@ -116,6 +121,8 @@ from .interfaces import (
     SensorSnapshot,
     SlotType,
     TaskSpec,
+    TwistExactPayload,
+    action_dispatch_to_json,
     final_action_from_json,
     final_action_to_json,
     fsm_status_from_json,
@@ -220,6 +227,30 @@ class JointStateMapper:
         )
 
 
+_DISPATCH_GROUP_LAYOUT = (
+    ("base", "cmd_vel", "geometry_msgs/msg/Twist", 0, 2),
+    ("spine", "slide", "std_msgs/msg/Float64MultiArray", 2, 3),
+    ("head", "head", "std_msgs/msg/Float64MultiArray", 3, 5),
+    ("left_arm", "left_arm", "std_msgs/msg/Float64MultiArray", 5, 12),
+    ("right_arm", "right_arm", "std_msgs/msg/Float64MultiArray", 12, 19),
+)
+
+
+def _empty_dispatch_group_records(topics: Mapping[str, str]) -> list[DispatchGroupRecord]:
+    return [
+        DispatchGroupRecord(group, topics[topic_key], message_type, False, None, None)
+        for group, topic_key, message_type, _start, _stop in _DISPATCH_GROUP_LAYOUT
+    ]
+
+
+class OfficialPublishError(RuntimeError):
+    """保留原 RuntimeError 传播语义，同时携带异常发生前的逐组调用事实。"""
+
+    def __init__(self, message: str, group_records: tuple[DispatchGroupRecord, ...]) -> None:
+        super().__init__(message)
+        self.group_records = group_records
+
+
 class OfficialCommandPublisher:
     """唯一允许发布五组官方机器人控制话题的适配器。
 
@@ -242,6 +273,7 @@ class OfficialCommandPublisher:
         if missing:
             raise RuntimeError(f"官方控制话题配置缺失：{missing}")
         self._node = node
+        self._topics = dict(topics)
         self._head_topic = topics["head"]
         tracking = head_target_tracking or {
             "enabled": False,
@@ -287,14 +319,23 @@ class OfficialCommandPublisher:
         ``RuntimeError``；调用方必须把同一对象用于 ``/team/final_action`` 遥测。
         """
 
+        self.publish_with_trace(action)
+
+    def _empty_group_records(self) -> list[DispatchGroupRecord]:
+        return _empty_dispatch_group_records(self._topics)
+
+    def publish_with_trace(self, action: FinalAction) -> tuple[DispatchGroupRecord, ...]:
+        """按原顺序 full 发布，并返回或随异常携带精确逐组 payload。"""
+
+        records = self._empty_group_records()
         if not action.valid:
-            raise RuntimeError(f"拒绝发布无效 FinalAction：{action.failure_reason}")
+            raise OfficialPublishError(
+                f"拒绝发布无效 FinalAction：{action.failure_reason}", tuple(records)
+            )
         values = action.values
         base = self._ros.Twist()
-        base.linear.x = values[0]
-        base.angular.z = values[1]
-
-        # 19 维动作只在此处拆分：2 个底盘量 + 1 slide + 2 head + 左右各 7 项。
+        base.linear.x, base.linear.y, base.linear.z = values[0], 0.0, 0.0
+        base.angular.x, base.angular.y, base.angular.z = 0.0, 0.0, values[1]
         slide = self._ros.Float64MultiArray()
         slide.data = list(values[2:3])
         head = self._ros.Float64MultiArray()
@@ -303,14 +344,40 @@ class OfficialCommandPublisher:
         left.data = list(values[5:12])
         right = self._ros.Float64MultiArray()
         right.data = list(values[12:19])
-        try:
-            self._base.publish(base)
-            self._slide.publish(slide)
-            self._head.publish(head)
-            self._left.publish(left)
-            self._right.publish(right)
-        except Exception as exc:  # noqa: BLE001 - ROS 中间件异常统一说明
-            raise RuntimeError(f"发布官方控制话题失败：{exc}") from exc
+        calls = (
+            (
+                0,
+                self._base,
+                base,
+                TwistExactPayload(
+                    (base.linear.x, base.linear.y, base.linear.z),
+                    (base.angular.x, base.angular.y, base.angular.z),
+                ),
+            ),
+            (1, self._slide, slide, Float64MultiArrayExactPayload(tuple(slide.data))),
+            (2, self._head, head, Float64MultiArrayExactPayload(tuple(head.data))),
+            (3, self._left, left, Float64MultiArrayExactPayload(tuple(left.data))),
+            (4, self._right, right, Float64MultiArrayExactPayload(tuple(right.data))),
+        )
+        for index, publisher, message, payload in calls:
+            record = records[index]
+            try:
+                publisher.publish(message)
+            except Exception as exc:  # noqa: BLE001 - 保留部分成功并停止后续调用
+                records[index] = replace(
+                    record,
+                    attempted=True,
+                    succeeded=False,
+                    exact_payload=payload,
+                    failure_reason=str(exc),
+                )
+                raise OfficialPublishError(
+                    f"发布官方控制话题失败：{exc}", tuple(records)
+                ) from exc
+            records[index] = replace(
+                record, attempted=True, succeeded=True, exact_payload=payload
+            )
+        return tuple(records)
 
     def head_writer_is_exclusive(self) -> bool:
         """只在ROS graph确认本节点是head话题唯一publisher时返回真。"""
@@ -329,27 +396,37 @@ class OfficialCommandPublisher:
         controller target shadow。发布成功后才更新yaw shadow，失败时保持原值。
         """
 
+        self.publish_head_with_trace(action)
+
+    def publish_head_with_trace(
+        self, action: FinalAction
+    ) -> tuple[DispatchGroupRecord, ...]:
+        """只发布 head，并精确记录 yaw 与 controller-target shadow pitch。"""
+
+        records = self._empty_group_records()
         if not action.valid:
-            raise RuntimeError(f"拒绝发布无效 FinalAction：{action.failure_reason}")
+            raise OfficialPublishError(
+                f"拒绝发布无效 FinalAction：{action.failure_reason}", tuple(records)
+            )
         if not self._head_tracking_enabled:
             self.last_head_publish_failure_reason = "head_target_tracking_disabled"
-            raise RuntimeError(self.last_head_publish_failure_reason)
+            raise OfficialPublishError(self.last_head_publish_failure_reason, tuple(records))
         if self.last_head_controller_target is None:
             self.last_head_publish_failure_reason = "fresh_reset_not_confirmed"
-            raise RuntimeError(self.last_head_publish_failure_reason)
+            raise OfficialPublishError(self.last_head_publish_failure_reason, tuple(records))
         if self._require_exclusive_head_writer and not self.head_writer_is_exclusive():
             self.last_head_publish_failure_reason = "head_writer_not_exclusive"
-            raise RuntimeError(self.last_head_publish_failure_reason)
+            raise OfficialPublishError(self.last_head_publish_failure_reason, tuple(records))
         yaw_target = action.values[3]
         if isinstance(yaw_target, bool) or not isinstance(yaw_target, (int, float)):
             self.last_head_publish_failure_reason = "head_yaw_target_invalid"
-            raise RuntimeError(self.last_head_publish_failure_reason)
+            raise OfficialPublishError(self.last_head_publish_failure_reason, tuple(records))
         yaw_target = float(yaw_target)
         if not math.isfinite(yaw_target) or not (
             self._head_yaw_bounds[0] <= yaw_target <= self._head_yaw_bounds[1]
         ):
             self.last_head_publish_failure_reason = "head_yaw_target_out_of_range"
-            raise RuntimeError(self.last_head_publish_failure_reason)
+            raise OfficialPublishError(self.last_head_publish_failure_reason, tuple(records))
         pitch_target = self.last_head_controller_target[1]
         if not math.isfinite(pitch_target) or not (
             self._head_pitch_bounds[0]
@@ -357,16 +434,30 @@ class OfficialCommandPublisher:
             <= self._head_pitch_bounds[1]
         ):
             self.last_head_publish_failure_reason = "head_pitch_shadow_invalid"
-            raise RuntimeError(self.last_head_publish_failure_reason)
+            raise OfficialPublishError(self.last_head_publish_failure_reason, tuple(records))
         head = self._ros.Float64MultiArray()
         head.data = [yaw_target, pitch_target]
+        payload = Float64MultiArrayExactPayload(tuple(head.data))
         try:
             self._head.publish(head)
         except Exception as exc:  # noqa: BLE001 - ROS 中间件异常统一说明
             self.last_head_publish_failure_reason = "head_publish_failed"
-            raise RuntimeError(f"发布官方head控制话题失败：{exc}") from exc
+            records[2] = replace(
+                records[2],
+                attempted=True,
+                succeeded=False,
+                exact_payload=payload,
+                failure_reason=str(exc),
+            )
+            raise OfficialPublishError(
+                f"发布官方head控制话题失败：{exc}", tuple(records)
+            ) from exc
+        records[2] = replace(
+            records[2], attempted=True, succeeded=True, exact_payload=payload
+        )
         self.last_head_controller_target[0] = yaw_target
         self.last_head_publish_failure_reason = ""
+        return tuple(records)
 
     def publish_emergency_base_stop(self) -> None:
         """仅在未来明确授权的底盘控制故障路径尽力发布零速度。
@@ -383,6 +474,62 @@ class OfficialCommandPublisher:
             self._base.publish(base)
         except Exception as exc:  # noqa: BLE001 - 转成边界错误并由生命周期调用方记录
             raise RuntimeError(f"紧急发布底盘零速度失败：{exc}") from exc
+
+
+def _build_action_dispatch_record(
+    action: FinalAction,
+    decision: ActionMuxDecision,
+    *,
+    publish_enabled: bool,
+    publisher_created: bool,
+    dispatch_mode: DispatchMode,
+    group_records: tuple[DispatchGroupRecord, ...],
+    failure_reason: str = "",
+) -> ActionDispatchRecord:
+    """从 publisher 边界事实构造固定 19 维、未发送项为 null 的记录。"""
+
+    dispatched: list[Optional[float]] = [None] * 19
+    for record, (_group, _topic_key, _message_type, start, stop) in zip(
+        group_records, _DISPATCH_GROUP_LAYOUT
+    ):
+        if not record.attempted:
+            continue
+        if isinstance(record.exact_payload, TwistExactPayload):
+            dispatched[0] = record.exact_payload.linear_xyz[0]
+            dispatched[1] = record.exact_payload.angular_xyz[2]
+        elif isinstance(record.exact_payload, Float64MultiArrayExactPayload):
+            if len(record.exact_payload.data) != stop - start:
+                raise ValueError(f"{record.group} exact_payload 长度与官方分组不一致")
+            dispatched[start:stop] = record.exact_payload.data
+        else:
+            raise ValueError(f"{record.group} attempted 但缺少受支持的 exact_payload")
+    mask = tuple(value is not None for value in dispatched)
+    attempted = tuple(record.group for record in group_records if record.attempted)
+    successful = tuple(record.group for record in group_records if record.succeeded is True)
+    failed = tuple(record.group for record in group_records if record.succeeded is False)
+    return ActionDispatchRecord(
+        schema_name="MMK2ActionDispatchRecord",
+        schema_version=1,
+        sequence=action.sequence,
+        timestamp_ns=action.timestamp_ns,
+        final_action_sequence=action.sequence,
+        decision=decision,
+        calculated=True,
+        publish_enabled=publish_enabled,
+        publisher_created=publisher_created,
+        publish_attempted=bool(attempted),
+        publisher_call_succeeded=None if not attempted else not failed,
+        dispatch_mode=dispatch_mode,
+        dispatched_action=tuple(dispatched),
+        dispatched_mask=mask,
+        attempted_groups=attempted,
+        successful_groups=successful,
+        failed_groups=failed,
+        group_records=group_records,
+        controller_accepted=None,
+        execution_confirmed=None,
+        failure_reason=failure_reason,
+    )
 
 
 def main_team_client(args: Optional[list[str]] = None) -> None:
@@ -517,6 +664,7 @@ def _load_config() -> dict[str, Any]:
         validate_controller_config(data)
     except ValueError as exc:
         raise RuntimeError(f"配置与MMK2 Controller Manifest V1不一致 {path}: {exc}") from exc
+    _validated_action_dispatch_topic(data.get("topics"))
     return data
 
 
@@ -608,6 +756,7 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             self._ros = ros_deps
             self._config = config
             topics = config["topics"]
+            action_dispatch_topic = _validated_action_dispatch_topic(topics)
             timing = config["timing"]
             self._state_max_delta_ns = int(float(timing["state_max_delta_s"]) * 1e9)
             self._command_ttl_ns = int(float(timing["command_ttl_s"]) * 1e9)
@@ -645,8 +794,10 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             self._observe_only = control["observe_only"]
             self._enable_official_publish = control["enable_official_publish"]
             self._simulation_only = control["simulation_only"]
+            self._official_topics = dict(topics["official_commands"])
+            self._publish_enabled = _official_publish_enabled(control)
             self._official_publisher: Optional[OfficialCommandPublisher] = None
-            if _official_publish_enabled(control):
+            if self._publish_enabled:
                 head_tracking = {
                     **control["head_target_tracking"],
                     "yaw_lower": self._mux.config.joint_lower[1],
@@ -670,6 +821,9 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                     f"official_publish_disabled:{reason};仅发布团队诊断遥测"
                 )
             self._action_pub = self.create_publisher(ros.String, topics["final_action"], 10)
+            self._dispatch_pub = self.create_publisher(
+                ros.String, action_dispatch_topic, 10
+            )
             self._fsm_pub = self.create_publisher(ros.String, topics["fsm_status"], 10)
             self.create_subscription(ros.String, topics["instruction"], self._on_instruction, 10)
             if _external_candidate_subscription_enabled(self._external_candidate_config):
@@ -959,6 +1113,7 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             self,
             action: FinalAction,
             *,
+            decision: ActionMuxDecision,
             head_publish_authorized: bool = False,
             safety_exit_authorized: bool = False,
             diagnostic_only: bool = False,
@@ -971,32 +1126,54 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             独立的安全路径。
             """
 
-            if diagnostic_only or self._official_publisher is None:
+            group_records = tuple(
+                _empty_dispatch_group_records(self._official_topics)
+            )
+            dispatch_mode = DispatchMode.NONE
+            dispatch_failure_reason = ""
+            if diagnostic_only:
                 published = False
+                dispatch_failure_reason = "diagnostic_only"
+            elif self._official_publisher is None:
+                published = False
+                dispatch_failure_reason = (
+                    "observe_only"
+                    if self._observe_only
+                    else "enable_official_publish=false"
+                )
             elif not self._context_ok():
                 self._log_control_warning_on_change(
                     "ROS context已失效，禁止尝试官方控制发布"
                 )
                 published = False
+                dispatch_failure_reason = "ros_context_unavailable"
             elif not action.valid:
                 self._publish_emergency_base_stop(
                     f"ActionMux 输出无效，禁止发布19维动作：{action.failure_reason}"
                 )
                 published = False
+                dispatch_failure_reason = "invalid_final_action"
             elif safety_exit_authorized:
+                dispatch_mode = DispatchMode.FULL
                 try:
-                    self._official_publisher.publish(action)
+                    group_records = self._official_publisher.publish_with_trace(action)
                     published = True
-                except RuntimeError as exc:
+                except OfficialPublishError as exc:
+                    group_records = exc.group_records
+                    dispatch_failure_reason = str(exc)
                     self._publish_emergency_base_stop(f"官方控制发布失败：{exc}")
                     published = False
             elif not head_publish_authorized:
                 published = False
+                dispatch_failure_reason = "current_cycle_not_authorized"
             else:
+                dispatch_mode = DispatchMode.HEAD_ONLY
                 try:
-                    self._official_publisher.publish_head(action)
+                    group_records = self._official_publisher.publish_head_with_trace(action)
                     published = True
-                except RuntimeError as exc:
+                except OfficialPublishError as exc:
+                    group_records = exc.group_records
+                    dispatch_failure_reason = str(exc)
                     # head Candidate失败不能顺带授权cmd_vel或其他四组官方话题。
                     self._log_control_warning_on_change(
                         f"官方head控制发布失败：{exc}"
@@ -1006,6 +1183,18 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             action_message = self._ros.String()
             action_message.data = final_action_to_json(action)
             self._action_pub.publish(action_message)
+            dispatch = _build_action_dispatch_record(
+                action,
+                decision,
+                publish_enabled=self._publish_enabled,
+                publisher_created=self._official_publisher is not None,
+                dispatch_mode=dispatch_mode,
+                group_records=group_records,
+                failure_reason=dispatch_failure_reason,
+            )
+            dispatch_message = self._ros.String()
+            dispatch_message.data = action_dispatch_to_json(dispatch)
+            self._dispatch_pub.publish(dispatch_message)
             return published
 
         def _context_ok(self) -> bool:
@@ -1092,8 +1281,17 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 )
             else:
                 self._log_control_warning_on_change("")
-            final_action = self._mux.compose(
-                base_command, manipulation_command, joints, status, now_ns
+            final_action, mux_decision = self._mux.compose_with_decision(
+                base_command,
+                manipulation_command,
+                joints,
+                status,
+                now_ns,
+                manipulation_source=(
+                    "external_candidate"
+                    if external_decision.accepted
+                    else "manipulation_command"
+                ),
             )
             candidate_publish_authorized = (
                 external_decision.accepted
@@ -1107,6 +1305,7 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 )
             published = self._publish_final_action(
                 final_action,
+                decision=mux_decision,
                 head_publish_authorized=candidate_publish_authorized,
                 diagnostic_only=(
                     external_decision.accepted and not candidate_publish_authorized
@@ -1605,6 +1804,17 @@ def _action_mux_config(config: dict[str, Any]) -> ActionMuxConfig:
         joint_lower=tuple(float(value) for value in action["joint_lower"]),
         joint_upper=tuple(float(value) for value in action["joint_upper"]),
     )
+
+
+def _validated_action_dispatch_topic(value: object) -> str:
+    """冻结团队内部dispatch遥测入口，且在任何官方publisher创建前失败。"""
+
+    if not isinstance(value, Mapping):
+        raise RuntimeError("topics配置必须是映射")
+    topic = value.get("action_dispatch")
+    if topic != "/team/action_dispatch":
+        raise RuntimeError("topics.action_dispatch必须严格为/team/action_dispatch")
+    return topic
 
 
 def _validated_control_config(config: dict[str, Any]) -> dict[str, Any]:

@@ -28,7 +28,7 @@ Candidate 也不能绕过现有 `ActionMux -> FinalAction[19] -> OfficialCommand
 External Candidate三道门之外还有独立的全局官方发布门。默认
 `control.observe_only=true`、`control.enable_official_publish=false`、
 `control.simulation_only=true`：节点可以订阅状态、运行FSM和ActionMux，并发布
-`/team/fsm_status`、`/team/final_action`诊断遥测，但不会创建
+`/team/fsm_status`、`/team/final_action`、`/team/action_dispatch`诊断遥测，但不会创建
 `OfficialCommandPublisher`或五组官方控制publisher，退出时也不会发布紧急底盘命令。
 只有显式同时设置`observe_only=false`、`enable_official_publish=true`且
 `simulation_only=true`才会创建官方发布器；observe-only优先关闭发布，
@@ -144,7 +144,7 @@ ROS 2 节点可以理解为一个独立运行、通过话题交换消息的程�
 
 - **订阅**：`/material/instruction`、`/slamware_ros_sdk_server_node/odom`、
   `/joint_states`、`/team/object_estimates`。
-- **发布**：团队遥测 `/team/fsm_status`、`/team/final_action`；只有全局发布门开启时，
+- **发布**：团队遥测 `/team/fsm_status`、`/team/final_action`、`/team/action_dispatch`；只有全局发布门开启时，
   才通过唯一的 `OfficialCommandPublisher` 发布五组官方控制话题。默认不创建该实例。
 - **调用**：当前实际调用 `fsm.py`、`action_mux.py`，并保留 `arm_execution.py` 的显式
   主动保持能力，以及 `navigation.py` 的区域分类；完整架构还应
@@ -280,8 +280,8 @@ Referee taskinfo / gameinfo / score
 2. `ObjectEstimate3D` 与 `TaskSpec.place_world_xyz` 描述物体中心；夹爪末端位姿还需要结合
    抓取方向、双臂间距和物体—夹爪关系另行规划。
 3. `BaseCommand` 和 `ManipulationCommand` 都只是模块建议；`ActionMux` 先生成
-   `FinalAction`，只有其中 `valid=True` 且经过 `OfficialCommandPublisher` 成功发布的
-   动作，才是实际控制动作。
+   `FinalAction`；`ActionMuxDecision`记录请求与接受关系，`ActionDispatchRecord`记录
+   本地publisher调用事实。即使publisher正常返回，也不能称为Server已接受或机器人已执行。
 
 ## 8. 19 维动作
 
@@ -313,7 +313,10 @@ Server 内部的左右轮速数组**。轮子数量、方向和底盘解算属�
 同一个不可变 `FinalAction` 对象用于官方话题发布和 `/team/final_action` 遥测，避免因
 再次拼接、重新限幅或索引错位产生“记录值与实发值不同”。但对象由 `ActionMux` 生成
 不等于已经控制机器人：只有 `valid=True` 且经过 `OfficialCommandPublisher` 成功发布的
-动作，才能视为实际控制动作；`valid=False` 的对象只能用于诊断记录。
+动作，仍只能视为本地候选dispatch；`valid=False` 的对象只能用于诊断记录。逐维
+requested/commanded/clipped/safety override以及真正publisher payload由
+`/team/action_dispatch`的V1严格JSON表达，见
+[`docs/mmk2_action_dispatch_telemetry_v1.md`](docs/mmk2_action_dispatch_telemetry_v1.md)。
 
 ## 9. ActionMux 与安全设计
 
@@ -385,6 +388,7 @@ Episode 级结果，不能复制成每一帧的真值标签。当前仓库只负
 | JointState | `/joint_states` |
 | 三维目标 | `/team/object_estimates` |
 | 最终动作遥测 | `/team/final_action` |
+| 动作决策与dispatch遥测 | `/team/action_dispatch` |
 | FSM 遥测 | `/team/fsm_status` |
 | 官方底盘控制 | `/cmd_vel` |
 | 官方 slide 控制 | `/spine_forward_position_controller/commands` |

@@ -52,7 +52,9 @@ from numbers import Real
 from typing import Optional
 
 from .interfaces import (
+    ActionMuxDecision,
     BaseCommand,
+    CandidateDisposition,
     FinalAction,
     FSMStatus,
     GlobalPhase,
@@ -177,7 +179,29 @@ class ActionMux:
         fsm_status: FSMStatus,
         now_ns: int,
     ) -> FinalAction:
-        """合成本控制周期唯一的固定 19 维最终动作。
+        """保持原有 API，只返回与此前数值和序列语义一致的 FinalAction。"""
+
+        action, _decision = self.compose_with_decision(
+            base_command,
+            manipulation_command,
+            actual_joints,
+            fsm_status,
+            now_ns,
+        )
+        return action
+
+    def compose_with_decision(
+        self,
+        base_command: Optional[BaseCommand],
+        manipulation_command: Optional[ManipulationCommand],
+        actual_joints: RobotJointState,
+        fsm_status: FSMStatus,
+        now_ns: int,
+        *,
+        base_source: str = "base_command",
+        manipulation_source: str = "manipulation_command",
+    ) -> tuple[FinalAction, ActionMuxDecision]:
+        """一次仲裁同时生成兼容 FinalAction 和不可变逐维 Decision V1。
 
         五个输入分别承担不同职责：
 
@@ -212,7 +236,22 @@ class ActionMux:
         """
 
         reasons: list[str] = []
-        clipped = False
+        requested_mask = [False] * 19
+        commanded_mask = [False] * 19
+        clipped_mask = [False] * 19
+        safety_override_mask = [False] * 19
+        base_present = base_command is not None
+        manipulation_present = manipulation_command is not None
+        if base_present:
+            requested_mask[0:2] = [True, True]
+        if manipulation_present:
+            requested_mask[2:19] = list(manipulation_command.controlled_mask)
+        base_disposition = CandidateDisposition.ABSENT
+        manipulation_disposition = CandidateDisposition.ABSENT
+        if not base_present:
+            base_source = "none"
+        if not manipulation_present:
+            manipulation_source = "none"
         output_valid = actual_joints.valid
         stop_phase = fsm_status.global_phase in self._STOP_PHASES
 
@@ -229,8 +268,18 @@ class ActionMux:
             )
             if fsm_status.failure_reason:
                 reasons.append(fsm_status.failure_reason)
+            safety_override_mask[:] = [True] * 19
+            if base_present:
+                base_disposition = CandidateDisposition.SAFETY_OVERRIDDEN
+            if manipulation_present:
+                manipulation_disposition = CandidateDisposition.SAFETY_OVERRIDDEN
         elif not actual_joints.valid:
             reasons.append("实际关节反馈无效，忽略普通底盘和机械臂候选命令")
+            safety_override_mask[:] = [True] * 19
+            if base_present:
+                base_disposition = CandidateDisposition.SAFETY_OVERRIDDEN
+            if manipulation_present:
+                manipulation_disposition = CandidateDisposition.SAFETY_OVERRIDDEN
 
         # 底盘候选命令处理
         base_v = 0.0
@@ -241,8 +290,12 @@ class ActionMux:
                 reasons.append("无底盘候选命令，输出零速度")
             elif not base_command.valid:
                 reasons.append(base_command.failure_reason or "底盘候选命令无效")
+                base_disposition = CandidateDisposition.REJECTED_INVALID
+                safety_override_mask[0:2] = [True, True]
             elif now_ns >= base_command.valid_until_ns:
                 reasons.append("底盘候选命令已过期，输出零速度")
+                base_disposition = CandidateDisposition.REJECTED_STALE
+                safety_override_mask[0:2] = [True, True]
             else:
                 try:
                     if isinstance(base_command.v, bool) or isinstance(base_command.w, bool):
@@ -251,19 +304,23 @@ class ActionMux:
                     candidate_w = float(base_command.w)
                 except (TypeError, ValueError, OverflowError) as exc:
                     reasons.append(f"底盘候选速度格式无效，输出零速度：{exc}")
+                    base_disposition = CandidateDisposition.REJECTED_INVALID
+                    safety_override_mask[0:2] = [True, True]
                 else:
                     # 非有限速度属于非法输入并归零；有限但超界的速度才进入限幅流程。
                     if not math.isfinite(candidate_v) or not math.isfinite(candidate_w):
                         reasons.append("底盘候选速度包含 NaN 或 Inf，输出零速度")
+                        base_disposition = CandidateDisposition.REJECTED_INVALID
+                        safety_override_mask[0:2] = [True, True]
                     else:
-                        base_v, was_clipped = self._clip(
+                        base_disposition = CandidateDisposition.ACCEPTED
+                        commanded_mask[0:2] = [True, True]
+                        base_v, clipped_mask[0] = self._clip(
                             candidate_v, -self.config.max_abs_base_v, self.config.max_abs_base_v
                         )
-                        clipped |= was_clipped
-                        base_w, was_clipped = self._clip(
+                        base_w, clipped_mask[1] = self._clip(
                             candidate_w, -self.config.max_abs_base_w, self.config.max_abs_base_w
                         )
-                        clipped |= was_clipped
 
         # 机械臂候选命令处理
         # 后 17 项先复制实际反馈，避免缺失、无效或过期命令把“保持”错误写成全零姿态。
@@ -274,25 +331,31 @@ class ActionMux:
                 reasons.append("无机械臂候选命令，保持实际关节位置")
             elif not manipulation_command.valid:
                 reasons.append(manipulation_command.failure_reason or "机械臂候选命令无效")
+                manipulation_disposition = CandidateDisposition.REJECTED_INVALID
+                safety_override_mask[2:19] = requested_mask[2:19]
             elif now_ns >= manipulation_command.valid_until_ns:
                 reasons.append("机械臂候选命令已过期，保持实际关节位置")
+                manipulation_disposition = CandidateDisposition.REJECTED_STALE
+                safety_override_mask[2:19] = requested_mask[2:19]
             else:
+                manipulation_disposition = CandidateDisposition.ACCEPTED
                 for index, controlled in enumerate(manipulation_command.controlled_mask):
                     if controlled:
                         controlled_mask[index] = True
+                        commanded_mask[index + 2] = True
                         joint_targets[index] = manipulation_command.joint_target[index]
 
         # 实际关节保持与越界检查
         # mask=True 才限幅候选；mask=False 必须原样保持实际值，不能借“限幅”主动移动。
         for index, target in enumerate(joint_targets):
             if controlled_mask[index]:
-                joint_targets[index], was_clipped = self._clip(
+                joint_targets[index], clipped_mask[index + 2] = self._clip(
                     float(target), self.config.joint_lower[index], self.config.joint_upper[index]
                 )
-                clipped |= was_clipped
             elif target < self.config.joint_lower[index] or target > self.config.joint_upper[index]:
                 # 实际保持值超界时不能静默移动到边界；保留快照并阻止官方发布。
                 output_valid = False
+                safety_override_mask[index + 2] = True
                 reasons.append(
                     f"未受控的实际关节第 {index} 项超出配置边界 "
                     f"[{self.config.joint_lower[index]}, {self.config.joint_upper[index]}]；"
@@ -304,16 +367,38 @@ class ActionMux:
         values = (base_v, base_w, *joint_targets)
         # 正常、保持和无效诊断输出都占一个控制周期；序号不代表已发布或已执行。
         self._sequence += 1
-        return FinalAction(
+        action = FinalAction(
             values=values,
             sequence=self._sequence,
             timestamp_ns=int(now_ns),
             global_phase=fsm_status.global_phase,
             local_phase=fsm_status.local_phase,
             valid=output_valid,
-            clipped=clipped,
+            clipped=any(clipped_mask),
             failure_reason="；".join(reasons),
         )
+        decision = ActionMuxDecision(
+            schema_name="MMK2ActionMuxDecision",
+            schema_version=1,
+            sequence=action.sequence,
+            timestamp_ns=action.timestamp_ns,
+            final_action_sequence=action.sequence,
+            requested_mask=tuple(requested_mask),
+            commanded_mask=tuple(commanded_mask),
+            clipped_mask=tuple(clipped_mask),
+            safety_override_mask=tuple(safety_override_mask),
+            base_candidate_present=base_present,
+            manipulation_candidate_present=manipulation_present,
+            base_disposition=base_disposition,
+            manipulation_disposition=manipulation_disposition,
+            base_source=base_source,
+            manipulation_source=manipulation_source,
+            global_phase=fsm_status.global_phase,
+            local_phase=fsm_status.local_phase,
+            valid=action.valid,
+            failure_reason=action.failure_reason,
+        )
+        return action, decision
 
     # 通用限幅工具
     @staticmethod

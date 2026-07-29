@@ -20,7 +20,7 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum
 import json
 import math
-from typing import Any, Optional, Sequence
+from typing import Any, Mapping, Optional, Sequence
 
 
 # 固定动作和关节名称
@@ -899,6 +899,661 @@ class FinalAction:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "values", ensure_finite_vector(self.values, 19, "FinalAction"))
+
+
+class CandidateDisposition(str, Enum):
+    """ActionMux 对一类候选的受控处置结果，不依赖 failure_reason 文本推断。"""
+
+    ABSENT = "absent"
+    ACCEPTED = "accepted"
+    REJECTED_INVALID = "rejected_invalid"
+    REJECTED_STALE = "rejected_stale"
+    SAFETY_OVERRIDDEN = "safety_overridden"
+    PARTIALLY_ACCEPTED = "partially_accepted"
+
+
+class DispatchMode(str, Enum):
+    """本周期官方发布路径；不表达 Server 接收或机器人执行。"""
+
+    NONE = "none"
+    HEAD_ONLY = "head_only"
+    FULL = "full"
+
+
+def _strict_bool_tuple(values: Sequence[bool], length: int, label: str) -> tuple[bool, ...]:
+    result = tuple(values)
+    if len(result) != length or any(type(value) is not bool for value in result):
+        raise ValueError(f"{label} 必须包含 {length} 项严格 bool")
+    return result
+
+
+def _strict_nonnegative_int(value: object, label: str) -> int:
+    if type(value) is not int or value < 0:
+        raise ValueError(f"{label} 必须是非负整数且不能是 bool")
+    return value
+
+
+def _strict_optional_float_tuple(
+    values: Sequence[Optional[float]], length: int, label: str
+) -> tuple[Optional[float], ...]:
+    result = tuple(values)
+    if len(result) != length:
+        raise ValueError(f"{label} 必须包含 {length} 项")
+    normalized: list[Optional[float]] = []
+    for index, value in enumerate(result):
+        if value is None:
+            normalized.append(None)
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{label}[{index}] 必须是有限数或 null，不能是 bool")
+        number = float(value)
+        if not math.isfinite(number):
+            raise ValueError(f"{label}[{index}] 必须是有限数或 null")
+        normalized.append(number)
+    return tuple(normalized)
+
+
+@dataclass(frozen=True)
+class ActionMuxDecision:
+    """与一个 FinalAction 稳定关联的逐维候选仲裁事实。"""
+
+    schema_name: str
+    schema_version: int
+    sequence: int
+    timestamp_ns: int
+    final_action_sequence: int
+    requested_mask: tuple[bool, ...]
+    commanded_mask: tuple[bool, ...]
+    clipped_mask: tuple[bool, ...]
+    safety_override_mask: tuple[bool, ...]
+    base_candidate_present: bool
+    manipulation_candidate_present: bool
+    base_disposition: CandidateDisposition
+    manipulation_disposition: CandidateDisposition
+    base_source: str
+    manipulation_source: str
+    global_phase: GlobalPhase
+    local_phase: LocalPhase
+    valid: bool
+    failure_reason: str = ""
+
+    def __post_init__(self) -> None:
+        if (
+            self.schema_name != "MMK2ActionMuxDecision"
+            or type(self.schema_version) is not int
+            or self.schema_version != 1
+        ):
+            raise ValueError("ActionMuxDecision schema 必须为 MMK2ActionMuxDecision V1")
+        _strict_nonnegative_int(self.sequence, "ActionMuxDecision.sequence")
+        _strict_nonnegative_int(self.timestamp_ns, "ActionMuxDecision.timestamp_ns")
+        _strict_nonnegative_int(
+            self.final_action_sequence, "ActionMuxDecision.final_action_sequence"
+        )
+        if self.sequence != self.final_action_sequence:
+            raise ValueError("ActionMuxDecision 必须与 FinalAction sequence 稳定关联")
+        requested = _strict_bool_tuple(self.requested_mask, 19, "requested_mask")
+        commanded = _strict_bool_tuple(self.commanded_mask, 19, "commanded_mask")
+        clipped = _strict_bool_tuple(self.clipped_mask, 19, "clipped_mask")
+        overridden = _strict_bool_tuple(
+            self.safety_override_mask, 19, "safety_override_mask"
+        )
+        object.__setattr__(self, "requested_mask", requested)
+        object.__setattr__(self, "commanded_mask", commanded)
+        object.__setattr__(self, "clipped_mask", clipped)
+        object.__setattr__(self, "safety_override_mask", overridden)
+        if any(commanded[index] and not requested[index] for index in range(19)):
+            raise ValueError("commanded_mask 不能包含 requested_mask 之外的维度")
+        if any(clipped[index] and not commanded[index] for index in range(19)):
+            raise ValueError("clipped_mask 只能标记已接受的业务命令")
+        if any(commanded[index] and overridden[index] for index in range(19)):
+            raise ValueError("commanded_mask 与 safety_override_mask 不能重叠")
+        for label, value in (
+            ("base_candidate_present", self.base_candidate_present),
+            ("manipulation_candidate_present", self.manipulation_candidate_present),
+            ("valid", self.valid),
+        ):
+            if type(value) is not bool:
+                raise ValueError(f"{label} 必须是严格 bool")
+        if not isinstance(self.base_disposition, CandidateDisposition) or not isinstance(
+            self.manipulation_disposition, CandidateDisposition
+        ):
+            raise ValueError("候选 disposition 必须使用 CandidateDisposition")
+        if not isinstance(self.global_phase, GlobalPhase) or not isinstance(
+            self.local_phase, LocalPhase
+        ):
+            raise ValueError("ActionMuxDecision phase 必须使用受控枚举")
+        if not isinstance(self.failure_reason, str):
+            raise ValueError("ActionMuxDecision.failure_reason 必须是字符串")
+        if requested[:2] != (self.base_candidate_present,) * 2:
+            raise ValueError("requested_mask 的 base 维度必须反映 BaseCommand 是否存在")
+        if not self.manipulation_candidate_present and any(requested[2:]):
+            raise ValueError("无 ManipulationCommand 时不得请求位置维度")
+        allowed_sources = {
+            "none",
+            "base_command",
+            "manipulation_command",
+            "external_candidate",
+        }
+        if (
+            not isinstance(self.base_source, str)
+            or not isinstance(self.manipulation_source, str)
+            or self.base_source not in allowed_sources
+            or self.manipulation_source not in allowed_sources
+        ):
+            raise ValueError("ActionMuxDecision 候选来源不是受控标签")
+        if not self.base_candidate_present and self.base_source != "none":
+            raise ValueError("无 BaseCommand 时 base_source 必须为 none")
+        if not self.manipulation_candidate_present and self.manipulation_source != "none":
+            raise ValueError("无 ManipulationCommand 时 manipulation_source 必须为 none")
+
+        rejected = {
+            CandidateDisposition.REJECTED_INVALID,
+            CandidateDisposition.REJECTED_STALE,
+            CandidateDisposition.SAFETY_OVERRIDDEN,
+        }
+        if not self.base_candidate_present:
+            if self.base_disposition is not CandidateDisposition.ABSENT:
+                raise ValueError("无 BaseCommand 时 base_disposition 必须为 absent")
+            if any((*commanded[:2], *clipped[:2])):
+                raise ValueError("无 BaseCommand 时 base commanded/clipped 必须全 false")
+        else:
+            if self.base_source != "base_command":
+                raise ValueError("存在 BaseCommand 时 base_source 必须为 base_command")
+            if self.base_disposition is CandidateDisposition.ABSENT:
+                raise ValueError("存在 BaseCommand 时 base_disposition 不能为 absent")
+        if self.base_disposition is CandidateDisposition.ACCEPTED and commanded[:2] != (
+            True,
+            True,
+        ):
+            raise ValueError("accepted BaseCommand 必须 commanded 两个 base 维度")
+        if self.base_disposition in rejected and any((*commanded[:2], *clipped[:2])):
+            raise ValueError("被拒绝或安全覆盖的 BaseCommand 不得 commanded/clipped")
+        if self.base_disposition is CandidateDisposition.PARTIALLY_ACCEPTED:
+            accepted_count = sum(commanded[:2])
+            if accepted_count <= 0 or accepted_count >= sum(requested[:2]):
+                raise ValueError("partially_accepted BaseCommand 必须只接受部分 requested 维度")
+
+        if not self.manipulation_candidate_present:
+            if self.manipulation_disposition is not CandidateDisposition.ABSENT:
+                raise ValueError(
+                    "无 ManipulationCommand 时 manipulation_disposition 必须为 absent"
+                )
+            if any((*commanded[2:], *clipped[2:])):
+                raise ValueError(
+                    "无 ManipulationCommand 时 manipulation commanded/clipped 必须全 false"
+                )
+        else:
+            if self.manipulation_source not in {
+                "manipulation_command",
+                "external_candidate",
+            }:
+                raise ValueError(
+                    "存在 ManipulationCommand 时 manipulation_source 无效"
+                )
+            if self.manipulation_disposition is CandidateDisposition.ABSENT:
+                raise ValueError(
+                    "存在 ManipulationCommand 时 manipulation_disposition 不能为 absent"
+                )
+        if (
+            self.manipulation_disposition is CandidateDisposition.ACCEPTED
+            and commanded[2:] != requested[2:]
+        ):
+            raise ValueError(
+                "accepted ManipulationCommand 的 commanded 必须等于 requested"
+            )
+        if self.manipulation_disposition in rejected and any(
+            (*commanded[2:], *clipped[2:])
+        ):
+            raise ValueError(
+                "被拒绝或安全覆盖的 ManipulationCommand 不得 commanded/clipped"
+            )
+        if self.manipulation_disposition is CandidateDisposition.PARTIALLY_ACCEPTED:
+            requested_count = sum(requested[2:])
+            accepted_count = sum(commanded[2:])
+            if accepted_count <= 0 or accepted_count >= requested_count:
+                raise ValueError(
+                    "partially_accepted ManipulationCommand 必须只接受部分 requested 维度"
+                )
+
+
+@dataclass(frozen=True)
+class TwistExactPayload:
+    """真正交给 Twist publisher 的六个分量。"""
+
+    linear_xyz: tuple[float, float, float]
+    angular_xyz: tuple[float, float, float]
+
+    def __post_init__(self) -> None:
+        if any(isinstance(value, bool) for value in (*self.linear_xyz, *self.angular_xyz)):
+            raise ValueError("Twist exact_payload 不能用 bool 冒充数值")
+        object.__setattr__(self, "linear_xyz", ensure_finite_vector(self.linear_xyz, 3, "Twist.linear"))
+        object.__setattr__(self, "angular_xyz", ensure_finite_vector(self.angular_xyz, 3, "Twist.angular"))
+
+
+@dataclass(frozen=True)
+class Float64MultiArrayExactPayload:
+    """真正交给 Float64MultiArray publisher 的 data。"""
+
+    data: tuple[float, ...]
+
+    def __post_init__(self) -> None:
+        if any(isinstance(value, bool) for value in self.data):
+            raise ValueError("Float64MultiArray exact_payload 不能用 bool 冒充数值")
+        object.__setattr__(self, "data", ensure_finite_vector(self.data, len(self.data), "Float64MultiArray.data"))
+
+
+@dataclass(frozen=True)
+class DispatchGroupRecord:
+    """一个官方话题在本周期的精确本地 publisher 调用事实。"""
+
+    group: str
+    official_topic: str
+    message_type: str
+    attempted: bool
+    succeeded: Optional[bool]
+    exact_payload: Optional[TwistExactPayload | Float64MultiArrayExactPayload]
+    failure_reason: str = ""
+
+    def __post_init__(self) -> None:
+        if not all(
+            isinstance(value, str)
+            for value in (self.group, self.official_topic, self.message_type, self.failure_reason)
+        ):
+            raise ValueError("DispatchGroupRecord 文本字段必须是字符串")
+        if type(self.attempted) is not bool:
+            raise ValueError("DispatchGroupRecord.attempted 必须是严格 bool")
+        if self.succeeded is not None and type(self.succeeded) is not bool:
+            raise ValueError("DispatchGroupRecord.succeeded 必须是 bool 或 null")
+        if not self.attempted and (self.succeeded is not None or self.exact_payload is not None):
+            raise ValueError("未尝试分组的 succeeded 和 exact_payload 必须为 null")
+        if self.attempted and self.succeeded is None:
+            raise ValueError("已尝试分组必须明确 succeeded")
+        if self.attempted and self.exact_payload is None:
+            raise ValueError("已尝试分组必须记录 exact_payload")
+        if self.succeeded is True and self.failure_reason:
+            raise ValueError("成功分组不得携带 failure_reason")
+
+
+@dataclass(frozen=True)
+class ActionDispatchRecord:
+    """一个已计算 FinalAction 的逐组本地 dispatch 遥测，不是执行确认。"""
+
+    schema_name: str
+    schema_version: int
+    sequence: int
+    timestamp_ns: int
+    final_action_sequence: int
+    decision: ActionMuxDecision
+    calculated: bool
+    publish_enabled: bool
+    publisher_created: bool
+    publish_attempted: bool
+    publisher_call_succeeded: Optional[bool]
+    dispatch_mode: DispatchMode
+    dispatched_action: tuple[Optional[float], ...]
+    dispatched_mask: tuple[bool, ...]
+    attempted_groups: tuple[str, ...]
+    successful_groups: tuple[str, ...]
+    failed_groups: tuple[str, ...]
+    group_records: tuple[DispatchGroupRecord, ...]
+    controller_accepted: None
+    execution_confirmed: None
+    failure_reason: str = ""
+
+    def __post_init__(self) -> None:
+        if (
+            self.schema_name != "MMK2ActionDispatchRecord"
+            or type(self.schema_version) is not int
+            or self.schema_version != 1
+        ):
+            raise ValueError("ActionDispatchRecord schema 必须为 MMK2ActionDispatchRecord V1")
+        _strict_nonnegative_int(self.sequence, "ActionDispatchRecord.sequence")
+        _strict_nonnegative_int(self.timestamp_ns, "ActionDispatchRecord.timestamp_ns")
+        _strict_nonnegative_int(
+            self.final_action_sequence, "ActionDispatchRecord.final_action_sequence"
+        )
+        if not isinstance(self.decision, ActionMuxDecision):
+            raise ValueError("ActionDispatchRecord.decision 必须是 ActionMuxDecision")
+        if self.sequence != self.final_action_sequence or self.decision.final_action_sequence != self.final_action_sequence:
+            raise ValueError("ActionDispatchRecord 必须与 Decision/FinalAction sequence 稳定关联")
+        if self.timestamp_ns != self.decision.timestamp_ns:
+            raise ValueError("ActionDispatchRecord 与 ActionMuxDecision timestamp_ns 必须一致")
+        if not isinstance(self.failure_reason, str):
+            raise ValueError("ActionDispatchRecord.failure_reason 必须是字符串")
+        for label, value in (
+            ("calculated", self.calculated),
+            ("publish_enabled", self.publish_enabled),
+            ("publisher_created", self.publisher_created),
+            ("publish_attempted", self.publish_attempted),
+        ):
+            if type(value) is not bool:
+                raise ValueError(f"{label} 必须是严格 bool")
+        if not self.calculated:
+            raise ValueError("ActionDispatchRecord V1 只描述已计算 FinalAction")
+        if not isinstance(self.dispatch_mode, DispatchMode):
+            raise ValueError("dispatch_mode 必须使用 DispatchMode")
+        if self.publisher_call_succeeded is not None and type(self.publisher_call_succeeded) is not bool:
+            raise ValueError("publisher_call_succeeded 必须是 bool 或 null")
+        group_records = tuple(self.group_records)
+        if any(not isinstance(record, DispatchGroupRecord) for record in group_records):
+            raise ValueError("group_records 必须只包含 DispatchGroupRecord")
+        object.__setattr__(self, "group_records", group_records)
+        for field_name in ("attempted_groups", "successful_groups", "failed_groups"):
+            groups = tuple(getattr(self, field_name))
+            if any(not isinstance(group, str) for group in groups):
+                raise ValueError(f"{field_name} 必须只包含字符串")
+            object.__setattr__(self, field_name, groups)
+        action = _strict_optional_float_tuple(
+            self.dispatched_action, 19, "dispatched_action"
+        )
+        mask = _strict_bool_tuple(self.dispatched_mask, 19, "dispatched_mask")
+        object.__setattr__(self, "dispatched_action", action)
+        object.__setattr__(self, "dispatched_mask", mask)
+        if any((value is not None) != mask[index] for index, value in enumerate(action)):
+            raise ValueError("dispatched_action 的 null 位置必须与 dispatched_mask 一致")
+        expected_groups = (
+            ("base", "/cmd_vel", "geometry_msgs/msg/Twist", 0, 2),
+            (
+                "spine",
+                "/spine_forward_position_controller/commands",
+                "std_msgs/msg/Float64MultiArray",
+                2,
+                3,
+            ),
+            (
+                "head",
+                "/head_forward_position_controller/commands",
+                "std_msgs/msg/Float64MultiArray",
+                3,
+                5,
+            ),
+            (
+                "left_arm",
+                "/left_arm_forward_position_controller/commands",
+                "std_msgs/msg/Float64MultiArray",
+                5,
+                12,
+            ),
+            (
+                "right_arm",
+                "/right_arm_forward_position_controller/commands",
+                "std_msgs/msg/Float64MultiArray",
+                12,
+                19,
+            ),
+        )
+        if len(self.group_records) != len(expected_groups):
+            raise ValueError("group_records 必须严格包含五个官方分组")
+        reconstructed: list[Optional[float]] = [None] * 19
+        for record, (group, topic, message_type, start, stop) in zip(
+            self.group_records, expected_groups
+        ):
+            if (record.group, record.official_topic, record.message_type) != (
+                group,
+                topic,
+                message_type,
+            ):
+                raise ValueError("group_records 顺序、话题或消息类型不符合官方映射")
+            if not record.attempted:
+                continue
+            if group == "base":
+                if not isinstance(record.exact_payload, TwistExactPayload):
+                    raise ValueError("base exact_payload 必须是完整 Twist")
+                reconstructed[0] = record.exact_payload.linear_xyz[0]
+                reconstructed[1] = record.exact_payload.angular_xyz[2]
+            else:
+                if not isinstance(record.exact_payload, Float64MultiArrayExactPayload):
+                    raise ValueError(f"{group} exact_payload 必须是 Float64MultiArray data")
+                if len(record.exact_payload.data) != stop - start:
+                    raise ValueError(f"{group} exact_payload 长度错误")
+                reconstructed[start:stop] = record.exact_payload.data
+        if tuple(reconstructed) != action:
+            raise ValueError("dispatched_action 必须精确派生自逐组 exact_payload")
+        attempted = tuple(record.group for record in self.group_records if record.attempted)
+        successful = tuple(record.group for record in self.group_records if record.succeeded is True)
+        failed = tuple(record.group for record in self.group_records if record.succeeded is False)
+        if self.attempted_groups != attempted or self.successful_groups != successful or self.failed_groups != failed:
+            raise ValueError("分组摘要必须与 group_records 完全一致")
+        if self.publish_attempted != bool(attempted):
+            raise ValueError("publish_attempted 必须与实际 attempted_groups 一致")
+        expected_call_result = None if not attempted else not failed
+        if self.publisher_call_succeeded is not expected_call_result:
+            raise ValueError("publisher_call_succeeded 必须反映本地 publisher 调用结果")
+        if self.dispatch_mode is DispatchMode.NONE and attempted:
+            raise ValueError("none 模式不得尝试官方分组")
+        if self.dispatch_mode is DispatchMode.HEAD_ONLY and any(
+            group != "head" for group in attempted
+        ):
+            raise ValueError("head_only 模式只能尝试 head 分组")
+        if self.dispatch_mode is DispatchMode.FULL:
+            official_order = tuple(group[0] for group in expected_groups)
+            if attempted != official_order[: len(attempted)]:
+                raise ValueError("full 模式 attempted groups 必须是官方顺序的连续前缀")
+            if len(failed) > 1:
+                raise ValueError("full 模式最多允许一个失败组")
+            if failed and failed[0] != attempted[-1]:
+                raise ValueError("full 模式失败组必须是最后一个 attempted group")
+        if self.publisher_created and not self.publish_enabled:
+            raise ValueError("publisher_created 不能绕过 publish_enabled")
+        if attempted and (not self.publish_enabled or not self.publisher_created):
+            raise ValueError("官方 publisher 调用不能绕过创建门或发布门")
+        if self.controller_accepted is not None or self.execution_confirmed is not None:
+            raise ValueError("V1 无法确认 controller accepted 或 execution confirmed")
+
+
+def _decision_to_dict(decision: ActionMuxDecision) -> dict[str, Any]:
+    return {
+        "schema_name": decision.schema_name,
+        "schema_version": decision.schema_version,
+        "sequence": decision.sequence,
+        "timestamp_ns": decision.timestamp_ns,
+        "final_action_sequence": decision.final_action_sequence,
+        "requested_mask": list(decision.requested_mask),
+        "commanded_mask": list(decision.commanded_mask),
+        "clipped_mask": list(decision.clipped_mask),
+        "safety_override_mask": list(decision.safety_override_mask),
+        "base_candidate_present": decision.base_candidate_present,
+        "manipulation_candidate_present": decision.manipulation_candidate_present,
+        "base_disposition": decision.base_disposition.value,
+        "manipulation_disposition": decision.manipulation_disposition.value,
+        "base_source": decision.base_source,
+        "manipulation_source": decision.manipulation_source,
+        "global_phase": decision.global_phase.value,
+        "local_phase": decision.local_phase.value,
+        "valid": decision.valid,
+        "failure_reason": decision.failure_reason,
+    }
+
+
+def _exact_payload_to_dict(
+    payload: Optional[TwistExactPayload | Float64MultiArrayExactPayload],
+) -> Optional[dict[str, Any]]:
+    if payload is None:
+        return None
+    if isinstance(payload, TwistExactPayload):
+        return {
+            "linear": dict(zip(("x", "y", "z"), payload.linear_xyz)),
+            "angular": dict(zip(("x", "y", "z"), payload.angular_xyz)),
+        }
+    return {"data": list(payload.data)}
+
+
+def action_dispatch_to_json(record: ActionDispatchRecord) -> str:
+    """严格序列化 ActionDispatchRecord V1，禁止 NaN/Inf。"""
+
+    if not isinstance(record, ActionDispatchRecord):
+        raise TypeError("action_dispatch_to_json 只接受 ActionDispatchRecord")
+    payload = {
+        "schema_name": record.schema_name,
+        "schema_version": record.schema_version,
+        "sequence": record.sequence,
+        "timestamp_ns": record.timestamp_ns,
+        "final_action_sequence": record.final_action_sequence,
+        "decision": _decision_to_dict(record.decision),
+        "calculated": record.calculated,
+        "publish_enabled": record.publish_enabled,
+        "publisher_created": record.publisher_created,
+        "publish_attempted": record.publish_attempted,
+        "publisher_call_succeeded": record.publisher_call_succeeded,
+        "dispatch_mode": record.dispatch_mode.value,
+        "dispatched_action": list(record.dispatched_action),
+        "dispatched_mask": list(record.dispatched_mask),
+        "attempted_groups": list(record.attempted_groups),
+        "successful_groups": list(record.successful_groups),
+        "failed_groups": list(record.failed_groups),
+        "group_records": [
+            {
+                "group": group.group,
+                "official_topic": group.official_topic,
+                "message_type": group.message_type,
+                "attempted": group.attempted,
+                "succeeded": group.succeeded,
+                "exact_payload": _exact_payload_to_dict(group.exact_payload),
+                "failure_reason": group.failure_reason,
+            }
+            for group in record.group_records
+        ],
+        "controller_accepted": None,
+        "execution_confirmed": None,
+        "failure_reason": record.failure_reason,
+    }
+    return json.dumps(
+        payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False
+    )
+
+
+def _strict_json_object(raw: str, label: str) -> dict[str, Any]:
+    try:
+        payload = json.loads(
+            raw,
+            parse_constant=lambda value: (_ for _ in ()).throw(
+                ValueError(f"禁止非有限 JSON 数值 {value}")
+            ),
+        )
+    except (TypeError, json.JSONDecodeError, ValueError) as exc:
+        raise ValueError(f"{label} JSON 无效：{exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"{label} JSON 顶层必须是对象")
+    return payload
+
+
+def _require_keys(payload: Mapping[str, Any], expected: set[str], label: str) -> None:
+    if set(payload) != expected:
+        raise ValueError(f"{label} 字段不匹配：missing={sorted(expected - set(payload))}, unknown={sorted(set(payload) - expected)}")
+
+
+def _decision_from_dict(payload: object) -> ActionMuxDecision:
+    if not isinstance(payload, dict):
+        raise ValueError("decision 必须是对象")
+    expected = {
+        "schema_name", "schema_version", "sequence", "timestamp_ns",
+        "final_action_sequence", "requested_mask", "commanded_mask", "clipped_mask",
+        "safety_override_mask", "base_candidate_present", "manipulation_candidate_present",
+        "base_disposition", "manipulation_disposition", "base_source",
+        "manipulation_source", "global_phase", "local_phase", "valid", "failure_reason",
+    }
+    _require_keys(payload, expected, "decision")
+    return ActionMuxDecision(
+        schema_name=payload["schema_name"],
+        schema_version=payload["schema_version"],
+        sequence=payload["sequence"],
+        timestamp_ns=payload["timestamp_ns"],
+        final_action_sequence=payload["final_action_sequence"],
+        requested_mask=tuple(payload["requested_mask"]),
+        commanded_mask=tuple(payload["commanded_mask"]),
+        clipped_mask=tuple(payload["clipped_mask"]),
+        safety_override_mask=tuple(payload["safety_override_mask"]),
+        base_candidate_present=payload["base_candidate_present"],
+        manipulation_candidate_present=payload["manipulation_candidate_present"],
+        base_disposition=CandidateDisposition(payload["base_disposition"]),
+        manipulation_disposition=CandidateDisposition(payload["manipulation_disposition"]),
+        base_source=payload["base_source"],
+        manipulation_source=payload["manipulation_source"],
+        global_phase=GlobalPhase(payload["global_phase"]),
+        local_phase=LocalPhase(payload["local_phase"]),
+        valid=payload["valid"],
+        failure_reason=payload["failure_reason"],
+    )
+
+
+def _group_from_dict(payload: object) -> DispatchGroupRecord:
+    if not isinstance(payload, dict):
+        raise ValueError("group_record 必须是对象")
+    expected = {
+        "group", "official_topic", "message_type", "attempted", "succeeded",
+        "exact_payload", "failure_reason",
+    }
+    _require_keys(payload, expected, "group_record")
+    exact = payload["exact_payload"]
+    parsed_exact: Optional[TwistExactPayload | Float64MultiArrayExactPayload]
+    if exact is None:
+        parsed_exact = None
+    elif payload["message_type"] == "geometry_msgs/msg/Twist":
+        if not isinstance(exact, dict) or set(exact) != {"linear", "angular"}:
+            raise ValueError("Twist exact_payload 必须包含 linear/angular")
+        for vector_name in ("linear", "angular"):
+            if not isinstance(exact[vector_name], dict) or set(exact[vector_name]) != {"x", "y", "z"}:
+                raise ValueError(f"Twist.{vector_name} 必须包含 x/y/z")
+        parsed_exact = TwistExactPayload(
+            tuple(exact["linear"][axis] for axis in ("x", "y", "z")),
+            tuple(exact["angular"][axis] for axis in ("x", "y", "z")),
+        )
+    elif payload["message_type"] == "std_msgs/msg/Float64MultiArray":
+        if not isinstance(exact, dict) or set(exact) != {"data"} or not isinstance(exact["data"], list):
+            raise ValueError("Float64MultiArray exact_payload 必须只包含 data 数组")
+        parsed_exact = Float64MultiArrayExactPayload(tuple(exact["data"]))
+    else:
+        raise ValueError("不支持的 group_record message_type")
+    return DispatchGroupRecord(
+        group=payload["group"],
+        official_topic=payload["official_topic"],
+        message_type=payload["message_type"],
+        attempted=payload["attempted"],
+        succeeded=payload["succeeded"],
+        exact_payload=parsed_exact,
+        failure_reason=payload["failure_reason"],
+    )
+
+
+def action_dispatch_from_json(raw: str) -> ActionDispatchRecord:
+    """严格解析 ActionDispatchRecord V1，拒绝未知版本、维度和非有限数。"""
+
+    try:
+        payload = _strict_json_object(raw, "ActionDispatchRecord")
+        expected = {
+            "schema_name", "schema_version", "sequence", "timestamp_ns",
+            "final_action_sequence", "decision", "calculated", "publish_enabled",
+            "publisher_created", "publish_attempted", "publisher_call_succeeded",
+            "dispatch_mode", "dispatched_action", "dispatched_mask", "attempted_groups",
+            "successful_groups", "failed_groups", "group_records", "controller_accepted",
+            "execution_confirmed", "failure_reason",
+        }
+        _require_keys(payload, expected, "ActionDispatchRecord")
+        return ActionDispatchRecord(
+            schema_name=payload["schema_name"],
+            schema_version=payload["schema_version"],
+            sequence=payload["sequence"],
+            timestamp_ns=payload["timestamp_ns"],
+            final_action_sequence=payload["final_action_sequence"],
+            decision=_decision_from_dict(payload["decision"]),
+            calculated=payload["calculated"],
+            publish_enabled=payload["publish_enabled"],
+            publisher_created=payload["publisher_created"],
+            publish_attempted=payload["publish_attempted"],
+            publisher_call_succeeded=payload["publisher_call_succeeded"],
+            dispatch_mode=DispatchMode(payload["dispatch_mode"]),
+            dispatched_action=tuple(payload["dispatched_action"]),
+            dispatched_mask=tuple(payload["dispatched_mask"]),
+            attempted_groups=tuple(payload["attempted_groups"]),
+            successful_groups=tuple(payload["successful_groups"]),
+            failed_groups=tuple(payload["failed_groups"]),
+            group_records=tuple(_group_from_dict(item) for item in payload["group_records"]),
+            controller_accepted=payload["controller_accepted"],
+            execution_confirmed=payload["execution_confirmed"],
+            failure_reason=payload["failure_reason"],
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"ActionDispatchRecord JSON 无效：{exc}") from exc
 
 
 # JSON编解码
