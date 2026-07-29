@@ -114,7 +114,7 @@ from .interfaces import (
     fsm_status_to_json,
 )
 from .navigation import Bounds3D, classify_slot_type
-from .perception_2d import OfficialYoloAdapter
+from .perception_2d import Detection2DStabilizer, OfficialYoloAdapter
 from .perception_3d import CameraTransformProvider, Perception3DEstimator
 from .recorder import EpisodeRecorder
 
@@ -930,7 +930,9 @@ def _create_perception_node(ros: SimpleNamespace) -> type:
             )
             self._yolo.self_check()
             self._transform.self_check()
-            self._estimator = Perception3DEstimator(self._transform)
+            self._stabilizer, self._estimator = _perception_pipeline_from_config(
+                config, self._transform
+            )
             self._publisher = self.create_publisher(
                 ros.Detection3DArray, topics["object_estimates"], 10
             )
@@ -1046,7 +1048,11 @@ def _create_perception_node(ros: SimpleNamespace) -> type:
                     frame_id=str(depth_message.header.frame_id),
                     timestamp_ns=_stamp_to_ns(depth_message.header.stamp),
                 )
-                detections = self._yolo.detect(rgb, depth, self._camera_info)
+                detections = self._stabilizer.update(
+                    self._yolo.detect(rgb, depth, self._camera_info),
+                    frame_timestamp_ns=rgb.timestamp_ns,
+                    frame_id=rgb.frame_id,
+                )
                 estimates = self._estimator.estimate(
                     detections, depth, self._camera_info, base, joints
                 )
@@ -1271,6 +1277,152 @@ def _create_recorder_node(ros: SimpleNamespace) -> type:
             return result
 
     return _DatasetRecorderNode
+
+
+def _perception_stabilizer_from_config(
+    config: dict[str, Any],
+) -> Detection2DStabilizer:
+    """从真实节点配置构造二维稳定器，并拒绝缺失或未消费字段。"""
+
+    perception = _config_mapping(config.get("perception"), "perception")
+    values = _config_mapping(
+        perception.get("stabilizer_2d"), "perception.stabilizer_2d"
+    )
+    required = {
+        "iou_match_threshold",
+        "min_confirmed_hits",
+        "max_missed_frames",
+        "bbox_smoothing_alpha",
+        "confidence_smoothing_alpha",
+    }
+    _require_exact_config_keys(values, required, "perception.stabilizer_2d")
+    try:
+        return Detection2DStabilizer(
+            iou_match_threshold=values["iou_match_threshold"],
+            min_confirmed_hits=values["min_confirmed_hits"],
+            max_missed_frames=values["max_missed_frames"],
+            bbox_smoothing_alpha=values["bbox_smoothing_alpha"],
+            confidence_smoothing_alpha=values["confidence_smoothing_alpha"],
+        )
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"perception.stabilizer_2d 配置无效：{exc}") from exc
+
+
+def _perception_pipeline_from_config(
+    config: dict[str, Any],
+    transform: CameraTransformProvider,
+) -> tuple[Detection2DStabilizer, Perception3DEstimator]:
+    """构造 PerceptionNode 唯一使用的二维稳定与三维估计流水线。"""
+
+    return (
+        _perception_stabilizer_from_config(config),
+        _perception_3d_estimator_from_config(config, transform),
+    )
+
+
+def _perception_3d_estimator_from_config(
+    config: dict[str, Any],
+    transform: CameraTransformProvider,
+) -> Perception3DEstimator:
+    """从 PerceptionNode 的真实配置构造三维估计器。
+
+    物体尺寸按 ``[width_m, height_m, depth_extent_m]`` 解释；键必须严格覆盖官方
+    YOLO 的三类目标。Detection/Depth/CameraInfo 的最大时间差复用 RGB/Depth 同步
+    的非零 ``sync_slop_s``，避免节点接线中出现两个互相漂移的时间窗口。
+    """
+
+    perception = _config_mapping(config.get("perception"), "perception")
+    values = _config_mapping(
+        perception.get("estimator_3d"), "perception.estimator_3d"
+    )
+    required = {
+        "depth_radius_px",
+        "ema_alpha",
+        "converge_frames",
+        "max_track_age_s",
+        "max_position_jump_m",
+        "object_dimensions_m",
+    }
+    _require_exact_config_keys(values, required, "perception.estimator_3d")
+    dimensions = _config_mapping(
+        values["object_dimensions_m"],
+        "perception.estimator_3d.object_dimensions_m",
+    )
+    expected_classes = set(OfficialYoloAdapter.CLASS_NAMES)
+    _require_exact_config_keys(
+        dimensions,
+        expected_classes,
+        "perception.estimator_3d.object_dimensions_m",
+    )
+    normalized_dimensions: dict[str, tuple[float, float, float]] = {}
+    for class_id in OfficialYoloAdapter.CLASS_NAMES:
+        raw = dimensions[class_id]
+        if isinstance(raw, (str, bytes)) or not isinstance(raw, (list, tuple)):
+            raise RuntimeError(
+                "perception.estimator_3d.object_dimensions_m"
+                f"[{class_id!r}] 必须是三个正有限数"
+            )
+        if len(raw) != 3:
+            raise RuntimeError(
+                "perception.estimator_3d.object_dimensions_m"
+                f"[{class_id!r}] 必须恰好包含 [width_m,height_m,depth_extent_m]"
+            )
+        converted = tuple(
+            _positive_config_number(
+                item,
+                "perception.estimator_3d.object_dimensions_m"
+                f"[{class_id!r}][{index}]",
+            )
+            for index, item in enumerate(raw)
+        )
+        normalized_dimensions[class_id] = converted
+
+    max_input_skew_s = _positive_config_number(
+        perception.get("sync_slop_s"), "perception.sync_slop_s"
+    )
+    try:
+        return Perception3DEstimator(
+            transform,
+            depth_radius_px=values["depth_radius_px"],
+            ema_alpha=values["ema_alpha"],
+            converge_frames=values["converge_frames"],
+            max_track_age_s=values["max_track_age_s"],
+            max_input_skew_s=max_input_skew_s,
+            max_position_jump_m=values["max_position_jump_m"],
+            object_dimensions_m=normalized_dimensions,
+        )
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"perception.estimator_3d 配置无效：{exc}") from exc
+
+
+def _config_mapping(value: Any, name: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise RuntimeError(f"{name} 必须是映射")
+    return value
+
+
+def _require_exact_config_keys(
+    values: dict[str, Any],
+    expected: set[str],
+    name: str,
+) -> None:
+    actual = set(values)
+    if actual == expected:
+        return
+    missing = sorted(expected - actual)
+    unknown = sorted(actual - expected)
+    raise RuntimeError(
+        f"{name} 字段不完整：缺失={missing}，未知={unknown}"
+    )
+
+
+def _positive_config_number(value: Any, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise RuntimeError(f"{name} 必须是正有限数，不能使用 bool")
+    number = float(value)
+    if not math.isfinite(number) or number <= 0.0:
+        raise RuntimeError(f"{name} 必须是正有限数，实际={value!r}")
+    return number
 
 
 def _action_mux_config(config: dict[str, Any]) -> ActionMuxConfig:

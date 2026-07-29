@@ -42,7 +42,10 @@ def _finite_number(value: Any, name: str) -> float:
 
     if isinstance(value, bool) or not isinstance(value, Real):
         raise ValueError(f"{name} 必须是真实数值，不能使用 bool 或其他类型")
-    result = float(value)
+    try:
+        result = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{name} 无法安全转换为有限浮点数") from exc
     if not math.isfinite(result):
         raise ValueError(f"{name} 必须是有限数，不能包含 NaN 或 Inf")
     return result
@@ -391,20 +394,23 @@ class CameraTransformProvider:
 
 @dataclass
 class _Track:
-    """单个物体在输出 frame 中的米制三维 EMA 状态。"""
+    """单个稳定二维轨迹在输出 frame 中的米制三维 EMA 状态。"""
 
+    class_id: str
     ema: list[float]
     count: int
     last_ts_ns: int
+    last_detection_ts_ns: int
 
 
 class Perception3DEstimator:
     """把二维框转换为输出 frame 中的物体三维中心估计。
 
     每条检测独立执行中心窗口中位深度、针孔反投影、已知尺寸中心补偿和官方相机外参
-    变换。最终世界坐标按类别和二维网格分桶做 EMA，以抑制深度逐帧噪声。尺寸未知时
-    无法声称表面点已经到达几何中心，因此返回带明确原因的无效估计。本类不负责二维
-    框关联、目标选择、抓取点或夹爪末端位姿。
+    变换。只使用 ``Detection2D.track_id`` 维持稳定的一对一三维 EMA；没有稳定
+    编号的兼容输入仍可生成当前帧估计，但不写入持久历史，绝不退回类别/固定像素
+    网格等不可靠身份。尺寸未知、输入不同步、frame 不一致、帧陈旧或三维跳变时
+    返回带明确原因的无效估计，绝不把可见表面点或旧 EMA 冒充当前物体中心。
     """
 
     def __init__(
@@ -414,8 +420,9 @@ class Perception3DEstimator:
         depth_radius_px: int = 4,
         ema_alpha: float = 0.5,
         converge_frames: int = 5,
-        track_grid_px: float = 40.0,
         max_track_age_s: float = 1.0,
+        max_input_skew_s: float = 0.05,
+        max_position_jump_m: float = 1.0,
         object_dimensions_m: Optional[
             dict[str, tuple[float, float, float]]
         ] = None,
@@ -423,8 +430,10 @@ class Perception3DEstimator:
         """保存三维估计参数，构造阶段不加载任何官方依赖。
 
         ``object_dimensions_m`` 的值依次为宽、高、沿相机视线近似深度，单位米。
-        ``track_grid_px`` 为二维轨迹分桶尺寸（像素），``max_track_age_s`` 为轨迹超时
-        秒数。失败：参数类型、范围或物体尺寸不合法时抛出 ``ValueError``。
+        ``max_track_age_s`` 为轨迹超时秒数，``max_input_skew_s`` 为
+        Detection/Depth/CameraInfo 最大绝对时间差秒数，``max_position_jump_m``
+        为相邻有效轨迹点允许的最大三维跳变。失败：参数类型、范围或物体尺寸不合法
+        时抛出 ``ValueError``。
         """
 
         if isinstance(depth_radius_px, bool) or not isinstance(
@@ -441,14 +450,19 @@ class Perception3DEstimator:
             raise ValueError("converge_frames 必须是正整数")
 
         alpha = _finite_number(ema_alpha, "ema_alpha")
-        grid_px = _finite_number(track_grid_px, "track_grid_px")
         max_age_s = _finite_number(max_track_age_s, "max_track_age_s")
+        input_skew_s = _finite_number(max_input_skew_s, "max_input_skew_s")
+        position_jump_m = _finite_number(
+            max_position_jump_m, "max_position_jump_m"
+        )
         if not 0.0 < alpha <= 1.0:
             raise ValueError("ema_alpha 必须位于 (0, 1] 范围")
-        if grid_px <= 0.0:
-            raise ValueError("track_grid_px 必须是正的有限像素数")
         if max_age_s <= 0.0:
             raise ValueError("max_track_age_s 必须是正的有限秒数")
+        if input_skew_s <= 0.0:
+            raise ValueError("max_input_skew_s 必须是非零正有限秒数")
+        if position_jump_m <= 0.0:
+            raise ValueError("max_position_jump_m 必须是正的有限米数")
 
         dimensions = dict(object_dimensions_m) if object_dimensions_m else {}
         normalized_dimensions: dict[str, tuple[float, float, float]] = {}
@@ -468,10 +482,13 @@ class Perception3DEstimator:
         self.depth_radius_px = int(depth_radius_px)
         self.ema_alpha = alpha
         self.converge_frames = int(converge_frames)
-        self.track_grid_px = grid_px
         self.max_track_age_s = max_age_s
+        self.max_input_skew_s = input_skew_s
+        self.max_position_jump_m = position_jump_m
         self._dims = normalized_dimensions
         self._tracks: dict[str, _Track] = {}
+        self._last_frame_ts_ns: Optional[int] = None
+        self._last_detection_frame_ts_ns: Optional[int] = None
 
     def estimate(
         self,
@@ -484,34 +501,136 @@ class Perception3DEstimator:
         """返回与输入检测顺序一致的三维估计元组。
 
         输入深度原始值通过 ``DepthFrame.unit_scale_m`` 换算为米；输出位置单位米，
-        frame 由 ``transform_provider.output_frame`` 指定，时间戳使用深度帧时间。
-        单条检测失败时只把对应结果标为 ``valid=False``，不会中断同批其他检测。
+        frame 由 ``transform_provider.output_frame`` 指定，时间戳使用当前有效深度帧
+        时间。Depth/CameraInfo 的 frame 或时间不同步会使整批无效；单条 Detection
+        时间、frame、深度或轨迹失败只使对应结果无效，不会中断同批其他检测。
         """
 
-        timestamp_ns = self._timestamp_ns(depth.timestamp_ns)
-        self._remove_expired_tracks(timestamp_ns)
         output_frame = self.transform_provider.output_frame
-        return tuple(
-            self._estimate_one(
-                detection,
-                depth,
-                intrinsics,
-                base,
-                joints,
-                output_frame,
+        failure_timestamp_ns = self._safe_failure_timestamp(
+            getattr(depth, "timestamp_ns", 0)
+        )
+        try:
+            (
                 timestamp_ns,
+                intrinsics_timestamp_ns,
+            ) = self._validate_batch_inputs(depth, intrinsics)
+        except ValueError as exc:
+            return tuple(
+                self._failure(
+                    detection.class_id,
+                    output_frame,
+                    failure_timestamp_ns,
+                    f"感知输入不同步：{exc}",
+                )
+                for detection in detections
+            )
+
+        if (
+            self._last_frame_ts_ns is not None
+            and timestamp_ns <= self._last_frame_ts_ns
+        ):
+            return tuple(
+                self._failure(
+                    detection.class_id,
+                    output_frame,
+                    timestamp_ns,
+                    (
+                        "陈旧感知帧：DepthFrame.timestamp_ns="
+                        f"{timestamp_ns} 未严格晚于最近有效帧 "
+                        f"{self._last_frame_ts_ns}"
+                    ),
+                )
+                for detection in detections
+            )
+
+        self._remove_expired_tracks(timestamp_ns)
+        context_errors: list[str] = [
+            self._detection_context_error(
+                detection,
+                depth.frame_id,
+                timestamp_ns,
+                intrinsics_timestamp_ns,
             )
             for detection in detections
+        ]
+        current_detection_timestamps = {
+            int(detection.timestamp_ns)
+            for index, detection in enumerate(detections)
+            if not context_errors[index] and detection.valid
+        }
+        if len(current_detection_timestamps) > 1:
+            reason = (
+                "二维检测上下文无效：同一批Detection2D必须来自同一RGB时间戳，"
+                f"实际为 {sorted(current_detection_timestamps)}"
+            )
+            for index, detection in enumerate(detections):
+                if not context_errors[index] and detection.valid:
+                    context_errors[index] = reason
+            current_detection_timestamps.clear()
+        if current_detection_timestamps:
+            current_detection_timestamp_ns = next(iter(current_detection_timestamps))
+            if (
+                self._last_detection_frame_ts_ns is not None
+                and current_detection_timestamp_ns
+                <= self._last_detection_frame_ts_ns
+            ):
+                reason = (
+                    "陈旧二维检测帧：Detection2D.timestamp_ns="
+                    f"{current_detection_timestamp_ns} 未严格晚于最近有效检测帧 "
+                    f"{self._last_detection_frame_ts_ns}"
+                )
+                for index, detection in enumerate(detections):
+                    if not context_errors[index] and detection.valid:
+                        context_errors[index] = reason
+                current_detection_timestamps.clear()
+        associations, association_errors = self._associate_tracks(
+            detections, context_errors
         )
+        self._last_frame_ts_ns = timestamp_ns
+        if current_detection_timestamps:
+            self._last_detection_frame_ts_ns = next(
+                iter(current_detection_timestamps)
+            )
+
+        results: list[ObjectEstimate3D] = []
+        for index, detection in enumerate(detections):
+            context_error = context_errors[index] or association_errors.get(index, "")
+            if context_error:
+                results.append(
+                    self._failure(
+                        detection.class_id,
+                        output_frame,
+                        timestamp_ns,
+                        context_error,
+                    )
+                )
+                continue
+            results.append(
+                self._estimate_one(
+                    detection,
+                    associations[index],
+                    depth,
+                    intrinsics,
+                    base,
+                    joints,
+                    output_frame,
+                    timestamp_ns,
+                )
+            )
+        return tuple(results)
 
     def reset_tracks(self) -> None:
         """清空全部三维 EMA 轨迹，用于切换场景或确认长时间失跟后重置。"""
 
         self._tracks.clear()
+        self._last_frame_ts_ns = None
+        self._last_detection_frame_ts_ns = None
 
     def _estimate_one(
         self,
         detection: Detection2D,
+        track_key: Optional[str],
         depth: DepthFrame,
         intrinsics: CameraIntrinsics,
         base: BaseState,
@@ -601,10 +720,19 @@ class Perception3DEstimator:
                 f"置信度计算失败：{exc}",
             )
         valid_fraction = self._depth_valid_fraction(depth, u, v)
-        key = self._track_key(detection.class_id, u, v)
-        filtered_point, count = self._update_track(
-            key, world_point, timestamp_ns
+        filtered_point, count, track_error = self._update_track(
+            track_key,
+            detection,
+            world_point,
+            timestamp_ns,
         )
+        if track_error:
+            return self._failure(
+                detection.class_id,
+                output_frame,
+                timestamp_ns,
+                track_error,
+            )
         converge = min(1.0, count / self.converge_frames)
         confidence *= valid_fraction * converge
         confidence = max(0.0, min(1.0, confidence))
@@ -636,42 +764,114 @@ class Perception3DEstimator:
         scale = (z + half_depth) / z
         return (x * scale, y * scale, z + half_depth), True
 
-    def _track_key(self, class_id: str, u: float, v: float) -> str:
-        """按类别和二维中心网格生成三维轨迹键，不执行二维框关联或平滑。"""
+    def _associate_tracks(
+        self,
+        detections: tuple[Detection2D, ...],
+        context_errors: list[str],
+    ) -> tuple[dict[int, Optional[str]], dict[int, str]]:
+        """按稳定ID做同帧一对一关联；无ID输入明确不建立持久轨迹。"""
 
-        bucket_x = round(u / self.track_grid_px)
-        bucket_y = round(v / self.track_grid_px)
-        return f"{class_id}:{bucket_x}:{bucket_y}"
+        associations: dict[int, Optional[str]] = {}
+        errors: dict[int, str] = {}
+        reserved_keys: set[str] = set()
+
+        for index, detection in enumerate(detections):
+            if context_errors[index]:
+                continue
+            if not detection.valid:
+                associations[index] = None
+                continue
+            if detection.track_id is None:
+                associations[index] = None
+                continue
+            key = f"stable:{detection.track_id}"
+            if key in reserved_keys:
+                errors[index] = (
+                    "二维稳定轨迹ID重复：同一帧中 "
+                    f"track_id={detection.track_id} "
+                    "只能关联一个目标"
+                )
+                continue
+            associations[index] = key
+            reserved_keys.add(key)
+        return associations, errors
 
     def _update_track(
         self,
-        key: str,
+        key: Optional[str],
+        detection: Detection2D,
         world_point: tuple[float, float, float],
         timestamp_ns: int,
-    ) -> tuple[tuple[float, float, float], int]:
-        """以严格递增时间戳更新输出 frame 中的三维 EMA。"""
+    ) -> tuple[tuple[float, float, float], int, str]:
+        """以严格递增时间戳更新三维 EMA，并拒绝离群大跳变。"""
 
+        if key is None:
+            return world_point, 1, ""
+
+        detection_timestamp_ns = int(detection.timestamp_ns)
         track = self._tracks.get(key)
-        max_age_ns = self.max_track_age_s * 1_000_000_000.0
-        if (
-            track is None
-            or timestamp_ns - track.last_ts_ns > max_age_ns
-        ):
-            track = _Track(list(world_point), 1, timestamp_ns)
+        if track is None:
+            track = _Track(
+                class_id=detection.class_id,
+                ema=list(world_point),
+                count=1,
+                last_ts_ns=timestamp_ns,
+                last_detection_ts_ns=detection_timestamp_ns,
+            )
             self._tracks[key] = track
-        elif timestamp_ns > track.last_ts_ns:
-            for index, value in enumerate(world_point):
-                track.ema[index] = (
-                    self.ema_alpha * value
-                    + (1.0 - self.ema_alpha) * track.ema[index]
-                )
-            track.count += 1
-            track.last_ts_ns = timestamp_ns
-        # 重复或倒序帧不得写入 EMA，也不得删除已有轨迹。
-        return tuple(track.ema), track.count
+            return tuple(track.ema), track.count, ""
+
+        if track.class_id != detection.class_id:
+            return (
+                (0.0, 0.0, 0.0),
+                track.count,
+                (
+                    "二维稳定轨迹ID类别冲突："
+                    f"历史类别 {track.class_id!r}，当前类别 {detection.class_id!r}"
+                ),
+            )
+        if timestamp_ns <= track.last_ts_ns:
+            return (
+                (0.0, 0.0, 0.0),
+                track.count,
+                (
+                    "陈旧轨迹样本：当前时间戳 "
+                    f"{timestamp_ns} 未严格晚于轨迹时间 {track.last_ts_ns}"
+                ),
+            )
+        if detection_timestamp_ns <= track.last_detection_ts_ns:
+            return (
+                (0.0, 0.0, 0.0),
+                track.count,
+                (
+                    "陈旧二维轨迹样本：当前Detection时间戳 "
+                    f"{detection_timestamp_ns} 未严格晚于轨迹Detection时间 "
+                    f"{track.last_detection_ts_ns}"
+                ),
+            )
+        jump_m = math.dist(tuple(track.ema), world_point)
+        if jump_m > self.max_position_jump_m:
+            return (
+                (0.0, 0.0, 0.0),
+                track.count,
+                (
+                    "三维位置跳变超限："
+                    f"{jump_m:.6f}m > {self.max_position_jump_m:.6f}m，"
+                    "拒绝离群值且不更新EMA"
+                ),
+            )
+        for index, value in enumerate(world_point):
+            track.ema[index] = (
+                self.ema_alpha * value
+                + (1.0 - self.ema_alpha) * track.ema[index]
+            )
+        track.count += 1
+        track.last_ts_ns = timestamp_ns
+        track.last_detection_ts_ns = detection_timestamp_ns
+        return tuple(track.ema), track.count, ""
 
     def _remove_expired_tracks(self, timestamp_ns: int) -> None:
-        """删除相对当前正序帧已超时的轨迹；倒序帧不会误删状态。"""
+        """删除相对当前正序帧已超时的轨迹。"""
 
         max_age_ns = self.max_track_age_s * 1_000_000_000.0
         expired = [
@@ -682,6 +882,113 @@ class Perception3DEstimator:
         ]
         for key in expired:
             del self._tracks[key]
+
+    def _validate_batch_inputs(
+        self,
+        depth: DepthFrame,
+        intrinsics: CameraIntrinsics,
+    ) -> tuple[int, int]:
+        """校验Depth/CameraInfo有效性、非负时间和严格frame一致性。"""
+
+        if not depth.valid:
+            raise ValueError(
+                f"DepthFrame无效：{depth.failure_reason or '上游未提供原因'}"
+            )
+        if not intrinsics.valid:
+            raise ValueError(
+                f"CameraInfo无效：{intrinsics.failure_reason or '上游未提供原因'}"
+            )
+        depth_timestamp_ns = self._timestamp_ns(
+            depth.timestamp_ns, "DepthFrame.timestamp_ns"
+        )
+        intrinsics_timestamp_ns = self._timestamp_ns(
+            intrinsics.timestamp_ns, "CameraIntrinsics.timestamp_ns"
+        )
+        depth_frame = self._frame_id(depth.frame_id, "DepthFrame.frame_id")
+        intrinsics_frame = self._frame_id(
+            intrinsics.frame_id, "CameraIntrinsics.frame_id"
+        )
+        if depth_frame != intrinsics_frame:
+            raise ValueError(
+                "DepthFrame/CameraInfo frame不一致："
+                f"{depth_frame!r} != {intrinsics_frame!r}"
+            )
+        self._require_time_window(
+            depth_timestamp_ns,
+            intrinsics_timestamp_ns,
+            "DepthFrame/CameraInfo",
+        )
+        return depth_timestamp_ns, intrinsics_timestamp_ns
+
+    def _detection_context_error(
+        self,
+        detection: Detection2D,
+        expected_frame_id: str,
+        depth_timestamp_ns: int,
+        intrinsics_timestamp_ns: int,
+    ) -> str:
+        """返回单条Detection与当前Depth上下文不一致的原因。"""
+
+        if not detection.valid:
+            return ""
+        try:
+            detection_timestamp_ns = self._timestamp_ns(
+                detection.timestamp_ns, "Detection2D.timestamp_ns"
+            )
+            detection_frame = self._frame_id(
+                detection.frame_id, "Detection2D.frame_id"
+            )
+            if detection_frame != expected_frame_id:
+                raise ValueError(
+                    "Detection2D/DepthFrame frame不一致："
+                    f"{detection_frame!r} != {expected_frame_id!r}"
+                )
+            self._require_time_window(
+                detection_timestamp_ns,
+                depth_timestamp_ns,
+                "Detection2D/DepthFrame",
+            )
+            self._require_time_window(
+                detection_timestamp_ns,
+                intrinsics_timestamp_ns,
+                "Detection2D/CameraInfo",
+            )
+            if detection.track_id is not None and (
+                isinstance(detection.track_id, bool)
+                or not isinstance(detection.track_id, Integral)
+                or int(detection.track_id) < 0
+            ):
+                raise ValueError("Detection2D.track_id 必须是非负整数或None")
+            x0, y0, x1, y1 = _finite_vector(
+                detection.bbox_xyxy, 4, "Detection2D.bbox_xyxy"
+            )
+            if x1 <= x0 or y1 <= y0:
+                raise ValueError(
+                    "Detection2D.bbox_xyxy 必须满足 x1>x0 且 y1>y0"
+                )
+        except ValueError as exc:
+            return f"二维检测上下文无效：{exc}"
+        return ""
+
+    def _require_time_window(
+        self,
+        first_timestamp_ns: int,
+        second_timestamp_ns: int,
+        label: str,
+    ) -> None:
+        max_skew_ns = self.max_input_skew_s * 1_000_000_000.0
+        skew_ns = abs(first_timestamp_ns - second_timestamp_ns)
+        if skew_ns > max_skew_ns:
+            raise ValueError(
+                f"{label} 时间差 {skew_ns}ns 超过允许窗口 "
+                f"{int(max_skew_ns)}ns"
+            )
+
+    @staticmethod
+    def _frame_id(value: Any, name: str) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{name} 必须是非空字符串")
+        return value
 
     def _depth_valid_fraction(
         self, depth: DepthFrame, u: float, v: float
@@ -705,12 +1012,26 @@ class Perception3DEstimator:
         return float(np.count_nonzero(valid) / patch.size)
 
     @staticmethod
-    def _timestamp_ns(value: Any) -> int:
-        """校验深度帧纳秒时间戳，避免 bool 或非整数参与轨迹时序。"""
+    def _timestamp_ns(value: Any, name: str) -> int:
+        """校验非负整数纳秒时间戳，避免bool或负值进入时序。"""
 
-        if isinstance(value, bool) or not isinstance(value, Integral):
-            raise ValueError("DepthFrame.timestamp_ns 必须是整数纳秒")
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, Integral)
+            or int(value) < 0
+        ):
+            raise ValueError(f"{name} 必须是非负整数纳秒")
         return int(value)
+
+    @staticmethod
+    def _safe_failure_timestamp(value: Any) -> int:
+        if (
+            isinstance(value, Integral)
+            and not isinstance(value, bool)
+            and int(value) >= 0
+        ):
+            return int(value)
+        return 0
 
     @staticmethod
     def _failure(
