@@ -113,8 +113,15 @@ class GlobalPhase(str, Enum):
     VERIFY_PLACE = "VERIFY_PLACE"#检查物体是否已正确释放
     RETURN_END = "RETURN_END"#返回规定的结束区域
     DONE = "DONE"#客户端认为任务流程完成
-    SAFE_HOLD = "SAFE_HOLD"#客户端认为任务无法继续
-    FAILED = "FAILED"#暂停普通动作，保持安全状态
+    # ————————————————————————————————
+    # 【Codex修改-14：澄清安全暂停与失败终态】
+    # 1. 修改前两个阶段的注释含义写反，容易把可恢复暂停误读成最终失败。
+    # 2. 当前明确SAFE_HOLD等待真实恢复条件，FAILED只能通过RESET离开。
+    # 3. 这样文档与FSM及ActionMux的安全语义一致，避免调用方采用错误恢复策略。
+    # 4. 仅修改注释，枚举名称和值完全不变。
+    SAFE_HOLD = "SAFE_HOLD"#临时安全暂停，保持安全状态，等待真实恢复条件。
+    FAILED = "FAILED"#客户端任务已经失败，只能通过RESET离开。
+    # ————————————————————————————————
 
 
 class LocalPhase(str, Enum):
@@ -168,6 +175,12 @@ def ensure_finite_vector(values: Sequence[float], length: int, name: str) -> tup
 
 # 任务与机器人实际状态
 
+# ————————————————————————————————
+# 【Codex修改-15：纠正TaskSpec解析失败文档】
+# 1. 修改前文档称解析失败会返回valid=False，与唯一InstructionParser实际抛异常冲突。
+# 2. 当前明确非法JSON、缺字段或类型错误会抛出ValueError，不构造无效TaskSpec。
+# 3. 这样调用方不会错误地等待一个永远不会返回的valid=False解析结果。
+# 4. 仅修改TaskSpec docstring，字段、顺序、JSON格式和运行逻辑均不变。
 @dataclass(frozen=True)
 class TaskSpec:
     """结构化比赛任务。。当前比赛要求机器人完成什么任务。
@@ -187,9 +200,11 @@ class TaskSpec:
     典型生产者是唯一任务解析入口 ``InstructionParser``，典型消费者是 FSM、导航和
     抓放规划。参数来自 ``/material/instruction``，包括任务编号、目标属性和放置约束。
     ``place_world_xyz`` 是任务要求的物体中心目标，单位米，不是夹爪末端位姿；它必须
-    经过规划转换为 ``PlaceTarget``。``None`` 表示可选字段未给出，解析失败时
-    ``valid=False`` 并填写原因。
+    经过规划转换为 ``PlaceTarget``。``None`` 表示可选字段未给出。当前唯一
+    ``InstructionParser`` 遇到非法 JSON、缺少字段或类型错误时抛出 ``ValueError``，
+    不返回 ``valid=False`` 的 ``TaskSpec``。
     """
+    # ————————————————————————————————
 
     task_id: int
     instruction: str
@@ -831,6 +846,12 @@ class GraspVerification:
 
 # FSM与最终动作
 
+# ————————————————————————————————
+# 【Codex修改-16：扩充FSMStatus原因字段文档】
+# 1. 修改前文档只称failure_reason保存失败原因，遗漏SAFE_HOLD暂停诊断语义。
+# 2. 当前明确该字段也可以保存SAFE_HOLD的安全暂停原因。
+# 3. 这样遥测、ActionMux和Recorder能按同一语义解释非终态安全原因。
+# 4. 仅修改FSMStatus docstring，不改变字段、顺序、JSON schema或运行逻辑。
 @dataclass(frozen=True)
 class FSMStatus:
     """全局和局部状态机遥测。
@@ -849,9 +870,11 @@ class FSMStatus:
     全局/局部阶段；``DONE`` 或 ``success=True`` 只表达客户端状态机的完成判断，不
     自动等于裁判结算或得分，裁判结果也不应写进逐帧状态语义。
 
-    时间单位纳秒，状态本身不带空间坐标。``failure_reason`` 记录客户端失败原因；
-    非法状态或解析失败时 JSON 解码函数抛出 ``ValueError``。
+    时间单位纳秒，状态本身不带空间坐标。``failure_reason`` 可以记录客户端失败原因，
+    也可以记录 ``SAFE_HOLD`` 的安全暂停原因；非法状态或解析失败时 JSON 解码函数
+    抛出 ``ValueError``。
     """
+    # ————————————————————————————————
 
     task_id: int
     global_phase: GlobalPhase

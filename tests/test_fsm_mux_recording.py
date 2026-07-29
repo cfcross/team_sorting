@@ -94,8 +94,14 @@ def _status(
         timestamp_ns=1_000,
     )
 
-
-def _loaded_fsm(max_pick_retries: int = 1) -> GlobalFSM:
+def _loaded_fsm(
+    max_pick_retries: int = 1,
+    # ————————————————————————————————
+    # 【Codex修改-17：测试辅助构造器接收超时策略】
+    # 防止测试辅助层忽略显式超时配置，从而让边界测试实际运行在默认无超时模式。
+    phase_timeouts_ns: dict[GlobalPhase, int] | None = None,
+    # ————————————————————————————————
+) -> GlobalFSM:
     raw = json.dumps(
         {
             "task_id": 1,
@@ -105,7 +111,14 @@ def _loaded_fsm(max_pick_retries: int = 1) -> GlobalFSM:
         }
     )
     task = InstructionParser().parse(raw, 100)[0]
-    fsm = GlobalFSM(max_pick_retries=max_pick_retries)
+    fsm = GlobalFSM(
+        max_pick_retries=max_pick_retries,
+        # ————————————————————————————————
+        # 【Codex修改-18：测试辅助构造器传递超时策略】
+        # 防止调用GlobalFSM时漏传上方策略，确保测试观察到真实配置行为。
+        phase_timeouts_ns=phase_timeouts_ns,
+        # ————————————————————————————————
+    )
     assert fsm.handle_event(FSMEvent.SYSTEM_READY, 110)
     assert fsm.submit_task(task, 120)
     return fsm
@@ -480,10 +493,22 @@ def test_done_and_failed_are_terminal_except_reset() -> None:
         FSMEvent.RETURN_REACHED,
     )
     assert done_fsm.phase is GlobalPhase.DONE
+    # ————————————————————————————————
+    # 【Codex修改-19：DONE终止态保护】
+    # 防止迟到失败或安全事件改写已经完成的任务结果。
+    assert done_fsm.status(2_000).success is True
+    assert done_fsm.status(2_000).task_id == 1
+    # ————————————————————————————————
     assert not done_fsm.handle_event(FSMEvent.FAILURE, 2_000, "迟到的失败事件")
+    # ————————————————————————————————
+    # 【Codex修改-20：DONE拒绝安全控制事件】
+    # 防止迟到的安全暂停或恢复事件让已完成任务重新进入活动状态。
+    assert not done_fsm.handle_event(FSMEvent.SAFETY_HOLD, 2_001, "迟到的安全事件")
+    assert not done_fsm.handle_event(FSMEvent.SAFETY_RECOVERED, 2_002)
+    # ————————————————————————————————
     assert done_fsm.phase is GlobalPhase.DONE
     assert done_fsm.failure_reason == ""
-    assert done_fsm.handle_event(FSMEvent.RESET, 2_001)
+    assert done_fsm.handle_event(FSMEvent.RESET, 2_003)
     assert done_fsm.phase is GlobalPhase.WAIT_READY
 
     failed_fsm = GlobalFSM()
@@ -491,12 +516,22 @@ def test_done_and_failed_are_terminal_except_reset() -> None:
     assert failed_fsm.phase is GlobalPhase.FAILED
     assert not failed_fsm.handle_event(FSMEvent.SYSTEM_READY, 3_001)
     assert not failed_fsm.handle_event(FSMEvent.FAILURE, 3_002, "迟到的第二个失败")
+    # ————————————————————————————————
+    # 【Codex修改-21：FAILED终止态保护】
+    # 防止普通业务、安全恢复或重复失败让FAILED终态重新进入活动流程。
+    assert not failed_fsm.handle_event(FSMEvent.SAFETY_HOLD, 3_003, "迟到的安全事件")
+    assert not failed_fsm.handle_event(FSMEvent.SAFETY_RECOVERED, 3_004)
+    # ————————————————————————————————
     assert failed_fsm.phase is GlobalPhase.FAILED
     assert failed_fsm.failure_reason == "启动失败"
-    assert failed_fsm.handle_event(FSMEvent.RESET, 3_003)
+    assert failed_fsm.handle_event(FSMEvent.RESET, 3_005)
     assert failed_fsm.phase is GlobalPhase.WAIT_READY
 
 
+# ————————————————————————————————
+# 【Codex修改-22：恢复抓取后的快照使用合法时间】
+# 防止测试用早于DONE转换的时间读取状态，同时继续保护旧抓取失败原因被成功验证清除。
+# ————————————————————————————————
 def test_recovered_pick_failure_reason_is_cleared() -> None:
     fsm = _loaded_fsm(max_pick_retries=1)
     _advance(
@@ -529,7 +564,7 @@ def test_recovered_pick_failure_reason_is_cleared() -> None:
         start_ns=3_000,
     )
     assert fsm.phase is GlobalPhase.DONE
-    assert fsm.status(3_000).failure_reason == ""
+    assert fsm.status(3_004).failure_reason == ""
 
 
 def test_exhausted_pick_retry_reason_survives_return_to_failed() -> None:
@@ -556,6 +591,695 @@ def test_exhausted_pick_retry_reason_survives_return_to_failed() -> None:
     assert fsm.handle_event(FSMEvent.RETURN_REACHED, 2_300)
     assert fsm.phase is GlobalPhase.FAILED
     assert fsm.status(2_300).failure_reason == "重试耗尽"
+
+
+# ————————————————————————————————
+# 【Codex修改-23：状态读取无副作用】
+# 防止phase_elapsed_ns或status读取推进FSM、触发超时或刷新阶段进入时间。
+# ————————————————————————————————
+def test_fsm_phase_time_and_status_are_side_effect_free() -> None:
+    fsm = GlobalFSM()
+    assert fsm.phase_entered_ns is None
+    assert fsm.phase_elapsed_ns(50) is None
+    assert fsm.handle_event(FSMEvent.SYSTEM_READY, 100)
+    assert fsm.phase_entered_ns == 100
+    assert fsm.phase_elapsed_ns(125) == 25
+    with pytest.raises(ValueError, match="早于"):
+        fsm.phase_elapsed_ns(99)
+
+    before = fsm.status(150)
+    after = fsm.status(250)
+    assert before.global_phase is after.global_phase is GlobalPhase.LOAD_TASK
+    assert before.retry_count == after.retry_count == 0
+    assert fsm.phase_entered_ns == 100
+
+    assert not fsm.handle_event(FSMEvent.TARGET_FOUND, 300)
+    assert fsm.phase_entered_ns == 100
+
+
+def test_fsm_legal_transitions_update_phase_entry_time_and_local_is_telemetry() -> None:
+    fsm = _loaded_fsm()
+    assert fsm.phase_entered_ns == 120
+    fsm.set_local_phase(LocalPhase.APPROACH)
+    assert fsm.phase is GlobalPhase.SEARCH_TARGET
+    assert fsm.phase_entered_ns == 120
+    assert fsm.status(125).local_phase is LocalPhase.APPROACH
+
+    assert fsm.handle_event(FSMEvent.TARGET_FOUND, 130)
+    assert fsm.phase is GlobalPhase.NAV_TO_PICK
+    assert fsm.phase_entered_ns == 130
+
+
+def test_fsm_rejects_negative_and_stale_mutating_timestamps() -> None:
+    fsm = _loaded_fsm()
+    with pytest.raises(ValueError, match="timestamp_ns"):
+        fsm.handle_event(FSMEvent.TARGET_FOUND, -1)
+    assert fsm.phase is GlobalPhase.SEARCH_TARGET
+    assert fsm.phase_entered_ns == 120
+
+    assert fsm.handle_event(FSMEvent.TARGET_FOUND, 200)
+    assert not fsm.handle_event(FSMEvent.PICK_NAV_REACHED, 199)
+    assert fsm.phase is GlobalPhase.NAV_TO_PICK
+    assert fsm.phase_entered_ns == 200
+
+    task = fsm.task
+    assert task is not None
+    assert not fsm.submit_task(task, 199)
+    with pytest.raises(ValueError, match="timestamp_ns"):
+        fsm.submit_task(task, -1)
+
+
+# ————————————————————————————————
+# 【Codex修改-24：恢复使用真实时间且拒绝暂停前旧事件】
+# 防止恢复后伪造阶段进入时间，或让暂停前产生的迟到业务回执推进已恢复阶段。
+# ————————————————————————————————
+def test_late_events_cannot_cross_safe_hold_recovery_or_reset_boundary() -> None:
+    fsm = _loaded_fsm()
+    assert fsm.handle_event(FSMEvent.SAFETY_HOLD, 200, "急停输入短暂失效")
+    assert fsm.handle_event(FSMEvent.SAFETY_RECOVERED, 300)
+    assert fsm.phase is GlobalPhase.SEARCH_TARGET
+    assert fsm.phase_entered_ns == 300
+    assert fsm._phase_elapsed_offset_ns == 80
+
+    # SAFE_HOLD前产生、恢复后才送达的旧回执不能推进恢复后的阶段。
+    assert not fsm.handle_event(FSMEvent.TARGET_FOUND, 250)
+    assert fsm.phase is GlobalPhase.SEARCH_TARGET
+    assert fsm.phase_entered_ns == 300
+
+    assert fsm.handle_event(FSMEvent.RESET, 400)
+    assert not fsm.handle_event(FSMEvent.SYSTEM_READY, 399)
+    assert fsm.phase is GlobalPhase.WAIT_READY
+    assert fsm.phase_entered_ns == 400
+
+
+def test_no_timeout_policy_preserves_compatibility() -> None:
+    fsm = _loaded_fsm()
+    assert not fsm.check_timeout(10**15)
+    assert fsm.phase is GlobalPhase.SEARCH_TARGET
+    assert fsm.phase_entered_ns == 120
+
+
+# ————————————————————————————————
+# 【Codex修改-25：阶段超时边界直接进入FAILED】
+# 防止配置超时进入可恢复SAFE_HOLD、RETURN_END或DONE，并核对完整超时诊断文本。
+# ————————————————————————————————
+def test_configured_timeout_uses_exact_boundary_and_enters_failed() -> None:
+    fsm = _loaded_fsm(phase_timeouts_ns={GlobalPhase.SEARCH_TARGET: 10})
+    assert not fsm.check_timeout(129)
+    assert fsm.phase is GlobalPhase.SEARCH_TARGET
+    assert fsm.phase_entered_ns == 120
+
+    assert fsm.check_timeout(130)
+    status = fsm.status(130)
+    assert status.global_phase is GlobalPhase.FAILED
+    assert status.global_phase not in {
+        GlobalPhase.SAFE_HOLD,
+        GlobalPhase.RETURN_END,
+        GlobalPhase.DONE,
+    }
+    assert status.success is False
+    assert "SEARCH_TARGET阶段超时" in status.failure_reason
+    assert "实际活动时间10ns" in status.failure_reason
+    assert "配置限制10ns" in status.failure_reason
+    assert fsm.phase_entered_ns == 130
+
+
+# ————————————————————————————————
+# 【Codex修改-26：外部安全暂停保存活动时间并清零暂停阶段偏移】
+# 防止进入SAFE_HOLD时遗漏暂停前预算，或把原阶段偏移错误带入暂停阶段。
+# ————————————————————————————————
+def test_external_safe_hold_saves_elapsed_time_before_pause() -> None:
+    fsm = _loaded_fsm(phase_timeouts_ns={GlobalPhase.SEARCH_TARGET: 100})
+
+    assert fsm.handle_event(FSMEvent.SAFETY_HOLD, 150, "外部安全监控暂停")
+
+    assert fsm.phase is GlobalPhase.SAFE_HOLD
+    assert fsm._interrupted_phase is GlobalPhase.SEARCH_TARGET
+    assert fsm._interrupted_elapsed_ns == 30
+    assert fsm.phase_entered_ns == 150
+    assert fsm._phase_elapsed_offset_ns == 0
+
+
+# ————————————————————————————————
+# 【Codex修改-27：恢复后继续使用剩余活动预算】
+# 防止安全暂停时长被算入业务耗时，也防止恢复时重新获得一整份阶段预算。
+# ————————————————————————————————
+def test_safe_hold_recovery_preserves_elapsed_timeout_budget() -> None:
+    fsm = _loaded_fsm(phase_timeouts_ns={GlobalPhase.SEARCH_TARGET: 100})
+    assert fsm.phase_elapsed_ns(150) == 30
+    assert fsm.handle_event(FSMEvent.SAFETY_HOLD, 150, "短暂安全暂停")
+    assert fsm._interrupted_elapsed_ns == 30
+
+    assert fsm.handle_event(FSMEvent.SAFETY_RECOVERED, 1_000)
+    assert fsm.phase is GlobalPhase.SEARCH_TARGET
+    assert fsm.phase_entered_ns == 1_000
+    assert fsm._phase_elapsed_offset_ns == 30
+    assert fsm.phase_elapsed_ns(1_000) == 30
+    assert not fsm.check_timeout(1_069)
+    assert fsm.check_timeout(1_070)
+    assert fsm.phase is GlobalPhase.FAILED
+
+
+# ————————————————————————————————
+# 【Codex修改-28：多次安全暂停只累计业务活动时间】
+# 防止第二次暂停覆盖第一次已用预算，或把两段长暂停时长累加到业务阶段。
+# ————————————————————————————————
+def test_multiple_safe_holds_accumulate_only_active_elapsed_time() -> None:
+    fsm = _loaded_fsm(phase_timeouts_ns={GlobalPhase.SEARCH_TARGET: 100})
+    assert fsm.handle_event(FSMEvent.SAFETY_HOLD, 150, "第一次暂停")
+    assert fsm.handle_event(FSMEvent.SAFETY_RECOVERED, 1_000)
+    assert fsm.phase_entered_ns == 1_000
+    assert fsm._phase_elapsed_offset_ns == 30
+
+    assert fsm.phase_elapsed_ns(1_010) == 40
+    assert fsm.handle_event(FSMEvent.SAFETY_HOLD, 1_010, "第二次暂停")
+    assert fsm._interrupted_elapsed_ns == 40
+    assert fsm.handle_event(FSMEvent.SAFETY_RECOVERED, 2_000)
+
+    assert fsm.phase is GlobalPhase.SEARCH_TARGET
+    assert fsm.phase_entered_ns == 2_000
+    assert fsm._phase_elapsed_offset_ns == 40
+    assert fsm.phase_elapsed_ns(2_000) == 40
+    assert not fsm.check_timeout(2_059)
+    assert fsm.check_timeout(2_060)
+    assert fsm.phase is GlobalPhase.FAILED
+
+
+# ————————————————————————————————
+# 【Codex修改-29：超时失败保持终止态】
+# 防止超时后通过安全恢复或重复FAILURE重新进入活动流程并扩展失败原因。
+# ————————————————————————————————
+def test_timeout_failure_is_terminal_and_cannot_recover() -> None:
+    fsm = _loaded_fsm(phase_timeouts_ns={GlobalPhase.SEARCH_TARGET: 10})
+    assert fsm.check_timeout(130)
+    original_reason = fsm.failure_reason
+
+    assert fsm.phase is GlobalPhase.FAILED
+    assert not fsm.handle_event(FSMEvent.SAFETY_RECOVERED, 1_000)
+    assert not fsm.handle_event(FSMEvent.FAILURE, 1_001, "重复失败")
+    assert fsm.phase is GlobalPhase.FAILED
+    assert fsm.failure_reason == original_reason
+
+
+# ————————————————————————————————
+# 【Codex修改-30：安全恢复保留任务重试与真实恢复时刻】
+# 防止恢复过程清空诊断信息、跳过原阶段或把虚拟活动起点写入phase_entered_ns。
+# ————————————————————————————————
+def test_safe_hold_preserves_task_retry_and_recovers_without_skipping() -> None:
+    fsm = _loaded_fsm(max_pick_retries=2)
+    _advance(
+        fsm,
+        FSMEvent.TARGET_FOUND,
+        FSMEvent.PICK_NAV_REACHED,
+        FSMEvent.TARGET_REFINED,
+        FSMEvent.PICK_PLAN_READY,
+        FSMEvent.PICK_EXECUTED,
+        start_ns=200,
+    )
+    assert fsm.handle_event(FSMEvent.PICK_FAILED, 300, "一次可恢复抓取失败")
+    task = fsm.task
+    assert task is not None
+    assert fsm.retry_count == 1
+    assert fsm.phase is GlobalPhase.REFINE_TARGET
+
+    assert fsm.handle_event(FSMEvent.SAFETY_HOLD, 310, "传感器短暂失效")
+    status = fsm.status(311)
+    assert status.task_id == task.task_id
+    assert status.retry_count == 1
+    assert status.success is False
+    assert status.failure_reason == (
+        "原失败：一次可恢复抓取失败；安全暂停：传感器短暂失效"
+    )
+    assert fsm.task is task
+    assert fsm.failure_reason == "一次可恢复抓取失败"
+    assert not fsm.handle_event(FSMEvent.TARGET_REFINED, 312)
+    assert not fsm.handle_event(FSMEvent.RETURN_REACHED, 313)
+    assert fsm.phase is GlobalPhase.SAFE_HOLD
+
+    assert fsm.handle_event(FSMEvent.SAFETY_RECOVERED, 320)
+    assert fsm.phase is GlobalPhase.REFINE_TARGET
+    assert fsm.phase_entered_ns == 320
+    assert fsm._phase_elapsed_offset_ns == 10
+    assert fsm.phase_elapsed_ns(320) == 10
+    assert fsm.failure_reason == "一次可恢复抓取失败"
+
+
+def test_safe_hold_rejects_wrong_recovery_and_never_jumps_to_done() -> None:
+    fsm = _loaded_fsm()
+    assert not fsm.handle_event(FSMEvent.SAFETY_RECOVERED, 150)
+    assert fsm.phase is GlobalPhase.SEARCH_TARGET
+    assert fsm.handle_event(FSMEvent.SAFETY_HOLD, 160)
+    assert not fsm.handle_event(FSMEvent.SAFETY_HOLD, 161)
+    assert not fsm.handle_event(FSMEvent.RETURN_REACHED, 162)
+    assert fsm.phase is GlobalPhase.SAFE_HOLD
+    assert fsm.status(162).success is False
+
+
+# ————————————————————————————————
+# 【Codex修改-31：SAFE_HOLD不可恢复失败直接终止】
+# 防止安全条件尚未恢复时进入RETURN_END，并保护任务、重试和一次性组合的诊断原因。
+# ————————————————————————————————
+def test_safe_hold_failure_enters_failed_and_preserves_diagnostics() -> None:
+    fsm = _loaded_fsm(max_pick_retries=2)
+    _advance(
+        fsm,
+        FSMEvent.TARGET_FOUND,
+        FSMEvent.PICK_NAV_REACHED,
+        FSMEvent.TARGET_REFINED,
+        FSMEvent.PICK_PLAN_READY,
+        FSMEvent.PICK_EXECUTED,
+        start_ns=200,
+    )
+    assert fsm.handle_event(FSMEvent.PICK_FAILED, 300, "一次可恢复抓取失败")
+    task = fsm.task
+    assert task is not None
+    assert fsm.retry_count == 1
+    assert fsm.handle_event(FSMEvent.SAFETY_HOLD, 310, "安全监控暂停")
+
+    assert fsm.handle_event(FSMEvent.FAILURE, 320, "安全条件不可恢复")
+
+    assert fsm.phase is GlobalPhase.FAILED
+    assert fsm.phase is not GlobalPhase.RETURN_END
+    assert fsm.task is task
+    assert fsm.retry_count == 1
+    assert fsm.failure_reason == (
+        "原失败：一次可恢复抓取失败；安全暂停失败：安全条件不可恢复"
+    )
+    assert fsm._fail_after_return is False
+    assert fsm._interrupted_phase is None
+    assert fsm._interrupted_elapsed_ns is None
+    assert fsm._phase_elapsed_offset_ns == 0
+    assert fsm._safe_hold_reason == ""
+    assert not fsm.handle_event(FSMEvent.FAILURE, 321, "重复失败")
+    assert fsm.failure_reason == (
+        "原失败：一次可恢复抓取失败；安全暂停失败：安全条件不可恢复"
+    )
+
+
+# ————————————————————————————————
+# 【Codex修改-32：SAFE_HOLD空失败原因优先保留暂停原因】
+# 防止空reason覆盖安全监控提供的唯一可诊断原因。
+# ————————————————————————————————
+def test_safe_hold_failure_without_reason_uses_safe_hold_reason() -> None:
+    fsm = _loaded_fsm()
+    assert fsm.handle_event(FSMEvent.SAFETY_HOLD, 150, "急停无法复位")
+
+    assert fsm.handle_event(FSMEvent.FAILURE, 160, "")
+
+    assert fsm.phase is GlobalPhase.FAILED
+    assert fsm.failure_reason == "急停无法复位"
+
+
+def test_failure_without_task_and_with_task_keep_required_return_semantics() -> None:
+    without_task = GlobalFSM()
+    assert without_task.handle_event(FSMEvent.FAILURE, 10)
+    assert without_task.phase is GlobalPhase.FAILED
+    assert without_task.failure_reason == "业务模块报告失败"
+    assert without_task.phase_entered_ns == 10
+
+    with_task = _loaded_fsm()
+    assert with_task.handle_event(FSMEvent.FAILURE, 200, "导航不可恢复")
+    assert with_task.phase is GlobalPhase.RETURN_END
+    assert with_task.failure_reason == "导航不可恢复"
+    assert with_task.handle_event(FSMEvent.RETURN_REACHED, 210)
+    assert with_task.phase is GlobalPhase.FAILED
+    assert with_task.failure_reason == "导航不可恢复"
+
+
+# ————————————————————————————————
+# 【Codex修改-33：失败返区再次失败立即终止并组合根因】
+# 防止返区导航失败后永久等待RETURN_REACHED，同时确保不会重新进入或刷新RETURN_END。
+# ————————————————————————————————
+def test_return_end_failure_enters_failed_and_combines_root_reason() -> None:
+    fsm = _loaded_fsm()
+    assert fsm.handle_event(FSMEvent.FAILURE, 200, "导航不可恢复")
+    assert fsm.phase is GlobalPhase.RETURN_END
+    assert fsm.phase_entered_ns == 200
+
+    assert fsm.handle_event(FSMEvent.FAILURE, 240, "返区期间底盘异常")
+    assert fsm.phase is GlobalPhase.FAILED
+    assert fsm.failure_reason == "导航不可恢复；返区失败：返区期间底盘异常"
+    assert fsm.phase_entered_ns == 240
+    assert fsm._last_transition_ns == 240
+    assert not fsm.handle_event(FSMEvent.RETURN_REACHED, 300)
+
+
+# ————————————————————————————————
+# 【Codex修改-34：返区失败原因只组合一次】
+# 防止FAILED后的重复失败继续追加字符串并造成failure_reason无界增长。
+# ————————————————————————————————
+def test_return_end_repeated_failure_reason_stays_bounded_and_deduplicated() -> None:
+    fsm = _loaded_fsm()
+    assert fsm.handle_event(FSMEvent.FAILURE, 200, "最初导航失败")
+    assert fsm.handle_event(FSMEvent.FAILURE, 201, "返区底盘故障")
+    original_reason = "最初导航失败；返区失败：返区底盘故障"
+    assert fsm.failure_reason == original_reason
+
+    for index in range(100):
+        repeated_reason = "最初导航失败" if index % 2 == 0 else f"返区错误{index}"
+        assert not fsm.handle_event(
+            FSMEvent.FAILURE,
+            201 + index,
+            repeated_reason,
+        )
+
+    assert fsm.failure_reason == original_reason
+    assert len(fsm.failure_reason) == len(original_reason)
+    assert fsm.phase is GlobalPhase.FAILED
+    assert fsm.phase_entered_ns == 201
+    assert fsm._last_transition_ns == 201
+
+
+# ————————————————————————————————
+# 【Codex修改-35：正常返区首次失败成为最终根因】
+# 防止正常完成后的返区故障被忽略，并验证终止后不会再次追加后续错误。
+# ————————————————————————————————
+def test_first_failure_during_normal_return_becomes_root_reason() -> None:
+    fsm = _loaded_fsm()
+    _advance(
+        fsm,
+        FSMEvent.TARGET_FOUND,
+        FSMEvent.PICK_NAV_REACHED,
+        FSMEvent.TARGET_REFINED,
+        FSMEvent.PICK_PLAN_READY,
+        FSMEvent.PICK_EXECUTED,
+        FSMEvent.PICK_VERIFIED,
+        FSMEvent.PLACE_NAV_REACHED,
+        FSMEvent.PLACE_PLAN_READY,
+        FSMEvent.PLACE_EXECUTED,
+        FSMEvent.PLACE_VERIFIED,
+    )
+    assert fsm.phase is GlobalPhase.RETURN_END
+    assert fsm.handle_event(FSMEvent.FAILURE, 2_000, "正常返区时底盘故障")
+    assert fsm.failure_reason == "正常返区时底盘故障"
+    assert fsm.phase is GlobalPhase.FAILED
+    assert fsm.phase_entered_ns == 2_000
+    assert fsm._last_transition_ns == 2_000
+
+    assert not fsm.handle_event(FSMEvent.FAILURE, 2_001, "后续返区错误")
+    assert fsm.failure_reason == "正常返区时底盘故障"
+
+
+# ————————————————————————————————
+# 【Codex修改-36：RESET允许仿真时钟回退】
+# 防止迟到事件检查阻止显式新生命周期在较小仿真时间上重建时间基准。
+# ————————————————————————————————
+def test_reset_accepts_clock_rollback_and_rebuilds_time_baseline() -> None:
+    fsm = _loaded_fsm()
+    assert fsm.handle_event(FSMEvent.TARGET_FOUND, 200)
+
+    assert fsm.handle_event(FSMEvent.RESET, 0)
+    assert fsm.phase is GlobalPhase.WAIT_READY
+    assert fsm.phase_entered_ns == 0
+    assert fsm._last_transition_ns == 0
+    assert fsm._phase_elapsed_offset_ns == 0
+    assert fsm.handle_event(FSMEvent.SYSTEM_READY, 0)
+    assert fsm.phase is GlobalPhase.LOAD_TASK
+
+
+# ————————————————————————————————
+# 【Codex修改-37：RESET清理活动时间和安全暂停上下文】
+# 防止新生命周期继承旧阶段偏移、暂停原因、被中断阶段或重试诊断状态。
+# ————————————————————————————————
+def test_reset_clears_all_fsm_runtime_state() -> None:
+    fsm = _loaded_fsm(max_pick_retries=1)
+    _advance(
+        fsm,
+        FSMEvent.TARGET_FOUND,
+        FSMEvent.PICK_NAV_REACHED,
+        FSMEvent.TARGET_REFINED,
+        FSMEvent.PICK_PLAN_READY,
+        FSMEvent.PICK_EXECUTED,
+        start_ns=200,
+    )
+    assert fsm.handle_event(FSMEvent.PICK_FAILED, 300, "可恢复失败")
+    fsm.set_local_phase(LocalPhase.FAILED)
+    assert fsm.handle_event(FSMEvent.SAFETY_HOLD, 310, "安全暂停")
+    assert fsm.handle_event(FSMEvent.RESET, 400)
+
+    status = fsm.status(401)
+    assert status.task_id == -1
+    assert status.global_phase is GlobalPhase.WAIT_READY
+    assert status.local_phase is LocalPhase.IDLE
+    assert status.retry_count == 0
+    assert status.success is False
+    assert status.failure_reason == ""
+    assert fsm.task is None
+    assert fsm.failure_reason == ""
+    assert fsm.phase_entered_ns == 400
+    assert fsm._fail_after_return is False
+    assert fsm._interrupted_phase is None
+    assert fsm._interrupted_elapsed_ns is None
+    assert fsm._phase_elapsed_offset_ns == 0
+    assert fsm._safe_hold_reason == ""
+
+
+def test_wait_ready_rejects_configured_phase_timeout() -> None:
+    with pytest.raises(ValueError, match="WAIT_READY.*不能配置阶段超时"):
+        GlobalFSM(phase_timeouts_ns={GlobalPhase.WAIT_READY: 1})
+
+
+@pytest.mark.parametrize(
+    "policy",
+    (
+        {GlobalPhase.DONE: 1},
+        {GlobalPhase.FAILED: 1},
+        {GlobalPhase.WAIT_READY: 1},
+        {GlobalPhase.SAFE_HOLD: 1},
+        {GlobalPhase.SEARCH_TARGET: 0},
+        {GlobalPhase.SEARCH_TARGET: True},
+    ),
+)
+def test_fsm_rejects_invalid_timeout_policies(
+    policy: dict[GlobalPhase, object],
+) -> None:
+    with pytest.raises(ValueError, match="超时"):
+        GlobalFSM(phase_timeouts_ns=policy)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "policy",
+    (
+        [],
+        [(GlobalPhase.SEARCH_TARGET, 10)],
+        "SEARCH_TARGET=10",
+        SimpleNamespace(SEARCH_TARGET=10),
+    ),
+)
+def test_fsm_rejects_non_mapping_timeout_policy(policy: object) -> None:
+    with pytest.raises(ValueError, match="Mapping"):
+        GlobalFSM(phase_timeouts_ns=policy)  # type: ignore[arg-type]
+
+
+def test_fsm_timeout_policy_is_copied_and_read_only() -> None:
+    source = {GlobalPhase.SEARCH_TARGET: 10}
+    fsm = GlobalFSM(phase_timeouts_ns=source)
+
+    source[GlobalPhase.SEARCH_TARGET] = 1
+    source[GlobalPhase.NAV_TO_PICK] = 20
+    assert fsm.phase_timeouts_ns == {GlobalPhase.SEARCH_TARGET: 10}
+
+    with pytest.raises(TypeError):
+        fsm.phase_timeouts_ns[GlobalPhase.SEARCH_TARGET] = 1  # type: ignore[index]
+    with pytest.raises(AttributeError):
+        fsm.phase_timeouts_ns = {}  # type: ignore[misc]
+
+
+@pytest.mark.parametrize("value", [True, 1.0, "1", -1])
+def test_fsm_rejects_invalid_internal_retry_limits(value: object) -> None:
+    with pytest.raises(ValueError, match="max_pick_retries"):
+        GlobalFSM(max_pick_retries=value)  # type: ignore[arg-type]
+
+
+def test_fsm_requires_public_contract_types() -> None:
+    fsm = GlobalFSM()
+    with pytest.raises(TypeError, match="FSMEvent"):
+        fsm.handle_event("SYSTEM_READY", 1)  # type: ignore[arg-type]
+    assert fsm.phase is GlobalPhase.WAIT_READY
+
+    assert fsm.handle_event(FSMEvent.SYSTEM_READY, 2)
+    with pytest.raises(TypeError, match="TaskSpec"):
+        fsm.submit_task(SimpleNamespace(valid=True), 3)  # type: ignore[arg-type]
+    assert fsm.phase is GlobalPhase.LOAD_TASK
+
+
+@pytest.mark.parametrize(
+    "reason",
+    (None, True, 1, 1.0, b"failure", ["失败"], SimpleNamespace(text="失败")),
+)
+def test_handle_event_rejects_non_string_reason(reason: object) -> None:
+    fsm = GlobalFSM()
+
+    with pytest.raises(TypeError, match="reason.*str"):
+        fsm.handle_event(
+            FSMEvent.SYSTEM_READY,
+            1,
+            reason,  # type: ignore[arg-type]
+        )
+
+    assert fsm.phase is GlobalPhase.WAIT_READY
+    assert fsm.phase_entered_ns is None
+
+
+def test_handle_event_empty_reason_keeps_default_failure_reason() -> None:
+    fsm = GlobalFSM()
+
+    assert fsm.handle_event(FSMEvent.FAILURE, 1, "")
+
+    assert fsm.phase is GlobalPhase.FAILED
+    assert fsm.failure_reason == "业务模块报告失败"
+
+
+# ————————————————————————————————
+# 【Codex修改-38：所有FSM读取入口严格校验时间类型】
+# 防止bool、负数、浮点数或字符串通过status或phase_elapsed_ns形成含糊时间语义。
+# ————————————————————————————————
+@pytest.mark.parametrize("timestamp_ns", [True, -1, 1.0, "1"])
+def test_parser_and_status_reject_invalid_timestamps(timestamp_ns: object) -> None:
+    raw = json.dumps(
+        {
+            "task": 1,
+            "target_body": "box_pink",
+            "place_type": "shelf_point",
+            "place_world": [-2.68, 0.778, 1.156],
+            "place_radius": 0.24,
+        }
+    )
+    with pytest.raises(ValueError, match="timestamp_ns"):
+        InstructionParser().parse(raw, timestamp_ns)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="timestamp_ns"):
+        GlobalFSM().status(timestamp_ns)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="timestamp_ns"):
+        GlobalFSM().phase_elapsed_ns(timestamp_ns)  # type: ignore[arg-type]
+
+
+# ————————————————————————————————
+# 【Codex修改-39：状态与活动时间读取拒绝倒序时间】
+# 防止旧时间生成倒序快照或负活动时间，并验证异常与相同时间读取都没有状态副作用。
+# ————————————————————————————————
+def test_fsm_time_reads_reject_stale_and_allow_equal_timestamp() -> None:
+    fsm = _loaded_fsm()
+    assert fsm.handle_event(FSMEvent.TARGET_FOUND, 200)
+    before = (
+        fsm.phase,
+        fsm.phase_entered_ns,
+        fsm._phase_elapsed_offset_ns,
+        fsm._last_transition_ns,
+        fsm.failure_reason,
+    )
+
+    with pytest.raises(ValueError, match="最近合法状态转换时间"):
+        fsm.status(199)
+    with pytest.raises(ValueError, match="最近合法状态转换时间"):
+        fsm.phase_elapsed_ns(199)
+
+    assert fsm.status(200).global_phase is GlobalPhase.NAV_TO_PICK
+    assert fsm.phase_elapsed_ns(200) == 0
+    assert (
+        fsm.phase,
+        fsm.phase_entered_ns,
+        fsm._phase_elapsed_offset_ns,
+        fsm._last_transition_ns,
+        fsm.failure_reason,
+    ) == before
+
+
+def test_fsm_accepts_equal_timestamps_without_skipping_event_order() -> None:
+    raw = json.dumps(
+        {
+            "task_id": 1,
+            "target_body": "box",
+            "place_type": "world_point",
+            "place_world": [1.0, 2.0, 0.8],
+        }
+    )
+    task = InstructionParser().parse(raw, 100)[0]
+    fsm = GlobalFSM()
+
+    assert fsm.handle_event(FSMEvent.SYSTEM_READY, 100)
+    assert fsm.submit_task(task, 100)
+    assert fsm.handle_event(FSMEvent.TARGET_FOUND, 100)
+    assert fsm.phase is GlobalPhase.NAV_TO_PICK
+    assert fsm.phase_entered_ns == 100
+
+    assert not fsm.handle_event(FSMEvent.PICK_EXECUTED, 100)
+    assert fsm.phase is GlobalPhase.NAV_TO_PICK
+    assert fsm.phase_entered_ns == 100
+    assert fsm.handle_event(FSMEvent.PICK_NAV_REACHED, 100)
+    assert fsm.phase is GlobalPhase.REFINE_TARGET
+    assert fsm.phase_entered_ns == 100
+
+
+def test_fsm_repeated_task_submission_does_not_reset_active_task() -> None:
+    raw = json.dumps(
+        [
+            {
+                "task": 1,
+                "target_kind": "cuboid_box",
+                "target_body": "box_pink",
+                "target_color": "pink",
+                "place_type": "shelf_point",
+                "place_world": [-2.68, 0.778, 1.156],
+                "place_radius": 0.24,
+            },
+            {
+                "task": 2,
+                "target_kind": "cuboid_box",
+                "target_body": "box_brown",
+                "target_color": "brown",
+                "place_type": "table_point",
+                "place_world": [-1.0, 2.2, 0.834],
+                "place_radius": 0.28,
+            },
+            {
+                "task": 3,
+                "target_kind": "cuboid_box",
+                "target_body": "box_yellow",
+                "target_color": "yellow",
+                "ref_prop": "packaging_box",
+                "ref_prop_body": "packaging_box",
+                "direction": "left",
+                "place_type": "shelf_prop_side",
+                "place_world": [-2.68, 0.54, 0.498],
+                "place_radius": 0.24,
+            },
+        ]
+    )
+    parser = InstructionParser()
+    first_broadcast = parser.parse(raw, 100)
+    repeated_broadcast = parser.parse(raw, 500_000_100)
+    assert len(first_broadcast) == len(repeated_broadcast) == 3
+    assert (
+        repeated_broadcast[0].timestamp_ns - first_broadcast[0].timestamp_ns
+        == 500_000_000
+    )
+
+    fsm = GlobalFSM()
+    assert fsm.handle_event(FSMEvent.SYSTEM_READY, 110)
+    assert fsm.submit_task(first_broadcast[0], 120)
+    assert fsm.handle_event(FSMEvent.TARGET_FOUND, 130)
+    phase_entered_ns = fsm.phase_entered_ns
+
+    # 这里只验证FSM层：执行中再次提交任务不会重载，不覆盖ROS回调或去重逻辑。
+    assert not fsm.submit_task(repeated_broadcast[0], 500_000_100)
+    assert fsm.phase is GlobalPhase.NAV_TO_PICK
+    assert fsm.phase_entered_ns == phase_entered_ns
+    assert fsm.task is first_broadcast[0]
+
+
+def test_instruction_parser_rejects_negative_place_radius() -> None:
+    raw = json.dumps(
+        {
+            "task": 1,
+            "target_body": "box_pink",
+            "place_type": "shelf_point",
+            "place_world": [-2.68, 0.778, 1.156],
+            "place_radius": -0.01,
+        }
+    )
+    with pytest.raises(ValueError, match="place_radius"):
+        InstructionParser().parse(raw, 100)
+# ————————————————————————————————
 
 
 # InstructionParser补充校验
