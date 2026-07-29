@@ -758,7 +758,8 @@ def test_prepare_mjcf_replaces_repo_root_and_cleans_temp_file(tmp_path: Path) ->
         provider.self_check()
 
     assert "__REPO_ROOT__" not in str(captured["xml"])
-    assert str(task_dir / "assets" / "robot.xml") in str(captured["xml"])
+    normalized_xml = str(captured["xml"]).replace("\\", "/")
+    assert (task_dir / "assets" / "robot.xml").as_posix() in normalized_xml
     assert not Path(str(captured["load_path"])).exists()
 
 
@@ -856,24 +857,303 @@ def test_camera_transform_rejects_invalid_input_state_and_point() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Perception3DEstimator临时未实现约束
+# Perception3DEstimator三维中心与多帧滤波回归
 # ---------------------------------------------------------------------------
 
-# 当前作用：防止物体中心补偿和滤波尚未实现时，把表面点、空结果或伪成功继续下传。
-# TODO(perception-3d-implementation)：estimate真正实现时，必须在同一提交中替换为单帧
-# 世界坐标、深度失败、表面到中心补偿、时间戳一致、多帧过滤和置信度测试；生产方法仍
-# 未实现时不得删除本组。
-def test_perception_3d_estimator_remains_unimplemented() -> None:
-    estimator = Perception3DEstimator(CameraTransformProvider())
-    detection = Detection2D("pink", (1.0, 1.0, 3.0, 3.0), 0.9, 100)
-    with pytest.raises(NotImplementedError, match="视觉2负责人"):
+
+class _OffsetTransformProvider(CameraTransformProvider):
+    """不加载MMK2FK，只给相机点增加固定的米制输出frame偏移。"""
+
+    def __init__(
+        self,
+        offset_xyz: tuple[float, float, float] = (0.0, 0.0, 0.0),
+        output_frame: str = "odom",
+    ) -> None:
+        super().__init__(output_frame=output_frame)
+        self.offset_xyz = offset_xyz
+
+    def camera_to_output(
+        self,
+        camera_point_xyz: tuple[float, float, float],
+        base: BaseState,
+        joints: RobotJointState,
+    ) -> tuple[float, float, float]:
+        del base, joints
+        return tuple(
+            camera_point_xyz[index] + self.offset_xyz[index]
+            for index in range(3)
+        )
+
+
+def _estimator_depth(
+    value_mm: float,
+    timestamp_ns: int,
+    *,
+    image: object | None = None,
+) -> DepthFrame:
+    """构造与默认内参尺寸一致的毫米深度帧。"""
+
+    depth_image = (
+        np.full((480, 640), value_mm, dtype=float)
+        if image is None
+        else image
+    )
+    return DepthFrame(
+        image=depth_image,
+        unit_scale_m=0.001,
+        frame_id="camera_optical_frame",
+        timestamp_ns=timestamp_ns,
+    )
+
+
+def test_perception_3d_single_frame_world_coordinate_and_timestamp() -> None:
+    estimator = Perception3DEstimator(
+        _OffsetTransformProvider((1.0, 2.0, 3.0)),
+        converge_frames=1,
+        object_dimensions_m={"pink": (0.1, 0.1, 0.2)},
+    )
+    detection = Detection2D("pink", (319.0, 239.0, 321.0, 241.0), 0.9, 90)
+
+    result = estimator.estimate(
+        (detection,),
+        _estimator_depth(1000.0, 100),
+        _intrinsics(),
+        _base(),
+        _actual_joints(),
+    )[0]
+
+    assert result.valid
+    assert result.position_xyz == pytest.approx((1.0, 2.0, 4.1))
+    assert result.frame_id == "odom"
+    assert result.timestamp_ns == 100
+
+
+def test_perception_3d_depth_failure_is_invalid_without_stopping_batch() -> None:
+    estimator = Perception3DEstimator(
+        _OffsetTransformProvider(),
+        converge_frames=1,
+        object_dimensions_m={
+            "pink": (0.1, 0.1, 0.2),
+            "yellow": (0.1, 0.1, 0.2),
+        },
+    )
+    partly_valid_depth = np.zeros((480, 640), dtype=float)
+    partly_valid_depth[236:245, 336:345] = 1000.0
+    detections = (
+        Detection2D("pink", (319.0, 239.0, 321.0, 241.0), 0.9, 100),
+        Detection2D("yellow", (339.0, 239.0, 341.0, 241.0), 0.8, 100),
+    )
+
+    results = estimator.estimate(
+        detections,
+        _estimator_depth(0.0, 100, image=partly_valid_depth),
+        _intrinsics(),
+        _base(),
+        _actual_joints(),
+    )
+
+    assert len(results) == 2
+    assert not results[0].valid
+    assert "深度" in results[0].failure_reason
+    assert results[0].confidence == 0.0
+    assert results[1].valid
+    assert results[1].position_xyz[2] == pytest.approx(1.1)
+
+
+def test_perception_3d_requires_compensation_before_claiming_valid_center() -> None:
+    estimator = Perception3DEstimator(
+        _OffsetTransformProvider(),
+        converge_frames=1,
+        object_dimensions_m={"pink": (0.1, 0.1, 0.2)},
+    )
+    known = Detection2D("pink", (419.0, 289.0, 421.0, 291.0), 0.9, 100)
+    unknown = Detection2D("brown", (419.0, 289.0, 421.0, 291.0), 0.9, 100)
+
+    known_result, unknown_result = estimator.estimate(
+        (known, unknown),
+        _estimator_depth(2000.0, 100),
+        _intrinsics(),
+        _base(),
+        _actual_joints(),
+    )
+
+    assert known_result.valid
+    assert known_result.position_xyz == pytest.approx((0.42, 0.21, 2.1))
+    assert not unknown_result.valid
+    assert unknown_result.position_xyz == (0.0, 0.0, 0.0)
+    assert unknown_result.confidence == 0.0
+    assert "中心补偿失败" in unknown_result.failure_reason
+    assert "可见表面" in unknown_result.failure_reason
+
+
+def test_perception_3d_multiframe_ema_and_confidence_converge() -> None:
+    estimator = Perception3DEstimator(
+        _OffsetTransformProvider(),
+        ema_alpha=0.5,
+        converge_frames=4,
+        object_dimensions_m={"pink": (0.1, 0.1, 0.2)},
+    )
+    detection = Detection2D("pink", (319.0, 239.0, 321.0, 241.0), 0.8, 100)
+    outputs = [
         estimator.estimate(
             (detection,),
-            _depth(np.ones((5, 5))),
+            _estimator_depth(value_mm, timestamp_ns),
             _intrinsics(),
             _base(),
             _actual_joints(),
+        )[0]
+        for value_mm, timestamp_ns in (
+            (1000.0, 100),
+            (2000.0, 101),
+            (2000.0, 102),
+            (2000.0, 103),
         )
+    ]
+
+    assert [result.position_xyz[2] for result in outputs] == pytest.approx(
+        [1.1, 1.6, 1.85, 1.975]
+    )
+    assert [result.confidence for result in outputs] == pytest.approx(
+        [0.2, 0.4, 0.6, 0.8]
+    )
+
+
+def test_perception_3d_confidence_uses_valid_depth_fraction_and_stays_in_range() -> None:
+    estimator = Perception3DEstimator(
+        _OffsetTransformProvider(),
+        depth_radius_px=1,
+        converge_frames=1,
+        object_dimensions_m={"pink": (0.1, 0.1, 0.2)},
+    )
+    image = np.zeros((480, 640), dtype=float)
+    image[239:242, 319:322] = (
+        (1000.0, 1000.0, 0.0),
+        (1000.0, 1000.0, 0.0),
+        (0.0, 0.0, 0.0),
+    )
+    detection = Detection2D("pink", (319.0, 239.0, 321.0, 241.0), 1.0, 100)
+
+    result = estimator.estimate(
+        (detection,),
+        _estimator_depth(0.0, 100, image=image),
+        _intrinsics(),
+        _base(),
+        _actual_joints(),
+    )[0]
+
+    assert result.valid
+    assert result.confidence == pytest.approx(4.0 / 9.0)
+    assert 0.0 <= result.confidence <= 1.0
+
+
+def test_perception_3d_unstabilized_2d_jitter_still_converges() -> None:
+    estimator = Perception3DEstimator(
+        _OffsetTransformProvider(),
+        ema_alpha=0.25,
+        converge_frames=1,
+        object_dimensions_m={"pink": (0.1, 0.1, 0.2)},
+    )
+    centers = (318.0, 322.0, 319.0, 321.0)
+    outputs = []
+    for index, center_x in enumerate(centers):
+        detection = Detection2D(
+            "pink",
+            (center_x - 1.0, 239.0, center_x + 1.0, 241.0),
+            0.9,
+            100 + index,
+        )
+        outputs.append(
+            estimator.estimate(
+                (detection,),
+                _estimator_depth(1000.0, 100 + index),
+                _intrinsics(),
+                _base(),
+                _actual_joints(),
+            )[0]
+        )
+
+    assert len(estimator._tracks) == 1
+    assert abs(outputs[-1].position_xyz[0]) < abs(outputs[0].position_xyz[0])
+    assert max(abs(result.position_xyz[0]) for result in outputs) <= 0.0045
+
+
+def test_perception_3d_rejects_duplicate_and_out_of_order_track_updates() -> None:
+    estimator = Perception3DEstimator(
+        _OffsetTransformProvider(),
+        ema_alpha=0.5,
+        converge_frames=5,
+        object_dimensions_m={"pink": (0.1, 0.1, 0.2)},
+    )
+    detection = Detection2D("pink", (319.0, 239.0, 321.0, 241.0), 0.9, 100)
+
+    first = estimator.estimate(
+        (detection,),
+        _estimator_depth(1000.0, 100),
+        _intrinsics(),
+        _base(),
+        _actual_joints(),
+    )[0]
+    duplicate = estimator.estimate(
+        (detection,),
+        _estimator_depth(3000.0, 100),
+        _intrinsics(),
+        _base(),
+        _actual_joints(),
+    )[0]
+    out_of_order = estimator.estimate(
+        (detection,),
+        _estimator_depth(4000.0, 99),
+        _intrinsics(),
+        _base(),
+        _actual_joints(),
+    )[0]
+    assert estimator.estimate(
+        (),
+        _estimator_depth(0.0, 101),
+        _intrinsics(),
+        _base(),
+        _actual_joints(),
+    ) == ()
+    resumed = estimator.estimate(
+        (detection,),
+        _estimator_depth(2000.0, 102),
+        _intrinsics(),
+        _base(),
+        _actual_joints(),
+    )[0]
+
+    assert first.position_xyz[2] == pytest.approx(1.1)
+    assert duplicate.position_xyz == first.position_xyz
+    assert out_of_order.position_xyz == first.position_xyz
+    assert resumed.position_xyz[2] == pytest.approx(1.6)
+    assert resumed.confidence > first.confidence
+
+
+def test_perception_3d_reset_tracks_restarts_convergence() -> None:
+    estimator = Perception3DEstimator(
+        _OffsetTransformProvider(),
+        converge_frames=5,
+        object_dimensions_m={"pink": (0.1, 0.1, 0.2)},
+    )
+    detection = Detection2D("pink", (319.0, 239.0, 321.0, 241.0), 0.9, 100)
+    first = estimator.estimate(
+        (detection,),
+        _estimator_depth(1000.0, 100),
+        _intrinsics(),
+        _base(),
+        _actual_joints(),
+    )[0]
+    estimator.reset_tracks()
+    restarted = estimator.estimate(
+        (detection,),
+        _estimator_depth(2000.0, 101),
+        _intrinsics(),
+        _base(),
+        _actual_joints(),
+    )[0]
+
+    assert restarted.position_xyz[2] == pytest.approx(2.1)
+    assert restarted.confidence == pytest.approx(first.confidence)
 
 
 # ---------------------------------------------------------------------------
@@ -936,7 +1216,8 @@ def test_kdl_self_check_reports_missing_module_and_search_paths(tmp_path: Path) 
         side_effect=ImportError("fake missing"),
     ), pytest.raises(RuntimeError, match="无法导入官方 MMK2Kdl") as exc_info:
         adapter.self_check()
-    assert str(tmp_path / "examples" / "material_sorting") in str(exc_info.value)
+    expected_search_path = str(tmp_path / "examples" / "material_sorting")
+    assert repr(expected_search_path) in str(exc_info.value)
     assert adapter._solver is None
 
 

@@ -10,12 +10,14 @@
 计算左右夹爪目标。Odom 只给出底盘位姿；slide 和 head 关节会改变头部相机相对底盘的
 位置与朝向，因此还必须使用实际 ``RobotJointState`` 和 ``MMK2FK`` 闭合坐标链。
 
-MMK2FK、MuJoCo、SciPy 和 NumPy 均按需延迟导入。第一版没有实现可靠的表面点到物体
-中心补偿，因此完整估计入口会明确报告未实现，不会把表面点伪装成物体中心。
+MMK2FK、MuJoCo、SciPy 和 NumPy 均按需延迟导入。物体尺寸由调用方注入；已知尺寸时
+沿相机射线把可见表面点补偿到近似几何中心，未知尺寸时明确返回无效估计，禁止把
+表面点冒充物体中心继续下传。
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import importlib
 import math
 from numbers import Integral, Real
@@ -387,28 +389,89 @@ class CameraTransformProvider:
         return temporary_path, temporary_path
 
 
+@dataclass
+class _Track:
+    """单个物体在输出 frame 中的米制三维 EMA 状态。"""
+
+    ema: list[float]
+    count: int
+    last_ts_ns: int
+
+
 class Perception3DEstimator:
-    """二维框到物体三维中心的估计器骨架。
+    """把二维框转换为输出 frame 中的物体三维中心估计。
 
-    视觉2未来需要为每个 ``Detection2D`` 选择可靠代表像素，从对齐深度中提取有效
-    距离，反投影到相机光学系，再经 ``CameraTransformProvider`` 转到输出 frame。
-    深度测到的通常是可见表面，必须完成表面点到物体中心的补偿后，才能组合类别、
-    三维中心、置信度、frame 和时间戳生成 ``ObjectEstimate3D``。
-
-    失败检测需要明确跳过或输出 ``valid=False``，并设计三维多帧滤波。BBOX 中心小
-    窗口中位数、缩小 ROI、深度离群过滤、点云/平面拟合、已知尺寸中心补偿及三维
-    EMA/中值滤波都只是待视觉2评审的候选方案，当前没有实现。本类不生成左右夹爪
-    末端位姿、最终抓取点或放置点。
+    每条检测独立执行中心窗口中位深度、针孔反投影、已知尺寸中心补偿和官方相机外参
+    变换。最终世界坐标按类别和二维网格分桶做 EMA，以抑制深度逐帧噪声。尺寸未知时
+    无法声称表面点已经到达几何中心，因此返回带明确原因的无效估计。本类不负责二维
+    框关联、目标选择、抓取点或夹爪末端位姿。
     """
 
-    def __init__(self, transform_provider: CameraTransformProvider) -> None:
-        """保存已配置的相机外参提供器。
+    def __init__(
+        self,
+        transform_provider: CameraTransformProvider,
+        *,
+        depth_radius_px: int = 4,
+        ema_alpha: float = 0.5,
+        converge_frames: int = 5,
+        track_grid_px: float = 40.0,
+        max_track_age_s: float = 1.0,
+        object_dimensions_m: Optional[
+            dict[str, tuple[float, float, float]]
+        ] = None,
+    ) -> None:
+        """保存三维估计参数，构造阶段不加载任何官方依赖。
 
-        参数：``transform_provider`` 负责 camera 到输出 frame 的官方 FK 转换。
-        返回：无。失败：不在构造阶段加载外部依赖。
+        ``object_dimensions_m`` 的值依次为宽、高、沿相机视线近似深度，单位米。
+        ``track_grid_px`` 为二维轨迹分桶尺寸（像素），``max_track_age_s`` 为轨迹超时
+        秒数。失败：参数类型、范围或物体尺寸不合法时抛出 ``ValueError``。
         """
 
+        if isinstance(depth_radius_px, bool) or not isinstance(
+            depth_radius_px, Integral
+        ):
+            raise ValueError("depth_radius_px 必须是非负整数")
+        if int(depth_radius_px) < 0:
+            raise ValueError("depth_radius_px 必须是非负整数")
+        if isinstance(converge_frames, bool) or not isinstance(
+            converge_frames, Integral
+        ):
+            raise ValueError("converge_frames 必须是正整数")
+        if int(converge_frames) <= 0:
+            raise ValueError("converge_frames 必须是正整数")
+
+        alpha = _finite_number(ema_alpha, "ema_alpha")
+        grid_px = _finite_number(track_grid_px, "track_grid_px")
+        max_age_s = _finite_number(max_track_age_s, "max_track_age_s")
+        if not 0.0 < alpha <= 1.0:
+            raise ValueError("ema_alpha 必须位于 (0, 1] 范围")
+        if grid_px <= 0.0:
+            raise ValueError("track_grid_px 必须是正的有限像素数")
+        if max_age_s <= 0.0:
+            raise ValueError("max_track_age_s 必须是正的有限秒数")
+
+        dimensions = dict(object_dimensions_m) if object_dimensions_m else {}
+        normalized_dimensions: dict[str, tuple[float, float, float]] = {}
+        for class_id, values in dimensions.items():
+            if not isinstance(class_id, str) or not class_id:
+                raise ValueError("object_dimensions_m 的类别键必须是非空字符串")
+            width, height, depth_extent = _finite_vector(
+                values, 3, f"object_dimensions_m[{class_id!r}]"
+            )
+            if width <= 0.0 or height <= 0.0 or depth_extent <= 0.0:
+                raise ValueError(
+                    f"object_dimensions_m[{class_id!r}] 的宽、高、深必须均为正数"
+                )
+            normalized_dimensions[class_id] = (width, height, depth_extent)
+
         self.transform_provider = transform_provider
+        self.depth_radius_px = int(depth_radius_px)
+        self.ema_alpha = alpha
+        self.converge_frames = int(converge_frames)
+        self.track_grid_px = grid_px
+        self.max_track_age_s = max_age_s
+        self._dims = normalized_dimensions
+        self._tracks: dict[str, _Track] = {}
 
     def estimate(
         self,
@@ -418,16 +481,255 @@ class Perception3DEstimator:
         base: BaseState,
         joints: RobotJointState,
     ) -> tuple[ObjectEstimate3D, ...]:
-        """把二维检测转换为物体中心三维估计。
+        """返回与输入检测顺序一致的三维估计元组。
 
-        参数包含像素框、米制深度、内参、Odom 和实际关节状态；目标输出 frame 由外参
-        提供器定义。返回三维目标元组。
-        失败：可靠像素/深度选择、物体表面点到中心的补偿、失败策略和滤波尚未实现，
-        当前明确抛出 ``NotImplementedError``。保留异常是为了阻止表面点被伪装成
-        物体中心后继续流入导航或抓取规划。
+        输入深度原始值通过 ``DepthFrame.unit_scale_m`` 换算为米；输出位置单位米，
+        frame 由 ``transform_provider.output_frame`` 指定，时间戳使用深度帧时间。
+        单条检测失败时只把对应结果标为 ``valid=False``，不会中断同批其他检测。
         """
 
-        raise NotImplementedError("三维物体中心补偿与多帧滤波尚未实现，请由视觉2负责人完成")
+        timestamp_ns = self._timestamp_ns(depth.timestamp_ns)
+        self._remove_expired_tracks(timestamp_ns)
+        output_frame = self.transform_provider.output_frame
+        return tuple(
+            self._estimate_one(
+                detection,
+                depth,
+                intrinsics,
+                base,
+                joints,
+                output_frame,
+                timestamp_ns,
+            )
+            for detection in detections
+        )
+
+    def reset_tracks(self) -> None:
+        """清空全部三维 EMA 轨迹，用于切换场景或确认长时间失跟后重置。"""
+
+        self._tracks.clear()
+
+    def _estimate_one(
+        self,
+        detection: Detection2D,
+        depth: DepthFrame,
+        intrinsics: CameraIntrinsics,
+        base: BaseState,
+        joints: RobotJointState,
+        output_frame: str,
+        timestamp_ns: int,
+    ) -> ObjectEstimate3D:
+        """独立处理一条检测，并把预期的数据错误转换为无效估计。"""
+
+        if not detection.valid:
+            reason = detection.failure_reason or "上游未提供原因"
+            return self._failure(
+                detection.class_id,
+                output_frame,
+                timestamp_ns,
+                f"二维检测无效：{reason}",
+            )
+
+        try:
+            depth_m = median_depth_m(
+                depth,
+                detection.bbox_xyxy,
+                radius_px=self.depth_radius_px,
+            )
+            x0, y0, x1, y1 = _finite_vector(
+                detection.bbox_xyxy, 4, "bbox_xyxy"
+            )
+            u = (x0 + x1) / 2.0
+            v = (y0 + y1) / 2.0
+        except ValueError as exc:
+            return self._failure(
+                detection.class_id,
+                output_frame,
+                timestamp_ns,
+                f"深度提取失败：{exc}",
+            )
+
+        try:
+            camera_point = project_pixel_to_camera(u, v, depth_m, intrinsics)
+        except ValueError as exc:
+            return self._failure(
+                detection.class_id,
+                output_frame,
+                timestamp_ns,
+                f"反投影失败：{exc}",
+            )
+
+        compensated_point, compensated = self._compensate_to_center(
+            detection.class_id, camera_point
+        )
+        if not compensated:
+            return self._failure(
+                detection.class_id,
+                output_frame,
+                timestamp_ns,
+                (
+                    "物体中心补偿失败："
+                    f"类别 {detection.class_id!r} 未配置可靠物体尺寸，"
+                    "当前深度点仅代表可见表面"
+                ),
+            )
+        try:
+            world_point = _finite_vector(
+                self.transform_provider.camera_to_output(
+                    compensated_point, base, joints
+                ),
+                3,
+                "camera_to_output 返回值",
+            )
+        except (ValueError, RuntimeError) as exc:
+            return self._failure(
+                detection.class_id,
+                output_frame,
+                timestamp_ns,
+                f"坐标变换失败：{exc}",
+            )
+
+        try:
+            confidence = _finite_number(
+                detection.confidence, "Detection2D.confidence"
+            )
+        except ValueError as exc:
+            return self._failure(
+                detection.class_id,
+                output_frame,
+                timestamp_ns,
+                f"置信度计算失败：{exc}",
+            )
+        valid_fraction = self._depth_valid_fraction(depth, u, v)
+        key = self._track_key(detection.class_id, u, v)
+        filtered_point, count = self._update_track(
+            key, world_point, timestamp_ns
+        )
+        converge = min(1.0, count / self.converge_frames)
+        confidence *= valid_fraction * converge
+        confidence = max(0.0, min(1.0, confidence))
+        return ObjectEstimate3D(
+            detection.class_id,
+            filtered_point,
+            confidence,
+            output_frame,
+            timestamp_ns,
+            valid=True,
+        )
+
+    def _compensate_to_center(
+        self,
+        class_id: str,
+        camera_point: tuple[float, float, float],
+    ) -> tuple[tuple[float, float, float], bool]:
+        """沿相机光学射线把可见表面点近似补偿到物体几何中心。
+
+        假设物体深度轴近似与相机 Z 轴对齐；已知物体沿视线深度时，把 Z 后移半深，
+        同时等比例放大 X/Y 以保持点位于同一光学射线上。未知尺寸或非正 Z 不补偿。
+        """
+
+        x, y, z = camera_point
+        dimensions = self._dims.get(class_id)
+        if dimensions is None or z <= 0.0:
+            return camera_point, False
+        half_depth = dimensions[2] / 2.0
+        scale = (z + half_depth) / z
+        return (x * scale, y * scale, z + half_depth), True
+
+    def _track_key(self, class_id: str, u: float, v: float) -> str:
+        """按类别和二维中心网格生成三维轨迹键，不执行二维框关联或平滑。"""
+
+        bucket_x = round(u / self.track_grid_px)
+        bucket_y = round(v / self.track_grid_px)
+        return f"{class_id}:{bucket_x}:{bucket_y}"
+
+    def _update_track(
+        self,
+        key: str,
+        world_point: tuple[float, float, float],
+        timestamp_ns: int,
+    ) -> tuple[tuple[float, float, float], int]:
+        """以严格递增时间戳更新输出 frame 中的三维 EMA。"""
+
+        track = self._tracks.get(key)
+        max_age_ns = self.max_track_age_s * 1_000_000_000.0
+        if (
+            track is None
+            or timestamp_ns - track.last_ts_ns > max_age_ns
+        ):
+            track = _Track(list(world_point), 1, timestamp_ns)
+            self._tracks[key] = track
+        elif timestamp_ns > track.last_ts_ns:
+            for index, value in enumerate(world_point):
+                track.ema[index] = (
+                    self.ema_alpha * value
+                    + (1.0 - self.ema_alpha) * track.ema[index]
+                )
+            track.count += 1
+            track.last_ts_ns = timestamp_ns
+        # 重复或倒序帧不得写入 EMA，也不得删除已有轨迹。
+        return tuple(track.ema), track.count
+
+    def _remove_expired_tracks(self, timestamp_ns: int) -> None:
+        """删除相对当前正序帧已超时的轨迹；倒序帧不会误删状态。"""
+
+        max_age_ns = self.max_track_age_s * 1_000_000_000.0
+        expired = [
+            key
+            for key, track in self._tracks.items()
+            if timestamp_ns > track.last_ts_ns
+            and timestamp_ns - track.last_ts_ns > max_age_ns
+        ]
+        for key in expired:
+            del self._tracks[key]
+
+    def _depth_valid_fraction(
+        self, depth: DepthFrame, u: float, v: float
+    ) -> float:
+        """计算深度中心窗口内有限且为正的原始像素占比。"""
+
+        try:
+            import numpy as np
+        except ImportError:
+            return 1.0
+        image = np.asarray(depth.image)
+        height, width = image.shape
+        center_x = int(round(u))
+        center_y = int(round(v))
+        xa = max(0, center_x - self.depth_radius_px)
+        xb = min(width, center_x + self.depth_radius_px + 1)
+        ya = max(0, center_y - self.depth_radius_px)
+        yb = min(height, center_y + self.depth_radius_px + 1)
+        patch = image[ya:yb, xa:xb].astype(float)
+        valid = np.isfinite(patch) & (patch > 0.0)
+        return float(np.count_nonzero(valid) / patch.size)
+
+    @staticmethod
+    def _timestamp_ns(value: Any) -> int:
+        """校验深度帧纳秒时间戳，避免 bool 或非整数参与轨迹时序。"""
+
+        if isinstance(value, bool) or not isinstance(value, Integral):
+            raise ValueError("DepthFrame.timestamp_ns 必须是整数纳秒")
+        return int(value)
+
+    @staticmethod
+    def _failure(
+        class_id: str,
+        output_frame: str,
+        timestamp_ns: int,
+        reason: str,
+    ) -> ObjectEstimate3D:
+        """构造不可用的诊断结果；零坐标仅作为无效值占位，绝不标记成功。"""
+
+        return ObjectEstimate3D(
+            class_id,
+            (0.0, 0.0, 0.0),
+            0.0,
+            output_frame,
+            timestamp_ns,
+            valid=False,
+            failure_reason=reason,
+        )
 
 
 def _rotate_by_wxyz(
