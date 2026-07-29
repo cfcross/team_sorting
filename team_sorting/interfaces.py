@@ -394,13 +394,19 @@ class Detection2D:
     bbox_xyxy         检测框坐标
     confidence        置信度
     timestamp_ns
+    frame_id          检测框所属图像坐标系
+    track_id          二维稳定器分配的稳定轨迹编号
     valid
 
     典型生产者是二维检测适配器，典型消费者是检测稳定逻辑和三维估计器。它是图像
-    平面中的检测结果，不携带深度或三维中心。
+    平面中的检测结果，不携带深度或三维中心。原始单帧检测的 ``track_id`` 为
+    ``None``；经过二维稳定器确认后，输出携带非负稳定编号，供三维滤波维持一对一
+    轨迹身份。
 
     ``bbox_xyxy`` 为图像像素坐标 ``(x0,y0,x1,y1)``；``confidence`` 范围建议为
-    0～1。该接口不携带三维位置。框越界可由检测适配层裁剪，格式错误时返回无效结果。
+    0～1；``timestamp_ns`` 为产生该框的 RGB 帧采样时间，单位纳秒；``frame_id``
+    必须与该 RGB 像素坐标系一致。该接口不携带三维位置。框越界可由检测适配层
+    裁剪，格式错误时返回无效结果。
     """
 
     class_id: str
@@ -409,6 +415,8 @@ class Detection2D:
     timestamp_ns: int
     valid: bool = True
     failure_reason: str = ""
+    frame_id: str = ""
+    track_id: Optional[int] = None
 
 
 @dataclass(frozen=True)

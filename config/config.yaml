@@ -83,9 +83,31 @@ timing:
 perception:
   confidence_threshold: 0.65  # OfficialYoloAdapter阈值，无单位，合法范围0到1
   sync_queue_size: 10         # RGB/Depth近似同步队列长度，必须是非bool正整数
-  sync_slop_s: 0.05           # RGB/Depth近似同步容差，单位秒，必须非负
+  # 同时作为Perception3DEstimator对Detection/Depth/CameraInfo的最大绝对时间差；
+  # 必须是非零正有限秒数，三者任何一对超窗都不得产生有效三维结果。
+  sync_slop_s: 0.05
   # 原始深度乘该比例得到米；0.001表示毫米转米，由PerceptionNode构造DepthFrame。
   depth_unit_scale_m: 0.001
+  stabilizer_2d:
+    iou_match_threshold: 0.3
+    min_confirmed_hits: 2
+    max_missed_frames: 2
+    bbox_smoothing_alpha: 0.5
+    confidence_smoothing_alpha: 0.5
+  estimator_3d:
+    depth_radius_px: 4
+    ema_alpha: 0.5
+    converge_frames: 5
+    max_track_age_s: 1.0
+    # 相邻稳定轨迹的三维中心若跳变超过该值则作为离群值拒绝，不污染EMA。
+    max_position_jump_m: 1.0
+    # 顺序为[width_m,height_m,depth_extent_m]。数值来自正式
+    # material_sorting/mjcf/material_competition.xml：三类movable_box的MuJoCo
+    # 半尺寸均为[0.12,0.08,0.095]m，因此这里填写完整尺寸[0.24,0.16,0.19]m。
+    object_dimensions_m:
+      pink: [0.24, 0.16, 0.19]
+      yellow: [0.24, 0.16, 0.19]
+      brown: [0.24, 0.16, 0.19]
 
 fsm:
   # 客户端在抓取失败后重新进入REFINE_TARGET的次数，不等于裁判允许的总尝试规则。

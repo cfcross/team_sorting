@@ -8,7 +8,7 @@
 旁路记录后续 ACT（动作分块 Transformer）/VLA（视觉—语言—动作模型）需要的数据。
 
 > 当前定位是“可导入、可测试、边界清晰的客户端骨架”，不是已经能完成比赛的成品。
-> 完整三维估计、导航、抓放规划、机械臂执行和比赛闭环仍未实现。
+> 真实相机/YOLO/MMK2FK 联调、导航、抓放规划、机械臂执行和比赛闭环仍未完成。
 
 ### Stage 2A External Candidate Consumer
 
@@ -58,8 +58,8 @@ Candidate 已执行、已发布或已被机器人采用。
 
 | 团队文件 | 官方来源 | 复用能力 | 团队适配接口 | 当前状态 |
 |---|---|---|---|---|
-| `perception_2d.py` | 官方 `backends.py`、YOLO 权重 | 加载官方检测器并执行二维检测 | `OfficialYoloAdapter.self_check()` / `detect()` | 自检和接口骨架完成，正式推理待联调 |
-| `perception_3d.py` | DISCOVERSE 的 `MMK2FK`、官方 `box_detect.py` 的针孔反投影思路 | 根据实际底盘和关节状态获得相机外参 | `CameraTransformProvider.self_check()` / `camera_to_output()` | 接口骨架完成，完整三维中心估计待实现 |
+| `perception_2d.py` | 官方 `backends.py`、YOLO 权重 | 加载官方检测器并执行二维检测 | `OfficialYoloAdapter.self_check()` / `detect()` | 检测转换、稳定轨迹 ID 与回归测试完成，正式推理待联调 |
+| `perception_3d.py` | DISCOVERSE 的 `MMK2FK`、官方 `box_detect.py` 的针孔反投影思路 | 根据实际底盘和关节状态获得相机外参 | `CameraTransformProvider.self_check()` / `camera_to_output()` | 深度中位数、反投影、尺寸中心补偿、稳定 ID EMA 与时帧校验已实现；真实 ROS/FK 待联调 |
 | `arm_planning.py` | 官方 `MMK2Kdl` / `ArmKdl` | FK 自检和固定 slide 的 IK（逆运动学：由末端目标求关节目标） | `OfficialKDLAdapter.self_check()` / `solve_ik()` | 导入和自检骨架完成，抓放规划待实现 |
 | `fsm.py` | 官方 `/material/instruction` JSON | 接收官方任务字段，但解析规则由团队集中维护 | `InstructionParser.parse()` | 已实现并有测试 |
 | `ros_nodes.py` | 官方 `/joint_states` | 按名称把反馈映射成团队固定的 17 维实际关节顺序 | `JointStateMapper.map_message()` | 已实现，待官方环境核对关节名称 |
@@ -134,11 +134,13 @@ ROS 2 节点可以理解为一个独立运行、通过话题交换消息的程�
 - **发布**：`/team/object_estimates`，类型为
   `vision_msgs/msg/Detection3DArray`，载荷包含类别、三维位置、置信度、时间和坐标系；
   `slot_type` 不通过该消息传输。
-- **调用**：`perception_2d.py` 的 `OfficialYoloAdapter`，`perception_3d.py` 的
-  `CameraTransformProvider` 与 `Perception3DEstimator`，以及 `interfaces.py` 中的感知接口。
+- **调用**：`perception_2d.py` 的 `OfficialYoloAdapter` 与
+  `Detection2DStabilizer`，`perception_3d.py` 的 `CameraTransformProvider` 与
+  `Perception3DEstimator`，以及 `interfaces.py` 中的感知接口。
 - **不负责**：解析任务、目标选择、导航、机械臂规划、动作仲裁或官方控制发布。
-- **是否必需**：默认 launch 会启动；完整比赛链路需要它提供三维目标。但当前
-  `Perception3DEstimator.estimate()` 尚未实现，所以不能声称感知链已经闭环。
+- **是否必需**：默认 launch 会启动；完整比赛链路需要它提供三维目标。纯 Python
+  三维估计与失败语义已有回归测试，但尚未在正式 ROS、相机、YOLO 与 MMK2FK
+  组合环境完成端到端验证，所以仍不能声称感知链已经闭环。
 
 ### `team_client_node`
 
@@ -265,8 +267,8 @@ Referee taskinfo / gameinfo / score
 | `BaseState` | 来自 Odom 的底盘实际位置、姿态和速度；无效或过期时不能作为到达依据。 |
 | `RobotJointState` | `/joint_states` 映射出的 17 维**实际反馈**；它不是规划目标，也不是 IK 解。 |
 | `SensorSnapshot` | `team_client_node` 一个周期的轻量快照：任务、底盘、实际关节、三维目标；不含图像。 |
-| `Detection2D` | 图像像素坐标中的类别框和置信度，不带三维位置。 |
-| `ObjectEstimate3D` | 目标**物体中心的估计位置**、frame、时间和置信度；不是末端位姿，当前中心补偿仍未实现。 |
+| `Detection2D` | 图像像素坐标中的类别框、置信度、RGB frame 与时间；稳定器输出还携带非负 `track_id`，不带三维位置。 |
+| `ObjectEstimate3D` | 目标**物体中心的估计位置**、frame、时间、置信度和 `valid/failure_reason`；已按配置尺寸沿光学射线补偿可见表面点，但不是夹爪末端位姿。 |
 | `NavGoal` | 底盘在指定 frame 中的 XY、yaw 目标和容差；物体放置点不能直接当作停车点。 |
 | `BaseCommand` | 导航模块提交给 `ActionMux` 的短时有效速度**建议**，不是已经发送的动作。 |
 | `IKResult` | 官方 KDL 求得的 slide/左右臂**目标关节解**；不是 `RobotJointState` 的实际反馈。 |
@@ -421,8 +423,12 @@ orphan 规则见
 | `control.head_target_tracking.fresh_reset_confirmed` | `false` | 运行方对本节点与官方Server共同fresh reset的显式确认 |
 | `control.head_target_tracking.initial_{yaw,pitch}_target` | `0.0` | Stage 2A固定reset controller target，单位rad，不能用JointState代替 |
 | `control.head_target_tracking.require_exclusive_writer` | `true` | 每次head发布前要求ROS graph中只有本节点一个publisher |
-| `perception.sync_slop_s` | `0.05` | RGB/Depth 近似同步容差 |
+| `perception.sync_slop_s` | `0.05` | RGB/Depth 近似同步及 Detection/Depth/CameraInfo 三方最大绝对时间差 |
 | `perception.depth_unit_scale_m` | `0.001` | 深度原始值换算为米的乘数 |
+| `perception.stabilizer_2d.min_confirmed_hits` | `2` | 轨迹连续命中两帧后才输出稳定 `track_id` |
+| `perception.estimator_3d.ema_alpha` | `0.5` | 同一稳定 `track_id` 的三维中心 EMA 当前样本权重 |
+| `perception.estimator_3d.max_position_jump_m` | `1.0` | 单轨迹相邻三维中心最大允许跳变 |
+| `perception.estimator_3d.object_dimensions_m.*` | `[0.24, 0.16, 0.19]` | 三类包装盒完整宽/高/深，单位米 |
 | `recorder.enabled` | `false` | 默认不启动记录 |
 | `recorder.record_rosbag` | `true` | 启动 Recorder 时同时管理 rosbag |
 | `recorder.root_dir` | `./team_sorting_dataset` | Episode 根目录 |
@@ -434,6 +440,9 @@ orphan 规则见
 
 官方 `mono16` 深度图的原始数值单位按当前代码和测试约定为毫米，因此乘
 `depth_unit_scale_m=0.001` 转为米。例如原始值 `1200` 表示 `1.2 m`。
+三类尺寸来自正式 `material_sorting/mjcf/material_competition.xml` 中
+`movable_box size="0.12 0.08 0.095"` 的 MuJoCo 半尺寸，配置保存完整尺寸；
+当前中心补偿使用第三项作为沿相机视线的近似物体深度。
 
 `recorder.rosbag_topics` 当前逐项记录：
 
@@ -503,13 +512,15 @@ ros2 launch team_sorting team.launch.xml record_data:=true
 - `ActionMux` 的限幅、TTL、安全状态覆盖和实际关节保持骨架；
 - 三个 ROS 2 节点入口、消息转换、时间缓存和官方发布出口骨架；
 - YOLO、MMK2FK、KDL 薄适配器及缺失依赖的清晰报错；
+- YOLO 检测的 RGB frame 传递、二维稳定轨迹 ID 与 PerceptionNode 接线；
+- 三维深度中位数、反投影、配置尺寸中心补偿、稳定 ID EMA、跳变拒绝与三方时帧校验；
 - Episode metadata、FSM/动作 JSONL 和外部 rosbag 管理链；
 - 几何、任务解析、FSM、19 维动作、安全覆盖与 Recorder 的测试骨架。
 
 ### 尚未完成
 
-- 完整 YOLO 联调、检测多帧稳定；
-- 三维物体中心补偿、滤波和实际 frame 验证；
+- 正式 YOLO/相机环境中的检测与二维稳定器参数联调；
+- 正式 ROS/MMK2FK 环境中的三维坐标、时间同步和 planning frame 端到端验证；
 - 抓取/放置站位生成、航点导航、精对准和底盘控制；
 - 由物体中心生成抓取/放置末端位姿，以及完整 IK/轨迹规划；
 - 机械臂轨迹插值、限速和局部抓放状态机；
