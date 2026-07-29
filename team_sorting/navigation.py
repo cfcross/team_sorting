@@ -13,8 +13,8 @@
 Z 轴角速度 ``w``（rad/s），不是左右轮速。本模块不得复制官方轮速换算，也不负责
 YOLO、机械臂 IK、全局 FSM 判断或 ROS 发布。
 
-第一版只实现可独立验证的几何函数。完整站位生成、航点导航、精对准和 creep 保留给
-底盘2负责人；``NavigationStatus`` 必须根据实际 Odom 判断，不能用命令生成代替到达。
+    当前实现包含基础站位生成和单周期比例控制；它不进行全局路径搜索、障碍物规划或
+    坐标变换。``NavigationStatus`` 必须根据实际 Odom 判断，不能用命令生成代替到达。
 """
 
 from __future__ import annotations
@@ -32,6 +32,23 @@ from .interfaces import (
     SlotType,
     TaskSpec,
 )
+
+# 本仓库尚无经评审的导航参数配置段；以下是受 ActionMux 现有限幅约束的保守团队初值，
+# 不是官方性能参数。待公共配置获批后应由组装层注入。
+#
+# 参数按用途分为四组：站位几何、目标有效期、反馈新鲜度和比例控制。集中声明可以避免
+# 抓取、放置和 update 各自复制数值，也便于后续迁移到 config.yaml。
+_STANDOFF_M = 0.60
+_POSITION_TOLERANCE_M = 0.05
+_YAW_TOLERANCE_RAD = 0.10
+_GOAL_TIMEOUT_NS = 30_000_000_000
+_COMMAND_TTL_NS = 200_000_000
+_ODOM_MAX_AGE_NS = 150_000_000
+_MAX_ABS_V_MPS = 0.25
+_MAX_ABS_W_RADPS = 0.50
+_LINEAR_KP = 0.8
+_ANGULAR_KP = 1.5
+_HEADING_STOP_RAD = math.pi / 4.0
 
 
 def _finite_real(value: object, field_name: str) -> float:
@@ -159,50 +176,268 @@ def classify_slot_type(
 
 
 class NavigationController:
-    """规则底盘导航器的普通 Python 接口骨架。
+    """根据目标中心生成操作站位，并用 Odom 计算单周期底盘候选命令。
 
     ``NavGoal`` 是要去的底盘站位，``BaseState`` 是 Odom 反馈的实际位置，
     ``BaseCommand`` 是本周期短时有效的 v/w 候选建议，``NavigationStatus`` 则是用实际
     反馈算出的执行状态。站位是机械臂能安全操作时底盘应停的位置，不等于物体中心。
 
-    未来由配置提供速度、加速度和容差。控制器不发布 ``/cmd_vel``，候选命令必须交给
-    ``ActionMux``；短 TTL 可防止控制循环中断后继续沿用旧速度。完整算法未实现时三个
-    公开方法都明确抛出 ``NotImplementedError``。
+    控制器不发布 ``/cmd_vel``，候选命令必须交给 ``ActionMux``；短 TTL 可防止控制循环
+    中断后继续沿用旧速度。本类只做局部几何和比例控制，不代替全局路径规划或 FSM。
     """
 
     def build_pick_goal(
         self, task: TaskSpec, target: ObjectEstimate3D, base: BaseState, timestamp_ns: int
     ) -> NavGoal:
-        """待底盘2根据物体中心反算抓取时的底盘 ``NavGoal``。
+        """根据物体中心和当前底盘位置生成抓取时的底盘 ``NavGoal``。
 
-        ``ObjectEstimate3D.position_xyz`` 是物体中心，不是底盘停车点。后续实现需结合
-        桌面/货架类型、抓取距离、机械臂可达范围、底盘朝向和碰撞余量生成站位，并确认
-        ``task/target/base`` 的 frame 关系。当前不使用固定坐标兜底。
+        ``ObjectEstimate3D.position_xyz`` 是物体中心，不是底盘停车点。当前最小确定性策略
+        沿“底盘到物体”的方向退让固定操作距离，再让底盘朝向物体；它不推测障碍物或
+        机械臂可达范围。``target`` 与 ``base`` 必须已处于同一 frame。
         """
 
-        raise NotImplementedError("抓取站位生成尚未实现，请由底盘2负责人完成")
+        # 先验证时间、任务和 Odom；任何几何计算都不能建立在无效状态上。
+        now = self._timestamp(timestamp_ns, "timestamp_ns")
+        self._validate_task(task, now)
+        self._validate_base(base, now, require_fresh=False)
+        if not isinstance(target, ObjectEstimate3D) or not target.valid:
+            raise ValueError("ObjectEstimate3D 无效")
+        target_stamp = self._timestamp(target.timestamp_ns, "target.timestamp_ns")
+        if target_stamp > now:
+            raise ValueError("ObjectEstimate3D 时间戳晚于当前周期")
+        if len(target.position_xyz) != 3:
+            raise ValueError("target.position_xyz 必须包含三项")
+        target_x, target_y = _read_xy(target.position_xyz, "target.position_xyz")
+        _finite_real(target.position_xyz[2], "target.position_xyz.z")
+        if not target.frame_id or target.frame_id != base.frame_id:
+            raise ValueError("目标与 BaseState frame 不一致，且仓库没有坐标转换接口")
+        # 物体中心只用于反算站位，不能直接复制为底盘停车点。
+        goal_x, goal_y, goal_yaw = self._stand_off_pose(
+            target_x, target_y, base.position_xyz
+        )
+        return NavGoal(
+            f"pick-{task.task_id}-{now}",
+            "pick",
+            (goal_x, goal_y, goal_yaw),
+            target.frame_id,
+            _POSITION_TOLERANCE_M,
+            _YAW_TOLERANCE_RAD,
+            now + _GOAL_TIMEOUT_NS,
+        )
 
     def build_place_goal(self, task: TaskSpec, base: BaseState, timestamp_ns: int) -> NavGoal:
-        """待底盘2根据 ``TaskSpec.place_world_xyz`` 反算放置站位。
+        """根据 ``TaskSpec.place_world_xyz`` 反算放置时的底盘站位。
 
-        ``place_world_xyz`` 是物体最终中心，单位米，不是底盘停车点。后续实现需结合
-        放置区域、机械臂可达范围和安全距离生成 ``NavGoal``，并明确目标与 Odom 的 frame
-        关系；不能把物体中心直接当作底盘目标。
+        ``place_world_xyz`` 是物体最终中心，单位米，不是底盘停车点。由于公共接口没有
+        world 到 odom 的转换，本方法只接受已经位于 world frame 的 ``BaseState``，避免
+        暗中假设 ``world == odom``。
         """
 
-        raise NotImplementedError("放置站位生成尚未实现，请由底盘2负责人完成")
+        now = self._timestamp(timestamp_ns, "timestamp_ns")
+        self._validate_task(task, now)
+        self._validate_base(base, now, require_fresh=False)
+        if task.place_world_xyz is None or len(task.place_world_xyz) != 3:
+            raise ValueError("TaskSpec.place_world_xyz 必须包含 world 三维坐标")
+        place_x, place_y = _read_xy(task.place_world_xyz, "task.place_world_xyz")
+        _finite_real(task.place_world_xyz[2], "task.place_world_xyz.z")
+        # 字段名明确规定 place_world_xyz 属于 world；没有变换时只能严格匹配。
+        if base.frame_id != "world":
+            raise ValueError(
+                "place_world_xyz 位于 world，但 BaseState 不在 world，且仓库没有坐标转换接口"
+            )
+        goal_x, goal_y, goal_yaw = self._stand_off_pose(
+            place_x, place_y, base.position_xyz
+        )
+        return NavGoal(
+            f"place-{task.task_id}-{now}",
+            "place",
+            (goal_x, goal_y, goal_yaw),
+            "world",
+            _POSITION_TOLERANCE_M,
+            _YAW_TOLERANCE_RAD,
+            now + _GOAL_TIMEOUT_NS,
+        )
 
     def update(
         self, base: BaseState, goal: NavGoal, timestamp_ns: int
     ) -> tuple[BaseCommand, NavigationStatus]:
-        """待底盘2用实际 Odom 推进一次导航控制周期。
+        """使用实际 Odom 推进一次导航控制周期。
 
-        后续根据 ``BaseState`` 与 ``NavGoal`` 计算 XY 距离误差和 yaw 误差，逐步实现粗
-        导航、转向、直行、靠近目标后的精对准，以及低速小步接近的 creep。输出应是带
-        短 TTL 的 ``BaseCommand(v,w)`` 和 ``NavigationStatus``。
+        控制分为“朝向停车点”“向停车点前进”“原地对准最终 yaw”和“到达”四种情况。
+        输出是带短 TTL 的 ``BaseCommand(v,w)`` 和基于同一份 Odom 的
+        ``NavigationStatus``；每次调用只生成一个周期的建议。
 
         只有实际 Odom 同时满足位置与角度容差时才能 ``success=True``；deadline 过期、
         frame 不一致或目标无效时必须失败。生成 ``NavGoal`` 或速度命令都不代表已经到达。
         """
 
-        raise NotImplementedError("底盘导航控制尚未实现，请由底盘2负责人完成")
+        try:
+            # 第一阶段：验证本周期时间、Odom、目标、frame、deadline 和容差。
+            now = self._timestamp(timestamp_ns, "timestamp_ns")
+            self._validate_base(base, now, require_fresh=True)
+            if not isinstance(goal, NavGoal) or not goal.valid:
+                raise ValueError("NavGoal 无效")
+            if not goal.goal_id or not goal.frame_id:
+                raise ValueError("NavGoal 标识或 frame 为空")
+            if goal.frame_id != base.frame_id:
+                raise ValueError("NavGoal 与 BaseState frame 不一致")
+            deadline = self._timestamp(goal.deadline_ns, "goal.deadline_ns")
+            if now > deadline:
+                return self._stopped(
+                    goal.goal_id,
+                    now,
+                    "timeout",
+                    "导航目标已超过 deadline",
+                    valid=False,
+                )
+            if len(goal.pose_xyyaw) != 3:
+                raise ValueError("goal.pose_xyyaw 必须包含三项")
+            goal_x, goal_y = _read_xy(goal.pose_xyyaw, "goal.pose_xyyaw")
+            goal_yaw = _finite_real(goal.pose_xyyaw[2], "goal.pose_xyyaw.yaw")
+            position_tolerance = _finite_real(
+                goal.position_tolerance, "goal.position_tolerance"
+            )
+            yaw_tolerance = _finite_real(goal.yaw_tolerance, "goal.yaw_tolerance")
+            if position_tolerance < 0.0 or yaw_tolerance < 0.0:
+                raise ValueError("NavGoal 容差不能为负数")
+
+            # 第二阶段：所有输入确认可靠后，再计算位置误差和最终姿态误差。
+            base_x, base_y = _read_xy(base.position_xyz, "base.position_xyz")
+            distance_error = distance_xy((base_x, base_y), (goal_x, goal_y))
+            final_yaw_error = wrap_to_pi(goal_yaw - base.yaw)
+            if distance_error <= position_tolerance:
+                # 已进入位置容差：停止平移，只调整目标要求的最终 yaw。
+                if abs(final_yaw_error) <= yaw_tolerance:
+                    return (
+                        BaseCommand(0.0, 0.0, now, now + _COMMAND_TTL_NS),
+                        NavigationStatus(
+                            goal.goal_id,
+                            "arrived",
+                            distance_error,
+                            final_yaw_error,
+                            True,
+                            "",
+                            now,
+                        ),
+                    )
+                v = 0.0
+                w = self._clamp(_ANGULAR_KP * final_yaw_error, _MAX_ABS_W_RADPS)
+                state = "aligning_final_yaw"
+                control_yaw_error = final_yaw_error
+            else:
+                # 尚未到达停车点：先朝向停车点，再按距离比例向前推进。
+                bearing = math.atan2(goal_y - base_y, goal_x - base_x)
+                heading_error = wrap_to_pi(bearing - base.yaw)
+                control_yaw_error = heading_error
+                w = self._clamp(_ANGULAR_KP * heading_error, _MAX_ABS_W_RADPS)
+                if abs(heading_error) >= _HEADING_STOP_RAD:
+                    # 偏航过大时禁止“边大幅转向边高速前进”。
+                    v = 0.0
+                    state = "aligning_to_goal"
+                else:
+                    # 距离比例项负责近目标减速，余弦项进一步抑制带偏角前进。
+                    v = min(_MAX_ABS_V_MPS, _LINEAR_KP * distance_error)
+                    v *= max(0.0, math.cos(heading_error))
+                    state = "moving"
+            if not math.isfinite(v) or not math.isfinite(w):
+                raise ValueError("导航控制计算得到非有限速度")
+            return (
+                BaseCommand(v, w, now, now + _COMMAND_TTL_NS),
+                NavigationStatus(
+                    goal.goal_id,
+                    state,
+                    distance_error,
+                    control_yaw_error,
+                    False,
+                    "",
+                    now,
+                ),
+            )
+        except (TypeError, ValueError, OverflowError) as exc:
+            # 非法输入或非有限计算结果统一转成无效零速候选，交给 ActionMux 安全仲裁。
+            goal_id = goal.goal_id if isinstance(goal, NavGoal) else ""
+            safe_now = (
+                timestamp_ns
+                if isinstance(timestamp_ns, int)
+                and not isinstance(timestamp_ns, bool)
+                and timestamp_ns >= 0
+                else 0
+            )
+            return self._stopped(goal_id, safe_now, "failed", str(exc), valid=False)
+
+    @staticmethod
+    def _timestamp(value: object, field_name: str) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"{field_name} 必须是非负整数纳秒时间戳")
+        return value
+
+    @classmethod
+    def _validate_task(cls, task: TaskSpec, now: int) -> None:
+        if not isinstance(task, TaskSpec) or not task.valid:
+            raise ValueError("TaskSpec 无效")
+        if isinstance(task.task_id, bool) or not isinstance(task.task_id, int):
+            raise ValueError("TaskSpec.task_id 必须是整数")
+        stamp = cls._timestamp(task.timestamp_ns, "task.timestamp_ns")
+        if stamp > now:
+            raise ValueError("TaskSpec 时间戳晚于当前周期")
+
+    @classmethod
+    def _validate_base(
+        cls, base: BaseState, now: int, *, require_fresh: bool
+    ) -> None:
+        if not isinstance(base, BaseState) or not base.valid:
+            raise ValueError("BaseState 无效")
+        if not base.frame_id:
+            raise ValueError("BaseState.frame_id 不能为空")
+        stamp = cls._timestamp(base.timestamp_ns, "base.timestamp_ns")
+        if stamp > now:
+            raise ValueError("BaseState 时间戳晚于当前周期")
+        if require_fresh and now - stamp > _ODOM_MAX_AGE_NS:
+            raise ValueError("BaseState/Odom 已过期")
+        if len(base.position_xyz) != 3:
+            raise ValueError("base.position_xyz 必须包含三项")
+        for index, value in enumerate(base.position_xyz):
+            _finite_real(value, f"base.position_xyz[{index}]")
+        _finite_real(base.yaw, "base.yaw")
+
+    @staticmethod
+    def _stand_off_pose(
+        target_x: float, target_y: float, base_position: tuple[float, float, float]
+    ) -> tuple[float, float, float]:
+        base_x, base_y = _read_xy(base_position, "base.position_xyz")
+        # 单位向量从底盘指向目标；从目标沿反方向退让，得到底盘中心停车点。
+        dx = target_x - base_x
+        dy = target_y - base_y
+        distance = math.hypot(dx, dy)
+        if distance <= 1e-9:
+            raise ValueError("底盘与目标中心重合，无法确定安全退让方向")
+        goal_x = target_x - _STANDOFF_M * dx / distance
+        goal_y = target_y - _STANDOFF_M * dy / distance
+        goal_yaw = math.atan2(target_y - goal_y, target_x - goal_x)
+        return goal_x, goal_y, goal_yaw
+
+    @staticmethod
+    def _clamp(value: float, absolute_limit: float) -> float:
+        return max(-absolute_limit, min(absolute_limit, value))
+
+    @staticmethod
+    def _stopped(
+        goal_id: str,
+        timestamp_ns: int,
+        state: str,
+        reason: str,
+        *,
+        valid: bool = True,
+    ) -> tuple[BaseCommand, NavigationStatus]:
+        # 失败命令仍携带短 TTL 和诊断原因，但 v/w 必须严格为零。
+        return (
+            BaseCommand(
+                0.0,
+                0.0,
+                timestamp_ns,
+                timestamp_ns + _COMMAND_TTL_NS,
+                valid=valid,
+                failure_reason=reason,
+            ),
+            NavigationStatus(goal_id, state, 0.0, 0.0, False, reason, timestamp_ns),
+        )
