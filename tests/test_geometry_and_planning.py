@@ -33,6 +33,7 @@ import numpy as np
 import pytest
 import yaml
 
+import team_sorting.perception_3d as perception_3d_module
 from team_sorting.arm_planning import ArmPlanner, OfficialKDLAdapter, _pose_to_matrix
 from team_sorting.interfaces import (
     BaseState,
@@ -58,6 +59,7 @@ from team_sorting.perception_2d import OfficialYoloAdapter
 from team_sorting.perception_3d import (
     CameraTransformProvider,
     Perception3DEstimator,
+    _HeadCameraPose,
     median_depth_m,
     project_pixel_to_camera,
 )
@@ -126,6 +128,7 @@ def _base(
     orientation_xyzw: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 1.0),
     *,
     valid: bool = True,
+    frame_id: str = "odom",
 ) -> BaseState:
     return BaseState(
         position_xyz=(1.0, 2.0, 3.0),
@@ -133,7 +136,7 @@ def _base(
         yaw=0.0,
         linear_velocity_xyz=(0.0, 0.0, 0.0),
         angular_velocity_xyz=(0.0, 0.0, 0.0),
-        frame_id="odom",
+        frame_id=frame_id,
         timestamp_ns=100,
         valid=valid,
         failure_reason="Odom无效" if not valid else "",
@@ -1052,7 +1055,7 @@ def test_camera_transform_known_90_degree_rotation() -> None:
 
 
 def test_camera_transform_rejects_zero_camera_quaternion() -> None:
-    provider = CameraTransformProvider()
+    provider = CameraTransformProvider(output_frame="odom")
     provider._fk = _RecordingFK((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 0.0))
     with pytest.raises(RuntimeError, match="范数为零"):
         provider.camera_to_output((1.0, 0.0, 0.0), _base(), _actual_joints())
@@ -1068,14 +1071,14 @@ def test_camera_transform_rejects_zero_camera_quaternion() -> None:
 def test_camera_transform_rejects_non_finite_fk_output(
     position: object, quaternion: object
 ) -> None:
-    provider = CameraTransformProvider()
+    provider = CameraTransformProvider(output_frame="odom")
     provider._fk = _RecordingFK(position, quaternion)
     with pytest.raises(RuntimeError, match="位姿无效"):
         provider.camera_to_output((1.0, 0.0, 0.0), _base(), _actual_joints())
 
 
 def test_camera_transform_rejects_invalid_input_state_and_point() -> None:
-    provider = CameraTransformProvider()
+    provider = CameraTransformProvider(output_frame="odom")
     provider._fk = _RecordingFK()
     with pytest.raises(ValueError, match="底盘状态无效"):
         provider.camera_to_output((0.0, 0.0, 1.0), _base(valid=False), _actual_joints())
@@ -1115,10 +1118,28 @@ class _OffsetTransformProvider(CameraTransformProvider):
         base: BaseState,
         joints: RobotJointState,
     ) -> tuple[float, float, float]:
-        del base, joints
-        return tuple(
-            camera_point_xyz[index] + self.offset_xyz[index]
-            for index in range(3)
+        pose = self.compute_head_camera_pose(base, joints)
+        return self.transform_camera_point(camera_point_xyz, pose)
+
+    def compute_head_camera_pose(
+        self,
+        base: BaseState,
+        joints: RobotJointState,
+    ) -> _HeadCameraPose:
+        if not base.valid:
+            raise ValueError(f"底盘状态无效，不能计算相机外参：{base.failure_reason}")
+        if not joints.valid:
+            raise ValueError(
+                f"实际关节状态无效，不能计算相机外参：{joints.failure_reason}"
+            )
+        if base.frame_id != self.output_frame:
+            raise ValueError(
+                f"BaseState.frame_id ({base.frame_id!r}) 与 "
+                f"CameraTransformProvider.output_frame ({self.output_frame!r}) 不一致"
+            )
+        return _HeadCameraPose(
+            self.offset_xyz,
+            (1.0, 0.0, 0.0, 0.0),
         )
 
 
@@ -1192,7 +1213,7 @@ def test_perception_3d_single_frame_world_coordinate_and_timestamp() -> None:
     assert result.position_xyz == pytest.approx((1.0, 2.0, 4.1))
     assert result.frame_id == "odom"
     assert result.timestamp_ns == 100
-    assert result.failure_reason == ""
+    assert "heuristic center approximation" in result.failure_reason
     assert estimator._tracks == {}
 
 
@@ -1330,7 +1351,7 @@ def test_perception_3d_multiframe_ema_and_confidence_converge() -> None:
         [1.1, 1.6, 1.85, 1.975]
     )
     assert [result.confidence for result in outputs] == pytest.approx(
-        [0.2, 0.4, 0.6, 0.8]
+        [0.1, 0.2, 0.3, 0.4]
     )
 
 
@@ -1358,7 +1379,7 @@ def test_perception_3d_confidence_uses_valid_depth_fraction_and_stays_in_range()
     )[0]
 
     assert result.valid
-    assert result.confidence == pytest.approx(4.0 / 9.0)
+    assert result.confidence == pytest.approx(2.0 / 9.0)
     assert 0.0 <= result.confidence <= 1.0
 
 
@@ -1544,7 +1565,7 @@ def test_perception_3d_same_region_same_class_targets_keep_distinct_tracks() -> 
     assert set(estimator._tracks) == {"stable:21", "stable:22"}
 
 
-def test_perception_3d_crossing_tracks_follow_stable_id_not_image_position() -> None:
+def test_perception_3d_order_reversal_keeps_moderately_moving_tracks_distinct() -> None:
     estimator = Perception3DEstimator(
         _OffsetTransformProvider(),
         ema_alpha=0.25,
@@ -1568,15 +1589,15 @@ def test_perception_3d_crossing_tracks_follow_stable_id_not_image_position() -> 
         _base(),
         _actual_joints(),
     )
-    # 输入顺序也反转：track 32移动到左边，track 31移动到右边。
+    # 输入顺序反转，但每个ID只作小幅移动，身份应保持而不依赖输入顺序。
     crossed = (
         _estimator_detection(
-            bbox_xyxy=(279.0, 239.0, 281.0, 241.0),
+            bbox_xyxy=(349.0, 239.0, 351.0, 241.0),
             timestamp_ns=101,
             track_id=32,
         ),
         _estimator_detection(
-            bbox_xyxy=(359.0, 239.0, 361.0, 241.0),
+            bbox_xyxy=(289.0, 239.0, 291.0, 241.0),
             timestamp_ns=101,
             track_id=31,
         ),
@@ -1591,7 +1612,7 @@ def test_perception_3d_crossing_tracks_follow_stable_id_not_image_position() -> 
 
     assert first_results[0].position_xyz[0] < 0.0
     assert first_results[1].position_xyz[0] > 0.0
-    # EMA仍跟随ID历史：当前位于左侧的track 32仍偏右，track 31反之。
+    assert crossed_results[0].valid and crossed_results[1].valid
     assert crossed_results[0].position_xyz[0] > 0.0
     assert crossed_results[1].position_xyz[0] < 0.0
 
@@ -1936,6 +1957,626 @@ def test_real_perception_node_config_produces_all_three_valid_classes() -> None:
     assert [result.position_xyz[2] for result in results] == pytest.approx(
         (1.095, 1.095, 1.095)
     )
+
+
+def test_median_depth_m_samples_only_inside_bbox() -> None:
+    image = np.full((24, 24), 5000.0, dtype=float)
+    image[10:12, 10:12] = 1000.0
+
+    depth_m = median_depth_m(
+        _depth(image),
+        (10.0, 10.0, 12.0, 12.0),
+        radius_px=4,
+    )
+
+    assert depth_m == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize(
+    "bbox",
+    (
+        (10.0, 10.0, 10.0, 12.0),
+        (10.1, 10.1, 10.9, 10.9),
+        (30.0, 30.0, 32.0, 32.0),
+    ),
+)
+def test_median_depth_m_rejects_bbox_smaller_than_one_pixel(
+    bbox: tuple[float, float, float, float],
+) -> None:
+    with pytest.raises(ValueError, match="bbox"):
+        median_depth_m(_depth(np.ones((24, 24))), bbox, radius_px=4)
+
+
+def test_perception_3d_small_target_avoids_background_in_estimation() -> None:
+    image = np.full((480, 640), 5000.0, dtype=float)
+    image[239:241, 319:321] = 1000.0
+    estimator = Perception3DEstimator(
+        _OffsetTransformProvider(),
+        converge_frames=1,
+        object_dimensions_m={"pink": (0.1, 0.1, 0.002)},
+    )
+
+    result = estimator.estimate(
+        (_estimator_detection(track_id=81),),
+        _estimator_depth(0.0, 100, image=image),
+        _intrinsics(timestamp_ns=100),
+        _base(),
+        _actual_joints(),
+    )[0]
+
+    assert result.valid
+    assert result.position_xyz[2] == pytest.approx(1.001)
+    assert result.position_xyz[2] < 2.0
+
+
+def test_perception_3d_partial_occlusion_at_bbox_edge() -> None:
+    image = np.zeros((480, 640), dtype=float)
+    image[239:243, 321:323] = 1000.0
+    estimator = Perception3DEstimator(
+        _OffsetTransformProvider(),
+        converge_frames=1,
+        object_dimensions_m={"pink": (0.1, 0.1, 0.2)},
+    )
+
+    result = estimator.estimate(
+        (
+            _estimator_detection(
+                bbox_xyxy=(319.0, 239.0, 323.0, 243.0),
+                track_id=82,
+            ),
+        ),
+        _estimator_depth(0.0, 100, image=image),
+        _intrinsics(timestamp_ns=100),
+        _base(),
+        _actual_joints(),
+    )[0]
+
+    assert result.valid
+    assert result.position_xyz[2] == pytest.approx(1.1)
+
+
+def test_perception_3d_detects_track_id_swap_on_crossing() -> None:
+    estimator = Perception3DEstimator(
+        _OffsetTransformProvider(),
+        ema_alpha=0.5,
+        converge_frames=1,
+        max_position_jump_m=1.0,
+        ambiguity_ratio=2.0,
+        object_dimensions_m={"pink": (0.1, 0.1, 0.2)},
+    )
+    first = estimator.estimate(
+        (
+            _estimator_detection(
+                bbox_xyxy=(279.0, 239.0, 283.0, 243.0),
+                track_id=31,
+            ),
+            _estimator_detection(
+                bbox_xyxy=(357.0, 239.0, 361.0, 243.0),
+                track_id=32,
+            ),
+        ),
+        _estimator_depth(1000.0, 100),
+        _intrinsics(timestamp_ns=100),
+        _base(),
+        _actual_joints(),
+    )
+    old_left = tuple(estimator._tracks["stable:31"].ema)
+    old_right = tuple(estimator._tracks["stable:32"].ema)
+
+    swapped = estimator.estimate(
+        (
+            _estimator_detection(
+                bbox_xyxy=(357.0, 239.0, 361.0, 243.0),
+                timestamp_ns=101,
+                track_id=31,
+            ),
+            _estimator_detection(
+                bbox_xyxy=(279.0, 239.0, 283.0, 243.0),
+                timestamp_ns=101,
+                track_id=32,
+            ),
+        ),
+        _estimator_depth(1000.0, 101),
+        _intrinsics(timestamp_ns=101),
+        _base(),
+        _actual_joints(),
+    )
+
+    assert first[0].position_xyz[0] < 0.0 < first[1].position_xyz[0]
+    assert all(not result.valid for result in swapped)
+    assert all(
+        "ID交换" in result.failure_reason or "一致性校验失败" in result.failure_reason
+        for result in swapped
+    )
+    assert estimator._tracks["stable:31"].ema == pytest.approx(old_left)
+    assert estimator._tracks["stable:32"].ema == pytest.approx(old_right)
+
+
+def test_perception_3d_occlusion_recovery_keeps_track() -> None:
+    estimator = Perception3DEstimator(
+        _OffsetTransformProvider(),
+        ema_alpha=0.5,
+        converge_frames=4,
+        max_track_age_s=1.0,
+        max_position_jump_m=0.5,
+        object_dimensions_m={"pink": (0.1, 0.1, 0.2)},
+    )
+    first = estimator.estimate(
+        (_estimator_detection(track_id=41),),
+        _estimator_depth(1000.0, 100),
+        _intrinsics(timestamp_ns=100),
+        _base(),
+        _actual_joints(),
+    )[0]
+    for timestamp_ns in (101, 102):
+        assert estimator.estimate(
+            (),
+            _estimator_depth(0.0, timestamp_ns),
+            _intrinsics(timestamp_ns=timestamp_ns),
+            _base(),
+            _actual_joints(),
+        ) == ()
+    recovered = estimator.estimate(
+        (
+            _estimator_detection(
+                bbox_xyxy=(320.0, 239.0, 322.0, 241.0),
+                timestamp_ns=103,
+                track_id=41,
+            ),
+        ),
+        _estimator_depth(1100.0, 103),
+        _intrinsics(timestamp_ns=103),
+        _base(),
+        _actual_joints(),
+    )[0]
+
+    assert first.valid and recovered.valid
+    assert recovered.position_xyz[2] == pytest.approx(1.15)
+    assert "ID交换" not in recovered.failure_reason
+    assert estimator._tracks["stable:41"].count == 2
+
+
+def test_perception_3d_complete_overlap_is_fail_closed() -> None:
+    estimator = Perception3DEstimator(
+        _OffsetTransformProvider(),
+        converge_frames=1,
+        object_dimensions_m={"pink": (0.1, 0.1, 0.2)},
+    )
+
+    results = estimator.estimate(
+        (
+            _estimator_detection(track_id=51),
+            _estimator_detection(
+                bbox_xyxy=(319.5, 239.0, 321.5, 241.0),
+                track_id=52,
+            ),
+        ),
+        _estimator_depth(1000.0, 100),
+        _intrinsics(timestamp_ns=100),
+        _base(),
+        _actual_joints(),
+    )
+
+    assert all(not result.valid for result in results)
+    assert all("无法可靠区分身份" in result.failure_reason for result in results)
+    assert estimator._tracks == {}
+
+
+def test_perception_3d_duplicate_track_id_fails_both_detections_closed() -> None:
+    estimator = Perception3DEstimator(
+        _OffsetTransformProvider(),
+        converge_frames=1,
+        object_dimensions_m={"pink": (0.1, 0.1, 0.2)},
+    )
+    results = estimator.estimate(
+        (
+            _estimator_detection(
+                bbox_xyxy=(279.0, 239.0, 283.0, 243.0),
+                track_id=7,
+            ),
+            _estimator_detection(
+                bbox_xyxy=(357.0, 239.0, 361.0, 243.0),
+                track_id=7,
+            ),
+        ),
+        _estimator_depth(1000.0, 100),
+        _intrinsics(timestamp_ns=100),
+        _base(),
+        _actual_joints(),
+    )
+
+    assert len(results) == 2
+    assert all(not result.valid for result in results)
+    assert all("轨迹ID重复" in result.failure_reason for result in results)
+    assert estimator._tracks == {}
+
+
+def test_camera_transform_rejects_frame_id_mismatch() -> None:
+    provider = CameraTransformProvider(output_frame="odom")
+    provider._fk = _RecordingFK()
+
+    with pytest.raises(ValueError, match="frame_id.*map.*odom|frame_id.*odom.*map"):
+        provider.camera_to_output(
+            (0.0, 0.0, 1.0),
+            _base(frame_id="map"),
+            _actual_joints(),
+        )
+    with pytest.raises(ValueError, match="frame_id.*为空"):
+        provider.camera_to_output(
+            (0.0, 0.0, 1.0),
+            _base(frame_id=""),
+            _actual_joints(),
+        )
+
+
+def test_perception_3d_estimate_rejects_base_frame_mismatch() -> None:
+    estimator = Perception3DEstimator(
+        _OffsetTransformProvider(output_frame="odom"),
+        converge_frames=1,
+        object_dimensions_m={"pink": (0.1, 0.1, 0.2)},
+    )
+
+    result = estimator.estimate(
+        (_estimator_detection(track_id=61),),
+        _estimator_depth(1000.0, 100),
+        _intrinsics(timestamp_ns=100),
+        _base(frame_id="map"),
+        _actual_joints(),
+    )[0]
+
+    assert not result.valid
+    assert "frame_id" in result.failure_reason
+    assert "map" in result.failure_reason and "odom" in result.failure_reason
+
+
+def test_perception_3d_degraded_compensation_reduces_confidence() -> None:
+    estimator = Perception3DEstimator(
+        _OffsetTransformProvider(),
+        converge_frames=1,
+        heuristic_center_reliability=0.5,
+        object_dimensions_m={"pink": (0.1, 0.1, 0.2)},
+    )
+
+    result = estimator.estimate(
+        (_estimator_detection(confidence=0.8, track_id=71),),
+        _estimator_depth(1000.0, 100),
+        _intrinsics(timestamp_ns=100),
+        _base(),
+        _actual_joints(),
+    )[0]
+
+    assert result.valid
+    assert result.confidence == pytest.approx(0.8 * 1.0 * 1.0 * 0.5)
+    assert "heuristic center approximation" in result.failure_reason
+
+
+def test_perception_3d_strict_compensation_rejects_heuristic_center() -> None:
+    estimator = Perception3DEstimator(
+        _OffsetTransformProvider(),
+        converge_frames=1,
+        center_compensation_mode="strict",
+        object_dimensions_m={"pink": (0.1, 0.1, 0.2)},
+    )
+
+    result = estimator.estimate(
+        (_estimator_detection(track_id=72),),
+        _estimator_depth(1000.0, 100),
+        _intrinsics(timestamp_ns=100),
+        _base(),
+        _actual_joints(),
+    )[0]
+
+    assert not result.valid
+    assert "not validated" in result.failure_reason
+
+
+@pytest.mark.parametrize("mode", ("degraded", "strict"))
+def test_perception_3d_unknown_dimension_still_invalid(mode: str) -> None:
+    estimator = Perception3DEstimator(
+        _OffsetTransformProvider(),
+        converge_frames=1,
+        center_compensation_mode=mode,
+        object_dimensions_m={"yellow": (0.1, 0.1, 0.2)},
+    )
+
+    result = estimator.estimate(
+        (_estimator_detection("pink", track_id=73),),
+        _estimator_depth(1000.0, 100),
+        _intrinsics(timestamp_ns=100),
+        _base(),
+        _actual_joints(),
+    )[0]
+
+    assert not result.valid
+    assert "中心补偿失败" in result.failure_reason
+
+
+@pytest.mark.parametrize(
+    ("keyword", "value"),
+    (
+        ("ambiguity_ratio", 1.0),
+        ("ambiguity_ratio", True),
+        ("center_compensation_mode", "fallback"),
+        ("heuristic_center_reliability", 0.0),
+        ("heuristic_center_reliability", True),
+    ),
+)
+def test_perception_3d_rejects_invalid_new_safety_parameters(
+    keyword: str, value: object
+) -> None:
+    with pytest.raises(ValueError, match=keyword):
+        Perception3DEstimator(
+            _OffsetTransformProvider(),
+            **{keyword: value},
+        )
+
+
+class _CountingOffsetTransformProvider(_OffsetTransformProvider):
+    """记录每帧 FK 位姿入口与廉价逐点变换的调用次数。"""
+
+    def __init__(
+        self,
+        offset_xyz: tuple[float, float, float] = (0.0, 0.0, 0.0),
+        output_frame: str = "odom",
+    ) -> None:
+        super().__init__(offset_xyz, output_frame)
+        self.pose_calls = 0
+        self.point_calls = 0
+
+    def compute_head_camera_pose(
+        self,
+        base: BaseState,
+        joints: RobotJointState,
+    ) -> _HeadCameraPose:
+        self.pose_calls += 1
+        return super().compute_head_camera_pose(base, joints)
+
+    def transform_camera_point(
+        self,
+        camera_point_xyz: tuple[float, float, float],
+        pose: _HeadCameraPose,
+    ) -> tuple[float, float, float]:
+        self.point_calls += 1
+        return super().transform_camera_point(camera_point_xyz, pose)
+
+
+class _LegacyCameraToOutputProvider(CameraTransformProvider):
+    """模拟只实现优化前公共变换入口的既有 Provider。"""
+
+    def __init__(self, offset_xyz: tuple[float, float, float]) -> None:
+        super().__init__(output_frame="odom")
+        self.offset_xyz = offset_xyz
+        self.calls = 0
+
+    def camera_to_output(
+        self,
+        camera_point_xyz: tuple[float, float, float],
+        base: BaseState,
+        joints: RobotJointState,
+    ) -> tuple[float, float, float]:
+        del joints
+        if base.frame_id != self.output_frame:
+            raise ValueError("BaseState.frame_id 与 output_frame 不一致")
+        self.calls += 1
+        return tuple(
+            camera_point_xyz[index] + self.offset_xyz[index]
+            for index in range(3)
+        )
+
+
+class _UnconvertibleDepthImage:
+    def __array__(self, *args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise TypeError("测试图像禁止转换")
+
+
+def test_perception_3d_legacy_camera_to_output_override_remains_compatible() -> None:
+    provider = _LegacyCameraToOutputProvider((1.0, 2.0, 3.0))
+    estimator = Perception3DEstimator(
+        provider,
+        converge_frames=1,
+        object_dimensions_m={"pink": (0.1, 0.1, 0.2)},
+    )
+
+    result = estimator.estimate(
+        (_estimator_detection(track_id=160),),
+        _estimator_depth(1000.0, 100),
+        _intrinsics(timestamp_ns=100),
+        _base(),
+        _actual_joints(),
+    )[0]
+
+    assert result.valid
+    assert result.position_xyz == pytest.approx((1.0, 2.0, 4.1))
+    assert provider.calls == 2
+
+
+def test_median_depth_m_validates_metadata_before_array_conversion() -> None:
+    bad_image = _UnconvertibleDepthImage()
+    invalid_depth = DepthFrame(
+        bad_image,
+        0.001,
+        "camera_optical_frame",
+        100,
+        valid=False,
+        failure_reason="传感器无效",
+    )
+    valid_metadata = DepthFrame(
+        bad_image,
+        0.001,
+        "camera_optical_frame",
+        100,
+    )
+    invalid_scale = DepthFrame(
+        bad_image,
+        -0.001,
+        "camera_optical_frame",
+        100,
+    )
+
+    with pytest.raises(ValueError, match="深度帧无效：传感器无效"):
+        median_depth_m(invalid_depth, (0.0, 0.0, 2.0, 2.0))
+    with pytest.raises(ValueError, match="radius_px"):
+        median_depth_m(valid_metadata, (0.0, 0.0, 2.0, 2.0), -1)
+    with pytest.raises(ValueError, match="x1>x0"):
+        median_depth_m(valid_metadata, (1.0, 1.0, 1.0, 2.0))
+    with pytest.raises(ValueError, match="unit_scale_m"):
+        median_depth_m(invalid_scale, (0.0, 0.0, 2.0, 2.0))
+
+
+def test_perception_3d_validates_depth_scale_before_array_conversion() -> None:
+    estimator = Perception3DEstimator(
+        _OffsetTransformProvider(),
+        converge_frames=1,
+        object_dimensions_m={"pink": (0.1, 0.1, 0.2)},
+    )
+    depth = DepthFrame(
+        _UnconvertibleDepthImage(),
+        -0.001,
+        "camera_optical_frame",
+        100,
+    )
+
+    result = estimator.estimate(
+        (_estimator_detection(track_id=161),),
+        depth,
+        _intrinsics(timestamp_ns=100),
+        _base(),
+        _actual_joints(),
+    )[0]
+
+    assert not result.valid
+    assert "depth.unit_scale_m" in result.failure_reason
+    assert "depth.image" not in result.failure_reason
+
+
+def test_perception_3d_computes_head_camera_pose_once_for_five_targets() -> None:
+    provider = _CountingOffsetTransformProvider()
+    estimator = Perception3DEstimator(
+        provider,
+        converge_frames=1,
+        object_dimensions_m={"pink": (0.1, 0.1, 0.2)},
+    )
+    detections = tuple(
+        _estimator_detection(
+            bbox_xyxy=(
+                258.0 + 30.0 * index,
+                238.0,
+                262.0 + 30.0 * index,
+                242.0,
+            ),
+            track_id=100 + index,
+        )
+        for index in range(5)
+    )
+
+    results = estimator.estimate(
+        detections,
+        _estimator_depth(1000.0, 100),
+        _intrinsics(timestamp_ns=100),
+        _base(),
+        _actual_joints(),
+    )
+
+    assert len(results) == 5
+    assert all(result.valid for result in results)
+    assert provider.pose_calls == 1
+    # 每个目标分别变换一次表面点和一次补偿中心，但二者都不再触发 FK。
+    assert provider.point_calls == 10
+
+
+def test_perception_3d_shared_pose_preserves_legacy_per_detection_results() -> None:
+    offset = (1.0, 2.0, 3.0)
+    optimized_provider = _CountingOffsetTransformProvider(offset)
+    legacy_provider = _OffsetTransformProvider(offset)
+    estimator = Perception3DEstimator(
+        optimized_provider,
+        converge_frames=1,
+        object_dimensions_m={"pink": (0.1, 0.1, 0.2)},
+    )
+    detections = tuple(
+        _estimator_detection(
+            bbox_xyxy=(center_x - 2.0, 238.0, center_x + 2.0, 242.0),
+            confidence=0.8,
+            track_id=120 + index,
+        )
+        for index, center_x in enumerate((280.0, 320.0, 360.0))
+    )
+    base = _base()
+    joints = _actual_joints()
+    intrinsics = _intrinsics(timestamp_ns=100)
+    expected_positions = []
+    for detection in detections:
+        x0, y0, x1, y1 = detection.bbox_xyxy
+        surface = project_pixel_to_camera(
+            (x0 + x1) / 2.0,
+            (y0 + y1) / 2.0,
+            1.0,
+            intrinsics,
+        )
+        scale = 1.1 / surface[2]
+        compensated = (
+            surface[0] * scale,
+            surface[1] * scale,
+            1.1,
+        )
+        expected_positions.append(
+            legacy_provider.camera_to_output(compensated, base, joints)
+        )
+
+    results = estimator.estimate(
+        detections,
+        _estimator_depth(1000.0, 100),
+        intrinsics,
+        base,
+        joints,
+    )
+
+    assert optimized_provider.pose_calls == 1
+    for result, expected_position in zip(results, expected_positions):
+        assert result.position_xyz == pytest.approx(expected_position)
+        assert result.confidence == pytest.approx(0.8 * 1.0 * 1.0 * 0.5)
+        assert result.valid
+        assert (
+            result.failure_reason
+            == "heuristic center approximation (surface-to-center not validated)"
+        )
+
+
+def test_perception_3d_samples_each_detection_depth_window_once() -> None:
+    estimator = Perception3DEstimator(
+        _OffsetTransformProvider(),
+        converge_frames=1,
+        object_dimensions_m={"pink": (0.1, 0.1, 0.2)},
+    )
+    detections = tuple(
+        _estimator_detection(
+            bbox_xyxy=(
+                278.0 + 24.0 * index,
+                238.0,
+                282.0 + 24.0 * index,
+                242.0,
+            ),
+            track_id=140 + index,
+        )
+        for index in range(4)
+    )
+
+    with patch.object(
+        perception_3d_module,
+        "_depth_window_statistics",
+        wraps=perception_3d_module._depth_window_statistics,
+    ) as statistics:
+        results = estimator.estimate(
+            detections,
+            _estimator_depth(1000.0, 100),
+            _intrinsics(timestamp_ns=100),
+            _base(),
+            _actual_joints(),
+        )
+
+    assert all(result.valid for result in results)
+    assert statistics.call_count == len(detections)
 
 
 # ---------------------------------------------------------------------------

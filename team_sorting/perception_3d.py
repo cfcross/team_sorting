@@ -68,6 +68,22 @@ def _finite_vector(values: Any, length: int, name: str) -> tuple[float, ...]:
     )
 
 
+def _require_matching_base_frame(base: BaseState, output_frame: str) -> None:
+    """没有显式TF时，底盘状态只能用于同名输出坐标系。"""
+
+    base_frame = base.frame_id
+    if not isinstance(base_frame, str) or not base_frame.strip():
+        raise ValueError(
+            "BaseState.frame_id 为空；缺少显式 TF 时不能静默重标坐标系"
+        )
+    if base_frame != output_frame:
+        raise ValueError(
+            f"BaseState.frame_id ({base_frame!r}) 与 "
+            f"CameraTransformProvider.output_frame ({output_frame!r}) 不一致；"
+            "缺少显式 TF 时不能静默重标坐标系"
+        )
+
+
 def project_pixel_to_camera(
     u: float, v: float, depth_m: float, intrinsics: CameraIntrinsics
 ) -> tuple[float, float, float]:
@@ -108,16 +124,29 @@ def project_pixel_to_camera(
     return result
 
 
-def median_depth_m(
-    depth: DepthFrame, bbox_xyxy: tuple[float, float, float, float], radius_px: int = 4
-) -> float:
-    """在二维框中心附近读取非零中位深度。
+@dataclass(frozen=True)
+class _DepthWindowStatistics:
+    """一次深度窗口访问得到的中位深度和原中心窗口有效比例。"""
 
-    参数：对齐深度图、像素 bbox 和非负窗口半径（像素）。返回米制中位深度。
-    中位数比单像素更不易受深度孔洞和少量离群值影响，但它通常仍落在物体可见表面，
-    不能直接声称是物体中心深度。失败：NumPy 缺失、二维图像/bbox/单位比例错误或
-    窗口内无有效深度时抛出 ``ValueError``，不会返回虚构距离。
-    """
+    depth_m: float
+    valid_fraction: float
+
+
+@dataclass(frozen=True)
+class _DepthWindowRequest:
+    """NumPy 转换前已完成校验的深度窗口参数。"""
+
+    radius: int
+    bbox: tuple[float, float, float, float]
+    unit_scale_m: float
+
+
+def _validate_depth_window_request(
+    depth: DepthFrame,
+    bbox_xyxy: tuple[float, float, float, float],
+    radius_px: int,
+) -> _DepthWindowRequest:
+    """保持原失败优先级，在接触图像数组前校验轻量输入。"""
 
     if not depth.valid:
         raise ValueError(f"深度帧无效：{depth.failure_reason}")
@@ -133,14 +162,22 @@ def median_depth_m(
     unit_scale_m = _finite_number(depth.unit_scale_m, "depth.unit_scale_m")
     if unit_scale_m <= 0.0:
         raise ValueError("depth.unit_scale_m 必须是正的有限数")
-    try:
-        import numpy as np  # 延迟导入，避免纯接口模块强依赖视觉环境
-    except ImportError as exc:
-        raise ValueError("深度处理中缺少 NumPy") from exc
-    try:
-        image = np.asarray(depth.image)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("depth.image 无法转换为深度数组") from exc
+    return _DepthWindowRequest(radius, bbox, unit_scale_m)
+
+
+def _depth_window_statistics(
+    depth: DepthFrame,
+    request: _DepthWindowRequest,
+    image: Any,
+    np: Any,
+) -> _DepthWindowStatistics:
+    """只访问一次深度数组窗口，同时保持既有深度与置信度计算语义。"""
+
+    del depth
+    radius = request.radius
+    bbox = request.bbox
+    x0, y0, x1, y1 = bbox
+    unit_scale_m = request.unit_scale_m
     if image.ndim != 2:
         raise ValueError(f"深度图必须是严格二维数组，实际维度={image.ndim}")
     height, width = image.shape
@@ -149,23 +186,86 @@ def median_depth_m(
     if x1 <= 0.0 or y1 <= 0.0 or x0 >= width or y0 >= height:
         raise ValueError("bbox 完全位于深度图范围之外")
 
+    if x1 - x0 < 1.0 or y1 - y0 < 1.0:
+        raise ValueError("bbox 在像素网格上的宽和高必须至少为1像素")
     center_x = int(round((x0 + x1) / 2.0))
     center_y = int(round((y0 + y1) / 2.0))
-    xa, xb = max(0, center_x - radius), min(width, center_x + radius + 1)
-    ya, yb = max(0, center_y - radius), min(height, center_y + radius + 1)
-    if xa >= xb or ya >= yb:
+    window_xa = max(0, center_x - radius)
+    window_xb = min(width, center_x + radius + 1)
+    window_ya = max(0, center_y - radius)
+    window_yb = min(height, center_y + radius + 1)
+    if window_xa >= window_xb or window_ya >= window_yb:
         raise ValueError("bbox 中心无法在深度图内形成有效采样窗口")
+    # 深度数组只切片一次。中位深度使用其中的 bbox 交集子区域；有效比例仍使用
+    # 原中心窗口，保持优化前 confidence 的数值完全不变。
     try:
-        patch = image[ya:yb, xa:xb].astype(float)
+        window = image[
+            window_ya:window_yb,
+            window_xa:window_xb,
+        ].astype(float)
     except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError("bbox 中心窗口的深度值无法转换为数值") from exc
+    full_valid = np.isfinite(window) & (window > 0.0)
+    valid_fraction = float(np.count_nonzero(full_valid) / window.size)
+
+    # bbox 使用半开区间语义；ceil 可避免把 bbox 外的左/上边缘像素纳入采样，
+    # 同时让整数 xyxy 框精确映射为 NumPy 切片。
+    bbox_xa, bbox_xb = math.ceil(x0), math.ceil(x1)
+    bbox_ya, bbox_yb = math.ceil(y0), math.ceil(y1)
+    xa = max(window_xa, bbox_xa)
+    xb = min(window_xb, bbox_xb)
+    ya = max(window_ya, bbox_ya)
+    yb = min(window_yb, bbox_yb)
+    if xa >= xb or ya >= yb:
+        raise ValueError("bbox 与中心深度窗口没有至少1像素的有效交集")
+    patch = window[
+        ya - window_ya : yb - window_ya,
+        xa - window_xa : xb - window_xa,
+    ]
     valid = patch[np.isfinite(patch) & (patch > 0.0)]
     if valid.size == 0:
         raise ValueError("bbox 中心窗口没有有效深度")
     result_m = float(np.median(valid)) * unit_scale_m
     if not math.isfinite(result_m) or result_m <= 0.0:
         raise ValueError("中位深度换算结果必须是正的有限米制数")
-    return result_m
+    return _DepthWindowStatistics(result_m, valid_fraction)
+
+
+def median_depth_m(
+    depth: DepthFrame, bbox_xyxy: tuple[float, float, float, float], radius_px: int = 4
+) -> float:
+    """在二维框与中心窗口的交集内读取非零中位深度。
+
+    参数：对齐深度图、像素 bbox 和非负窗口半径（像素）。采样绝不越过 bbox，
+    返回米制中位深度。
+    中位数比单像素更不易受深度孔洞和少量离群值影响，但它通常仍落在物体可见表面，
+    不能直接声称是物体中心深度。失败：NumPy 缺失、二维图像/bbox/单位比例错误或
+    窗口内无有效深度时抛出 ``ValueError``，不会返回虚构距离。
+    """
+
+    request = _validate_depth_window_request(depth, bbox_xyxy, radius_px)
+    try:
+        import numpy as np  # 延迟导入，避免纯接口模块强依赖视觉环境
+    except ImportError as exc:
+        raise ValueError("深度处理中缺少 NumPy") from exc
+    try:
+        image = np.asarray(depth.image)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("depth.image 无法转换为深度数组") from exc
+    return _depth_window_statistics(
+        depth,
+        request,
+        image,
+        np,
+    ).depth_m
+
+
+@dataclass(frozen=True)
+class _HeadCameraPose:
+    """当前帧头部相机在输出坐标系中的位姿。"""
+
+    position: tuple[float, float, float]
+    quaternion_wxyz: tuple[float, float, float, float]
 
 
 class CameraTransformProvider:
@@ -288,13 +388,32 @@ class CameraTransformProvider:
         抛出 ``RuntimeError``/``ValueError``。
         """
 
+        # 保留旧方法的失败顺序：共享状态先校验，随后校验逐点输入，再执行 FK。
         if self._fk is None:
             raise RuntimeError("CameraTransformProvider 尚未通过 self_check")
         if not base.valid:
             raise ValueError(f"底盘状态无效，不能计算相机外参：{base.failure_reason}")
         if not joints.valid:
             raise ValueError(f"实际关节状态无效，不能计算相机外参：{joints.failure_reason}")
+        _require_matching_base_frame(base, self.output_frame)
         camera_point = _finite_vector(camera_point_xyz, 3, "camera_point_xyz")
+        pose = self.compute_head_camera_pose(base, joints)
+        return self.transform_camera_point(camera_point, pose)
+
+    def compute_head_camera_pose(
+        self,
+        base: BaseState,
+        joints: RobotJointState,
+    ) -> _HeadCameraPose:
+        """用当前底盘与关节反馈执行一次官方 FK，返回本帧可复用的相机位姿。"""
+
+        if self._fk is None:
+            raise RuntimeError("CameraTransformProvider 尚未通过 self_check")
+        if not base.valid:
+            raise ValueError(f"底盘状态无效，不能计算相机外参：{base.failure_reason}")
+        if not joints.valid:
+            raise ValueError(f"实际关节状态无效，不能计算相机外参：{joints.failure_reason}")
+        _require_matching_base_frame(base, self.output_frame)
         base_position = _finite_vector(base.position_xyz, 3, "BaseState.position_xyz")
         qx, qy, qz, qw = _finite_vector(
             base.orientation_xyzw, 4, "BaseState.orientation_xyzw"
@@ -324,6 +443,25 @@ class CameraTransformProvider:
             position = _finite_vector(camera_position, 3, "MMK2FK camera_position")
             quaternion = _finite_vector(
                 camera_quaternion_wxyz, 4, "MMK2FK camera_quaternion_wxyz"
+            )
+        except ValueError as exc:
+            raise RuntimeError(f"MMK2FK 返回的头部相机位姿无效：{exc}") from exc
+        return _HeadCameraPose(position, quaternion)
+
+    def transform_camera_point(
+        self,
+        camera_point_xyz: tuple[float, float, float],
+        pose: _HeadCameraPose,
+    ) -> tuple[float, float, float]:
+        """使用已计算的当前帧相机位姿变换单个点，不再次执行官方 FK。"""
+
+        camera_point = _finite_vector(camera_point_xyz, 3, "camera_point_xyz")
+        try:
+            position = _finite_vector(
+                pose.position, 3, "MMK2FK camera_position"
+            )
+            quaternion = _finite_vector(
+                pose.quaternion_wxyz, 4, "MMK2FK camera_quaternion_wxyz"
             )
             # headeye site 已含相机光学轴翻转；这里只按官方姿态旋转，再加相机世界位置。
             rotated = _rotate_by_wxyz(camera_point, quaternion)
@@ -401,6 +539,31 @@ class _Track:
     count: int
     last_ts_ns: int
     last_detection_ts_ns: int
+    bbox_center_xy: tuple[float, float]
+    last_surface_xyz: tuple[float, float, float]
+
+
+@dataclass(frozen=True)
+class _IdentityCandidate:
+    """当前检测用于稳定ID一致性检查的未补偿表面点。"""
+
+    bbox_center_xy: tuple[float, float]
+    surface_xyz: tuple[float, float, float]
+
+
+@dataclass(frozen=True)
+class _SurfaceProbe:
+    """单个检测一次深度窗口统计与反投影的可复用结果。"""
+
+    u: float
+    v: float
+    depth_m: float
+    valid_fraction: float
+    camera_surface_xyz: tuple[float, float, float]
+
+
+class _SurfaceProbeError(ValueError):
+    """保留原逐检测阶段前缀的内部预计算失败。"""
 
 
 class Perception3DEstimator:
@@ -426,14 +589,19 @@ class Perception3DEstimator:
         object_dimensions_m: Optional[
             dict[str, tuple[float, float, float]]
         ] = None,
+        ambiguity_ratio: float = 2.0,
+        center_compensation_mode: str = "degraded",
+        heuristic_center_reliability: float = 0.5,
     ) -> None:
         """保存三维估计参数，构造阶段不加载任何官方依赖。
 
         ``object_dimensions_m`` 的值依次为宽、高、沿相机视线近似深度，单位米。
         ``max_track_age_s`` 为轨迹超时秒数，``max_input_skew_s`` 为
         Detection/Depth/CameraInfo 最大绝对时间差秒数，``max_position_jump_m``
-        为相邻有效轨迹点允许的最大三维跳变。失败：参数类型、范围或物体尺寸不合法
-        时抛出 ``ValueError``。
+        为相邻有效轨迹点允许的最大三维跳变。``ambiguity_ratio`` 控制稳定ID与其他
+        同类历史轨迹的距离比判定。中心补偿默认是降级的启发式估计；``strict`` 模式
+        会拒绝未经真值验证的中心补偿。失败：参数类型、范围或物体尺寸不合法时抛出
+        ``ValueError``。
         """
 
         if isinstance(depth_radius_px, bool) or not isinstance(
@@ -455,6 +623,12 @@ class Perception3DEstimator:
         position_jump_m = _finite_number(
             max_position_jump_m, "max_position_jump_m"
         )
+        identity_ambiguity_ratio = _finite_number(
+            ambiguity_ratio, "ambiguity_ratio"
+        )
+        center_reliability = _finite_number(
+            heuristic_center_reliability, "heuristic_center_reliability"
+        )
         if not 0.0 < alpha <= 1.0:
             raise ValueError("ema_alpha 必须位于 (0, 1] 范围")
         if max_age_s <= 0.0:
@@ -463,6 +637,19 @@ class Perception3DEstimator:
             raise ValueError("max_input_skew_s 必须是非零正有限秒数")
         if position_jump_m <= 0.0:
             raise ValueError("max_position_jump_m 必须是正的有限米数")
+        if identity_ambiguity_ratio <= 1.0:
+            raise ValueError("ambiguity_ratio 必须是大于1的有限数")
+        if (
+            not isinstance(center_compensation_mode, str)
+            or center_compensation_mode not in {"degraded", "strict"}
+        ):
+            raise ValueError(
+                "center_compensation_mode 只允许 'degraded' 或 'strict'"
+            )
+        if not 0.0 < center_reliability <= 1.0:
+            raise ValueError(
+                "heuristic_center_reliability 必须位于 (0, 1] 范围"
+            )
 
         dimensions = dict(object_dimensions_m) if object_dimensions_m else {}
         normalized_dimensions: dict[str, tuple[float, float, float]] = {}
@@ -485,10 +672,26 @@ class Perception3DEstimator:
         self.max_track_age_s = max_age_s
         self.max_input_skew_s = input_skew_s
         self.max_position_jump_m = position_jump_m
+        self.ambiguity_ratio = identity_ambiguity_ratio
+        self.center_compensation_mode = center_compensation_mode
+        self.heuristic_center_reliability = center_reliability
         self._dims = normalized_dimensions
         self._tracks: dict[str, _Track] = {}
         self._last_frame_ts_ns: Optional[int] = None
         self._last_detection_frame_ts_ns: Optional[int] = None
+
+    def _uses_legacy_point_transform_provider(self) -> bool:
+        """兼容只覆写旧 ``camera_to_output`` 公共入口的 Provider 子类。"""
+
+        provider_type = type(self.transform_provider)
+        return (
+            provider_type.camera_to_output
+            is not CameraTransformProvider.camera_to_output
+            and provider_type.compute_head_camera_pose
+            is CameraTransformProvider.compute_head_camera_pose
+            and provider_type.transform_camera_point
+            is CameraTransformProvider.transform_camera_point
+        )
 
     def estimate(
         self,
@@ -587,6 +790,76 @@ class Perception3DEstimator:
         associations, association_errors = self._associate_tracks(
             detections, context_errors
         )
+        probes: dict[int, _SurfaceProbe] = {}
+        probe_errors: dict[int, str] = {}
+        depth_requests: dict[int, _DepthWindowRequest] = {}
+        eligible_indices = [
+            index
+            for index, detection in enumerate(detections)
+            if (
+                detection.valid
+                and not context_errors[index]
+                and index not in association_errors
+            )
+        ]
+        for index in eligible_indices:
+            try:
+                depth_requests[index] = _validate_depth_window_request(
+                    depth,
+                    detections[index].bbox_xyxy,
+                    self.depth_radius_px,
+                )
+            except ValueError as exc:
+                probe_errors[index] = f"深度提取失败：{exc}"
+        if depth_requests:
+            try:
+                import numpy as np
+            except ImportError:
+                for index in depth_requests:
+                    probe_errors[index] = "深度提取失败：深度处理中缺少 NumPy"
+            else:
+                try:
+                    depth_array = np.asarray(depth.image)
+                except (TypeError, ValueError):
+                    for index in depth_requests:
+                        probe_errors[index] = (
+                            "深度提取失败：depth.image 无法转换为深度数组"
+                        )
+                else:
+                    for index, request in depth_requests.items():
+                        try:
+                            probes[index] = self._surface_probe(
+                                depth,
+                                detections[index],
+                                intrinsics,
+                                request,
+                                depth_array,
+                                np,
+                            )
+                        except _SurfaceProbeError as exc:
+                            probe_errors[index] = str(exc)
+
+        head_pose: Optional[_HeadCameraPose] = None
+        head_pose_error = ""
+        legacy_point_transform = self._uses_legacy_point_transform_provider()
+        if probes and not legacy_point_transform:
+            try:
+                head_pose = self.transform_provider.compute_head_camera_pose(
+                    base, joints
+                )
+            except (ValueError, RuntimeError) as exc:
+                head_pose_error = f"坐标变换失败：{exc}"
+        identity_candidates, identity_errors = self._identity_consistency(
+            detections,
+            associations,
+            context_errors,
+            association_errors,
+            probes,
+            head_pose,
+            base,
+            joints,
+            legacy_point_transform,
+        )
         self._last_frame_ts_ns = timestamp_ns
         if current_detection_timestamps:
             self._last_detection_frame_ts_ns = next(
@@ -595,7 +868,11 @@ class Perception3DEstimator:
 
         results: list[ObjectEstimate3D] = []
         for index, detection in enumerate(detections):
-            context_error = context_errors[index] or association_errors.get(index, "")
+            context_error = (
+                context_errors[index]
+                or association_errors.get(index, "")
+                or identity_errors.get(index, "")
+            )
             if context_error:
                 results.append(
                     self._failure(
@@ -610,12 +887,16 @@ class Perception3DEstimator:
                 self._estimate_one(
                     detection,
                     associations[index],
-                    depth,
-                    intrinsics,
-                    base,
-                    joints,
                     output_frame,
                     timestamp_ns,
+                    identity_candidates.get(index),
+                    probes.get(index),
+                    probe_errors.get(index, ""),
+                    head_pose,
+                    head_pose_error,
+                    base,
+                    joints,
+                    legacy_point_transform,
                 )
             )
         return tuple(results)
@@ -631,12 +912,16 @@ class Perception3DEstimator:
         self,
         detection: Detection2D,
         track_key: Optional[str],
-        depth: DepthFrame,
-        intrinsics: CameraIntrinsics,
-        base: BaseState,
-        joints: RobotJointState,
         output_frame: str,
         timestamp_ns: int,
+        identity_candidate: Optional[_IdentityCandidate],
+        probe: Optional[_SurfaceProbe],
+        probe_error: str,
+        head_pose: Optional[_HeadCameraPose],
+        head_pose_error: str,
+        base: BaseState,
+        joints: RobotJointState,
+        legacy_point_transform: bool,
     ) -> ObjectEstimate3D:
         """独立处理一条检测，并把预期的数据错误转换为无效估计。"""
 
@@ -649,37 +934,16 @@ class Perception3DEstimator:
                 f"二维检测无效：{reason}",
             )
 
-        try:
-            depth_m = median_depth_m(
-                depth,
-                detection.bbox_xyxy,
-                radius_px=self.depth_radius_px,
-            )
-            x0, y0, x1, y1 = _finite_vector(
-                detection.bbox_xyxy, 4, "bbox_xyxy"
-            )
-            u = (x0 + x1) / 2.0
-            v = (y0 + y1) / 2.0
-        except ValueError as exc:
+        if probe is None:
             return self._failure(
                 detection.class_id,
                 output_frame,
                 timestamp_ns,
-                f"深度提取失败：{exc}",
-            )
-
-        try:
-            camera_point = project_pixel_to_camera(u, v, depth_m, intrinsics)
-        except ValueError as exc:
-            return self._failure(
-                detection.class_id,
-                output_frame,
-                timestamp_ns,
-                f"反投影失败：{exc}",
+                probe_error or "深度提取失败：未生成深度表面探针",
             )
 
         compensated_point, compensated = self._compensate_to_center(
-            detection.class_id, camera_point
+            detection.class_id, probe.camera_surface_xyz
         )
         if not compensated:
             return self._failure(
@@ -692,11 +956,37 @@ class Perception3DEstimator:
                     "当前深度点仅代表可见表面"
                 ),
             )
-        try:
-            world_point = _finite_vector(
-                self.transform_provider.camera_to_output(
-                    compensated_point, base, joints
+        if self.center_compensation_mode == "strict":
+            return self._failure(
+                detection.class_id,
+                output_frame,
+                timestamp_ns,
+                (
+                    "surface point only, center compensation not validated；"
+                    "严格模式拒绝启发式表面到中心补偿"
                 ),
+            )
+        if head_pose is None and not legacy_point_transform:
+            return self._failure(
+                detection.class_id,
+                output_frame,
+                timestamp_ns,
+                head_pose_error or "坐标变换失败：未生成当前帧相机位姿",
+            )
+        try:
+            if legacy_point_transform:
+                transformed_point = self.transform_provider.camera_to_output(
+                    compensated_point,
+                    base,
+                    joints,
+                )
+            else:
+                assert head_pose is not None
+                transformed_point = self.transform_provider.transform_camera_point(
+                    compensated_point, head_pose
+                )
+            world_point = _finite_vector(
+                transformed_point,
                 3,
                 "camera_to_output 返回值",
             )
@@ -719,12 +1009,12 @@ class Perception3DEstimator:
                 timestamp_ns,
                 f"置信度计算失败：{exc}",
             )
-        valid_fraction = self._depth_valid_fraction(depth, u, v)
         filtered_point, count, track_error = self._update_track(
             track_key,
             detection,
             world_point,
             timestamp_ns,
+            identity_candidate,
         )
         if track_error:
             return self._failure(
@@ -734,7 +1024,11 @@ class Perception3DEstimator:
                 track_error,
             )
         converge = min(1.0, count / self.converge_frames)
-        confidence *= valid_fraction * converge
+        confidence *= (
+            probe.valid_fraction
+            * converge
+            * self.heuristic_center_reliability
+        )
         confidence = max(0.0, min(1.0, confidence))
         return ObjectEstimate3D(
             detection.class_id,
@@ -743,6 +1037,52 @@ class Perception3DEstimator:
             output_frame,
             timestamp_ns,
             valid=True,
+            failure_reason=(
+                "heuristic center approximation "
+                "(surface-to-center not validated)"
+            ),
+        )
+
+    def _surface_probe(
+        self,
+        depth: DepthFrame,
+        detection: Detection2D,
+        intrinsics: CameraIntrinsics,
+        request: _DepthWindowRequest,
+        depth_array: Any,
+        np: Any,
+    ) -> _SurfaceProbe:
+        """对一条检测只统计一次深度窗口，并复用其中位数与有效比例。"""
+
+        try:
+            statistics = _depth_window_statistics(
+                depth,
+                request,
+                depth_array,
+                np,
+            )
+            x0, y0, x1, y1 = _finite_vector(
+                detection.bbox_xyxy, 4, "bbox_xyxy"
+            )
+            u = (x0 + x1) / 2.0
+            v = (y0 + y1) / 2.0
+        except ValueError as exc:
+            raise _SurfaceProbeError(f"深度提取失败：{exc}") from exc
+        try:
+            camera_surface = project_pixel_to_camera(
+                u,
+                v,
+                statistics.depth_m,
+                intrinsics,
+            )
+        except ValueError as exc:
+            raise _SurfaceProbeError(f"反投影失败：{exc}") from exc
+        return _SurfaceProbe(
+            u,
+            v,
+            statistics.depth_m,
+            statistics.valid_fraction,
+            camera_surface,
         )
 
     def _compensate_to_center(
@@ -773,7 +1113,7 @@ class Perception3DEstimator:
 
         associations: dict[int, Optional[str]] = {}
         errors: dict[int, str] = {}
-        reserved_keys: set[str] = set()
+        reserved_indices: dict[str, int] = {}
 
         for index, detection in enumerate(detections):
             if context_errors[index]:
@@ -785,16 +1125,127 @@ class Perception3DEstimator:
                 associations[index] = None
                 continue
             key = f"stable:{detection.track_id}"
-            if key in reserved_keys:
-                errors[index] = (
+            if key in reserved_indices:
+                previous_index = reserved_indices[key]
+                reason = (
                     "二维稳定轨迹ID重复：同一帧中 "
                     f"track_id={detection.track_id} "
                     "只能关联一个目标"
                 )
+                errors[previous_index] = reason
+                errors[index] = reason
+                associations.pop(previous_index, None)
                 continue
             associations[index] = key
-            reserved_keys.add(key)
+            reserved_indices[key] = index
         return associations, errors
+
+    def _identity_consistency(
+        self,
+        detections: tuple[Detection2D, ...],
+        associations: dict[int, Optional[str]],
+        context_errors: list[str],
+        association_errors: dict[int, str],
+        probes: dict[int, _SurfaceProbe],
+        head_pose: Optional[_HeadCameraPose],
+        base: BaseState,
+        joints: RobotJointState,
+        legacy_point_transform: bool,
+    ) -> tuple[dict[int, _IdentityCandidate], dict[int, str]]:
+        """在更新EMA前用未补偿三维表面点核验稳定ID，疑似交换时关闭失败。"""
+
+        candidates: dict[int, _IdentityCandidate] = {}
+        errors: dict[int, str] = {}
+        if head_pose is None and not legacy_point_transform:
+            return candidates, errors
+        for index, detection in enumerate(detections):
+            key = associations.get(index)
+            if (
+                key is None
+                or context_errors[index]
+                or index in association_errors
+                or not detection.valid
+                or index not in probes
+            ):
+                continue
+            probe = probes[index]
+            try:
+                if legacy_point_transform:
+                    transformed_surface = (
+                        self.transform_provider.camera_to_output(
+                            probe.camera_surface_xyz,
+                            base,
+                            joints,
+                        )
+                    )
+                else:
+                    assert head_pose is not None
+                    transformed_surface = (
+                        self.transform_provider.transform_camera_point(
+                            probe.camera_surface_xyz, head_pose
+                        )
+                    )
+                surface_xyz = _finite_vector(
+                    transformed_surface,
+                    3,
+                    "camera_to_output 返回值",
+                )
+            except (ValueError, RuntimeError):
+                # 正式估计路径会保留完整的深度、反投影或坐标变换失败原因。
+                continue
+            candidates[index] = _IdentityCandidate(
+                (probe.u, probe.v),
+                surface_xyz,
+            )
+
+        # 同类、同帧且候选在1像素/1厘米内近乎重合时没有足够证据区分身份，
+        # 整对关闭失败。该阈值只用于“不可分辨”保护，不用于普通目标关联。
+        candidate_items = list(candidates.items())
+        for item_index, (left_index, left) in enumerate(candidate_items):
+            for right_index, right in candidate_items[item_index + 1 :]:
+                if detections[left_index].class_id != detections[right_index].class_id:
+                    continue
+                if (
+                    math.dist(left.surface_xyz, right.surface_xyz) <= 0.01
+                    and math.dist(
+                        left.bbox_center_xy, right.bbox_center_xy
+                    )
+                    <= 1.0
+                ):
+                    reason = (
+                        "二维轨迹ID一致性校验失败：同类目标完全重叠，"
+                        "无法可靠区分身份"
+                    )
+                    errors[left_index] = reason
+                    errors[right_index] = reason
+
+        # 当前候选若明显更接近另一条同类历史轨迹，则上游ID很可能已贴反。
+        for index, candidate in candidates.items():
+            if index in errors:
+                continue
+            key = associations[index]
+            if key is None:
+                continue
+            assigned = self._tracks.get(key)
+            if assigned is None or assigned.class_id != detections[index].class_id:
+                continue
+            d_assigned = math.dist(candidate.surface_xyz, assigned.last_surface_xyz)
+            other_distances = [
+                math.dist(candidate.surface_xyz, track.last_surface_xyz)
+                for other_key, track in self._tracks.items()
+                if other_key != key and track.class_id == assigned.class_id
+            ]
+            if not other_distances:
+                continue
+            d_other_min = min(other_distances)
+            if d_assigned > d_other_min * self.ambiguity_ratio:
+                errors[index] = (
+                    "二维轨迹ID一致性校验失败，疑似ID交换："
+                    f"分配轨迹距离={d_assigned:.6f}m，"
+                    f"其他同类轨迹最近距离={d_other_min:.6f}m，"
+                    f"比率阈值={self.ambiguity_ratio:.6f}"
+                )
+        return candidates, errors
 
     def _update_track(
         self,
@@ -802,11 +1253,18 @@ class Perception3DEstimator:
         detection: Detection2D,
         world_point: tuple[float, float, float],
         timestamp_ns: int,
+        identity_candidate: Optional[_IdentityCandidate],
     ) -> tuple[tuple[float, float, float], int, str]:
         """以严格递增时间戳更新三维 EMA，并拒绝离群大跳变。"""
 
         if key is None:
             return world_point, 1, ""
+        if identity_candidate is None:
+            return (
+                (0.0, 0.0, 0.0),
+                0,
+                "二维轨迹ID一致性校验失败：缺少有效三维身份候选",
+            )
 
         detection_timestamp_ns = int(detection.timestamp_ns)
         track = self._tracks.get(key)
@@ -817,6 +1275,8 @@ class Perception3DEstimator:
                 count=1,
                 last_ts_ns=timestamp_ns,
                 last_detection_ts_ns=detection_timestamp_ns,
+                bbox_center_xy=identity_candidate.bbox_center_xy,
+                last_surface_xyz=identity_candidate.surface_xyz,
             )
             self._tracks[key] = track
             return tuple(track.ema), track.count, ""
@@ -868,6 +1328,8 @@ class Perception3DEstimator:
         track.count += 1
         track.last_ts_ns = timestamp_ns
         track.last_detection_ts_ns = detection_timestamp_ns
+        track.bbox_center_xy = identity_candidate.bbox_center_xy
+        track.last_surface_xyz = identity_candidate.surface_xyz
         return tuple(track.ema), track.count, ""
 
     def _remove_expired_tracks(self, timestamp_ns: int) -> None:
@@ -989,27 +1451,6 @@ class Perception3DEstimator:
         if not isinstance(value, str) or not value.strip():
             raise ValueError(f"{name} 必须是非空字符串")
         return value
-
-    def _depth_valid_fraction(
-        self, depth: DepthFrame, u: float, v: float
-    ) -> float:
-        """计算深度中心窗口内有限且为正的原始像素占比。"""
-
-        try:
-            import numpy as np
-        except ImportError:
-            return 1.0
-        image = np.asarray(depth.image)
-        height, width = image.shape
-        center_x = int(round(u))
-        center_y = int(round(v))
-        xa = max(0, center_x - self.depth_radius_px)
-        xb = min(width, center_x + self.depth_radius_px + 1)
-        ya = max(0, center_y - self.depth_radius_px)
-        yb = min(height, center_y + self.depth_radius_px + 1)
-        patch = image[ya:yb, xa:xb].astype(float)
-        valid = np.isfinite(patch) & (patch > 0.0)
-        return float(np.count_nonzero(valid) / patch.size)
 
     @staticmethod
     def _timestamp_ns(value: Any, name: str) -> int:
