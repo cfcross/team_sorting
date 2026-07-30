@@ -1459,7 +1459,7 @@ def test_rosbag_command_contains_all_configured_topics(
     command = recorder.build_rosbag_command(topics)
     assert command[:4] == ("ros2", "bag", "record", "-o")
     assert set(command[5:]) == set(topics)
-    assert command[4].endswith("episode_bag/rosbag")
+    assert Path(command[4]) == tmp_path / "episode_bag" / "rosbag"
     recorder.mark_rosbag_started(command[4])
     recorder.mark_rosbag_finished(0)
     assert recorder.metadata is not None
