@@ -48,6 +48,7 @@ from team_sorting.interfaces import (
 )
 from team_sorting.navigation import (
     Bounds3D,
+    NavigationConfig,
     NavigationController,
     classify_slot_type,
     distance_xy,
@@ -439,20 +440,55 @@ def test_navigation_pick_goal_rejects_invalid_coordinates_and_frame(bad_x: float
         )
 
 
-def test_navigation_place_goal_requires_world_and_stands_off() -> None:
+def test_navigation_place_goal_requires_approved_world_to_planning_transform() -> None:
     controller = NavigationController()
-    base = _nav_base(frame="world")
     task = _nav_task()
-    goal = controller.build_place_goal(task, base, 1_000_000_000)
-    assert goal.pose_xyyaw[:2] != pytest.approx(task.place_world_xyz[:2])
-    assert distance_xy(goal.pose_xyyaw, task.place_world_xyz) == pytest.approx(0.6)
-    assert goal.pose_xyyaw[2] == pytest.approx(0.0)
-    with pytest.raises(ValueError, match="world"):
+    with pytest.raises(NotImplementedError, match="world→planning"):
         controller.build_place_goal(task, _nav_base(frame="odom"), 1_000_000_000)
+    with pytest.raises(NotImplementedError, match="world→planning"):
+        controller.build_place_goal(
+            task, _nav_base(frame="world"), 1_000_000_000
+        )
     with pytest.raises(ValueError):
         controller.build_place_goal(
-            _nav_task((math.nan, 0.0, 0.5)), base, 1_000_000_000
+            _nav_task((math.nan, 0.0, 0.5)),
+            _nav_base(frame="world"),
+            1_000_000_000,
         )
+
+
+def test_navigation_goal_generation_rejects_stale_base_and_target_at_boundary() -> None:
+    config = NavigationConfig(odom_max_age_ns=100, target_max_age_ns=100)
+    controller = NavigationController(config)
+    task = _nav_task()
+    target_at_boundary = ObjectEstimate3D(
+        "pink", (2.0, 0.0, 0.8), 0.9, "odom", 900
+    )
+    controller.build_pick_goal(
+        task, target_at_boundary, _nav_base(stamp=900), 1_000
+    )
+    with pytest.raises(ValueError, match="Odom 已过期"):
+        controller.build_pick_goal(
+            task, target_at_boundary, _nav_base(stamp=899), 1_000
+        )
+    with pytest.raises(ValueError, match="ObjectEstimate3D 已过期"):
+        controller.build_pick_goal(
+            task,
+            ObjectEstimate3D("pink", (2.0, 0.0, 0.8), 0.9, "odom", 899),
+            _nav_base(stamp=900),
+            1_000,
+        )
+
+
+def test_navigation_config_is_injected_and_validated() -> None:
+    config = NavigationConfig(max_abs_v_mps=0.1, max_abs_w_radps=0.2)
+    command, _ = NavigationController(config).update(
+        _nav_base(), _nav_goal(1.0, 1.0, 0.0), 1_000_000_000
+    )
+    assert abs(command.v) <= 0.1
+    assert abs(command.w) <= 0.2
+    with pytest.raises(ValueError, match="standoff_m"):
+        NavigationConfig(standoff_m=math.nan)
 
 
 @pytest.mark.parametrize(
@@ -524,6 +560,43 @@ def test_navigation_update_safely_stops_on_timeout_invalid_and_stale_odom() -> N
         assert (command.v, command.w) == (0.0, 0.0)
         assert not status.success
         assert status.failure_reason
+
+
+def test_navigation_deadline_is_exclusive_and_stops_at_equal_timestamp() -> None:
+    command, status = NavigationController().update(
+        _nav_base(),
+        _nav_goal(1.0, 0.0, 0.0, deadline=1_000_000_000),
+        1_000_000_000,
+    )
+    assert (command.v, command.w) == (0.0, 0.0)
+    assert not command.valid
+    assert status.state == "timeout"
+    assert not status.success
+
+
+def test_navigation_fails_closed_when_finite_arithmetic_overflows() -> None:
+    controller = NavigationController()
+    with pytest.raises(ValueError):
+        controller.build_pick_goal(
+            _nav_task(),
+            ObjectEstimate3D(
+                "pink", (1e308, 0.0, 0.8), 0.9, "odom", 1_000_000_000
+            ),
+            _nav_base(x=-1e308),
+            1_000_000_000,
+        )
+
+    command, status = controller.update(
+        _nav_base(x=-1e308),
+        _nav_goal(1e308, 0.0, 0.0),
+        1_000_000_000,
+    )
+    assert (command.v, command.w) == (0.0, 0.0)
+    assert not command.valid
+    assert not status.success
+    assert status.failure_reason
+    assert math.isfinite(status.distance_error)
+    assert math.isfinite(status.yaw_error)
 
 
 # ---------------------------------------------------------------------------
