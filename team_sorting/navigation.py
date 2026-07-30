@@ -33,24 +33,6 @@ from .interfaces import (
     TaskSpec,
 )
 
-# 本仓库尚无经评审的导航参数配置段；以下是受 ActionMux 现有限幅约束的保守团队初值，
-# 不是官方性能参数。待公共配置获批后应由组装层注入。
-#
-# 参数按用途分为四组：站位几何、目标有效期、反馈新鲜度和比例控制。集中声明可以避免
-# 抓取、放置和 update 各自复制数值，也便于后续迁移到 config.yaml。
-_STANDOFF_M = 0.60
-_POSITION_TOLERANCE_M = 0.05
-_YAW_TOLERANCE_RAD = 0.10
-_GOAL_TIMEOUT_NS = 30_000_000_000
-_COMMAND_TTL_NS = 200_000_000
-_ODOM_MAX_AGE_NS = 150_000_000
-_MAX_ABS_V_MPS = 0.25
-_MAX_ABS_W_RADPS = 0.50
-_LINEAR_KP = 0.8
-_ANGULAR_KP = 1.5
-_HEADING_STOP_RAD = math.pi / 4.0
-
-
 def _finite_real(value: object, field_name: str) -> float:
     """把真实数转换为有限浮点数，并统一基础几何函数的错误说明。"""
 
@@ -60,6 +42,59 @@ def _finite_real(value: object, field_name: str) -> float:
     if not math.isfinite(converted):
         raise ValueError(f"{field_name}必须是真实有限数")
     return converted
+
+
+def _nonnegative_int(value: object, field_name: str) -> int:
+    """校验纳秒时长等非负整数配置，拒绝 bool 和隐式浮点截断。"""
+
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{field_name}必须是非负整数")
+    return value
+
+
+@dataclass(frozen=True)
+class NavigationConfig:
+    """导航局部策略的不可变配置。
+
+    默认值是团队当前的保守初值，不是官方性能参数。配置保留在本模块内并通过
+    ``NavigationController`` 构造函数注入，避免修改公共数据接口或 ROS 组装层。
+    """
+
+    standoff_m: float = 0.60
+    position_tolerance_m: float = 0.05
+    yaw_tolerance_rad: float = 0.10
+    goal_timeout_ns: int = 30_000_000_000
+    command_ttl_ns: int = 200_000_000
+    odom_max_age_ns: int = 150_000_000
+    target_max_age_ns: int = 150_000_000
+    max_abs_v_mps: float = 0.25
+    max_abs_w_radps: float = 0.50
+    linear_kp: float = 0.8
+    angular_kp: float = 1.5
+    heading_stop_rad: float = math.pi / 4.0
+
+    def __post_init__(self) -> None:
+        positive_fields = (
+            ("standoff_m", self.standoff_m),
+            ("position_tolerance_m", self.position_tolerance_m),
+            ("yaw_tolerance_rad", self.yaw_tolerance_rad),
+            ("max_abs_v_mps", self.max_abs_v_mps),
+            ("max_abs_w_radps", self.max_abs_w_radps),
+            ("linear_kp", self.linear_kp),
+            ("angular_kp", self.angular_kp),
+            ("heading_stop_rad", self.heading_stop_rad),
+        )
+        for name, value in positive_fields:
+            if _finite_real(value, f"NavigationConfig.{name}") <= 0.0:
+                raise ValueError(f"NavigationConfig.{name}必须大于零")
+        for name, value in (
+            ("goal_timeout_ns", self.goal_timeout_ns),
+            ("command_ttl_ns", self.command_ttl_ns),
+            ("odom_max_age_ns", self.odom_max_age_ns),
+            ("target_max_age_ns", self.target_max_age_ns),
+        ):
+            if _nonnegative_int(value, f"NavigationConfig.{name}") == 0:
+                raise ValueError(f"NavigationConfig.{name}必须大于零")
 
 
 def _read_xy(point: object, field_name: str) -> tuple[float, float]:
@@ -102,7 +137,9 @@ def distance_xy(first_xyz: tuple[float, ...], second_xyz: tuple[float, ...]) -> 
 
     first_x, first_y = _read_xy(first_xyz, "第一个坐标")
     second_x, second_y = _read_xy(second_xyz, "第二个坐标")
-    return math.hypot(first_x - second_x, first_y - second_y)
+    delta_x = _finite_real(first_x - second_x, "X坐标差")
+    delta_y = _finite_real(first_y - second_y, "Y坐标差")
+    return _finite_real(math.hypot(delta_x, delta_y), "XY距离")
 
 
 @dataclass(frozen=True)
@@ -186,6 +223,9 @@ class NavigationController:
     中断后继续沿用旧速度。本类只做局部几何和比例控制，不代替全局路径规划或 FSM。
     """
 
+    def __init__(self, config: NavigationConfig | None = None) -> None:
+        self._config = config if config is not None else NavigationConfig()
+
     def build_pick_goal(
         self, task: TaskSpec, target: ObjectEstimate3D, base: BaseState, timestamp_ns: int
     ) -> NavGoal:
@@ -199,12 +239,14 @@ class NavigationController:
         # 先验证时间、任务和 Odom；任何几何计算都不能建立在无效状态上。
         now = self._timestamp(timestamp_ns, "timestamp_ns")
         self._validate_task(task, now)
-        self._validate_base(base, now, require_fresh=False)
+        self._validate_base(base, now, require_fresh=True)
         if not isinstance(target, ObjectEstimate3D) or not target.valid:
             raise ValueError("ObjectEstimate3D 无效")
         target_stamp = self._timestamp(target.timestamp_ns, "target.timestamp_ns")
         if target_stamp > now:
             raise ValueError("ObjectEstimate3D 时间戳晚于当前周期")
+        if now - target_stamp > self._config.target_max_age_ns:
+            raise ValueError("ObjectEstimate3D 已过期")
         if len(target.position_xyz) != 3:
             raise ValueError("target.position_xyz 必须包含三项")
         target_x, target_y = _read_xy(target.position_xyz, "target.position_xyz")
@@ -215,14 +257,15 @@ class NavigationController:
         goal_x, goal_y, goal_yaw = self._stand_off_pose(
             target_x, target_y, base.position_xyz
         )
+        self._finite_vector((goal_x, goal_y, goal_yaw), "抓取 NavGoal.pose_xyyaw")
         return NavGoal(
             f"pick-{task.task_id}-{now}",
             "pick",
             (goal_x, goal_y, goal_yaw),
             target.frame_id,
-            _POSITION_TOLERANCE_M,
-            _YAW_TOLERANCE_RAD,
-            now + _GOAL_TIMEOUT_NS,
+            self._config.position_tolerance_m,
+            self._config.yaw_tolerance_rad,
+            now + self._config.goal_timeout_ns,
         )
 
     def build_place_goal(self, task: TaskSpec, base: BaseState, timestamp_ns: int) -> NavGoal:
@@ -235,27 +278,14 @@ class NavigationController:
 
         now = self._timestamp(timestamp_ns, "timestamp_ns")
         self._validate_task(task, now)
-        self._validate_base(base, now, require_fresh=False)
+        self._validate_base(base, now, require_fresh=True)
         if task.place_world_xyz is None or len(task.place_world_xyz) != 3:
             raise ValueError("TaskSpec.place_world_xyz 必须包含 world 三维坐标")
         place_x, place_y = _read_xy(task.place_world_xyz, "task.place_world_xyz")
         _finite_real(task.place_world_xyz[2], "task.place_world_xyz.z")
-        # 字段名明确规定 place_world_xyz 属于 world；没有变换时只能严格匹配。
-        if base.frame_id != "world":
-            raise ValueError(
-                "place_world_xyz 位于 world，但 BaseState 不在 world，且仓库没有坐标转换接口"
-            )
-        goal_x, goal_y, goal_yaw = self._stand_off_pose(
-            place_x, place_y, base.position_xyz
-        )
-        return NavGoal(
-            f"place-{task.task_id}-{now}",
-            "place",
-            (goal_x, goal_y, goal_yaw),
-            "world",
-            _POSITION_TOLERANCE_M,
-            _YAW_TOLERANCE_RAD,
-            now + _GOAL_TIMEOUT_NS,
+        raise NotImplementedError(
+            "place_world_xyz 位于 world，但当前 planning frame 为 odom；"
+            "world→planning 显式转换契约尚未批准，禁止生成不可执行的放置 NavGoal"
         )
 
     def update(
@@ -282,7 +312,7 @@ class NavigationController:
             if goal.frame_id != base.frame_id:
                 raise ValueError("NavGoal 与 BaseState frame 不一致")
             deadline = self._timestamp(goal.deadline_ns, "goal.deadline_ns")
-            if now > deadline:
+            if now >= deadline:
                 return self._stopped(
                     goal.goal_id,
                     now,
@@ -309,7 +339,9 @@ class NavigationController:
                 # 已进入位置容差：停止平移，只调整目标要求的最终 yaw。
                 if abs(final_yaw_error) <= yaw_tolerance:
                     return (
-                        BaseCommand(0.0, 0.0, now, now + _COMMAND_TTL_NS),
+                        BaseCommand(
+                            0.0, 0.0, now, now + self._config.command_ttl_ns
+                        ),
                         NavigationStatus(
                             goal.goal_id,
                             "arrived",
@@ -321,7 +353,10 @@ class NavigationController:
                         ),
                     )
                 v = 0.0
-                w = self._clamp(_ANGULAR_KP * final_yaw_error, _MAX_ABS_W_RADPS)
+                raw_w = _finite_real(
+                    self._config.angular_kp * final_yaw_error, "最终对准角速度"
+                )
+                w = self._clamp(raw_w, self._config.max_abs_w_radps)
                 state = "aligning_final_yaw"
                 control_yaw_error = final_yaw_error
             else:
@@ -329,20 +364,28 @@ class NavigationController:
                 bearing = math.atan2(goal_y - base_y, goal_x - base_x)
                 heading_error = wrap_to_pi(bearing - base.yaw)
                 control_yaw_error = heading_error
-                w = self._clamp(_ANGULAR_KP * heading_error, _MAX_ABS_W_RADPS)
-                if abs(heading_error) >= _HEADING_STOP_RAD:
+                raw_w = _finite_real(
+                    self._config.angular_kp * heading_error, "航向角速度"
+                )
+                w = self._clamp(raw_w, self._config.max_abs_w_radps)
+                if abs(heading_error) >= self._config.heading_stop_rad:
                     # 偏航过大时禁止“边大幅转向边高速前进”。
                     v = 0.0
                     state = "aligning_to_goal"
                 else:
                     # 距离比例项负责近目标减速，余弦项进一步抑制带偏角前进。
-                    v = min(_MAX_ABS_V_MPS, _LINEAR_KP * distance_error)
-                    v *= max(0.0, math.cos(heading_error))
+                    raw_v = _finite_real(
+                        self._config.linear_kp * distance_error, "距离比例线速度"
+                    )
+                    v = min(self._config.max_abs_v_mps, raw_v)
+                    v = _finite_real(
+                        v * max(0.0, math.cos(heading_error)), "航向抑制线速度"
+                    )
                     state = "moving"
             if not math.isfinite(v) or not math.isfinite(w):
                 raise ValueError("导航控制计算得到非有限速度")
             return (
-                BaseCommand(v, w, now, now + _COMMAND_TTL_NS),
+                BaseCommand(v, w, now, now + self._config.command_ttl_ns),
                 NavigationStatus(
                     goal.goal_id,
                     state,
@@ -371,28 +414,27 @@ class NavigationController:
             raise ValueError(f"{field_name} 必须是非负整数纳秒时间戳")
         return value
 
-    @classmethod
-    def _validate_task(cls, task: TaskSpec, now: int) -> None:
+    @staticmethod
+    def _validate_task(task: TaskSpec, now: int) -> None:
         if not isinstance(task, TaskSpec) or not task.valid:
             raise ValueError("TaskSpec 无效")
         if isinstance(task.task_id, bool) or not isinstance(task.task_id, int):
             raise ValueError("TaskSpec.task_id 必须是整数")
-        stamp = cls._timestamp(task.timestamp_ns, "task.timestamp_ns")
+        stamp = NavigationController._timestamp(task.timestamp_ns, "task.timestamp_ns")
         if stamp > now:
             raise ValueError("TaskSpec 时间戳晚于当前周期")
 
-    @classmethod
     def _validate_base(
-        cls, base: BaseState, now: int, *, require_fresh: bool
+        self, base: BaseState, now: int, *, require_fresh: bool
     ) -> None:
         if not isinstance(base, BaseState) or not base.valid:
             raise ValueError("BaseState 无效")
         if not base.frame_id:
             raise ValueError("BaseState.frame_id 不能为空")
-        stamp = cls._timestamp(base.timestamp_ns, "base.timestamp_ns")
+        stamp = self._timestamp(base.timestamp_ns, "base.timestamp_ns")
         if stamp > now:
             raise ValueError("BaseState 时间戳晚于当前周期")
-        if require_fresh and now - stamp > _ODOM_MAX_AGE_NS:
+        if require_fresh and now - stamp > self._config.odom_max_age_ns:
             raise ValueError("BaseState/Odom 已过期")
         if len(base.position_xyz) != 3:
             raise ValueError("base.position_xyz 必须包含三项")
@@ -400,28 +442,43 @@ class NavigationController:
             _finite_real(value, f"base.position_xyz[{index}]")
         _finite_real(base.yaw, "base.yaw")
 
-    @staticmethod
     def _stand_off_pose(
-        target_x: float, target_y: float, base_position: tuple[float, float, float]
+        self,
+        target_x: float,
+        target_y: float,
+        base_position: tuple[float, float, float],
     ) -> tuple[float, float, float]:
         base_x, base_y = _read_xy(base_position, "base.position_xyz")
         # 单位向量从底盘指向目标；从目标沿反方向退让，得到底盘中心停车点。
-        dx = target_x - base_x
-        dy = target_y - base_y
-        distance = math.hypot(dx, dy)
+        dx = _finite_real(target_x - base_x, "目标与底盘X坐标差")
+        dy = _finite_real(target_y - base_y, "目标与底盘Y坐标差")
+        distance = _finite_real(math.hypot(dx, dy), "目标与底盘距离")
         if distance <= 1e-9:
             raise ValueError("底盘与目标中心重合，无法确定安全退让方向")
-        goal_x = target_x - _STANDOFF_M * dx / distance
-        goal_y = target_y - _STANDOFF_M * dy / distance
-        goal_yaw = math.atan2(target_y - goal_y, target_x - goal_x)
+        offset_x = _finite_real(
+            self._config.standoff_m * dx / distance, "站位X退让量"
+        )
+        offset_y = _finite_real(
+            self._config.standoff_m * dy / distance, "站位Y退让量"
+        )
+        goal_x = _finite_real(target_x - offset_x, "站位X坐标")
+        goal_y = _finite_real(target_y - offset_y, "站位Y坐标")
+        facing_x = _finite_real(target_x - goal_x, "目标朝向X分量")
+        facing_y = _finite_real(target_y - goal_y, "目标朝向Y分量")
+        goal_yaw = _finite_real(math.atan2(facing_y, facing_x), "站位yaw")
         return goal_x, goal_y, goal_yaw
+
+    @staticmethod
+    def _finite_vector(values: tuple[float, ...], field_name: str) -> None:
+        for index, value in enumerate(values):
+            _finite_real(value, f"{field_name}[{index}]")
 
     @staticmethod
     def _clamp(value: float, absolute_limit: float) -> float:
         return max(-absolute_limit, min(absolute_limit, value))
 
-    @staticmethod
     def _stopped(
+        self,
         goal_id: str,
         timestamp_ns: int,
         state: str,
@@ -435,7 +492,7 @@ class NavigationController:
                 0.0,
                 0.0,
                 timestamp_ns,
-                timestamp_ns + _COMMAND_TTL_NS,
+                timestamp_ns + self._config.command_ttl_ns,
                 valid=valid,
                 failure_reason=reason,
             ),
