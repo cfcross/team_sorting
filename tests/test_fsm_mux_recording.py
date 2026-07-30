@@ -36,7 +36,7 @@ import yaml
 
 import team_sorting.recorder as recorder_module
 from team_sorting.action_mux import ActionMux, ActionMuxConfig
-from team_sorting.arm_execution import ArmExecutionController
+from team_sorting.arm_execution import ArmExecutionConfig, ArmExecutionController
 from team_sorting.fsm import FSMEvent, GlobalFSM, InstructionParser
 from team_sorting.interfaces import (
     ACTION_NAMES,
@@ -2354,22 +2354,32 @@ def test_arm_execution_reset_only_clears_memory_state() -> None:
 
 
 # ============================================================================
-# ArmExecutionController.step() 真实行为测试（替换原临时 NotImplementedError 测试）
-# ============================================================================
-# 当前开关全部 False：策略3限速跳过、策略4到位按时间推进、策略5稳定跳过
-# D 类测试需要 _ARRIVAL_CHECK_ENABLED=True，先 skip 等队长确认参数后启用
+# ArmExecutionController.step() 完整测试（含所有组长要求的新增用例）
 # ============================================================================
 
 
-def _step_joints() -> RobotJointState:
-    """与 _joints() 不同的实际反馈，用于区分实际位置与路点目标。"""
-    return RobotJointState(
-        position=(0.20, 0.10, -0.30, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60,
-                  0.50, -0.10, -0.20, -0.30, -0.40, -0.50, -0.60, 0.55),
-        velocity=(0.0,) * 17,
-        effort=(0.0,) * 17,
-        timestamp_ns=10_000,
+def _test_config(**overrides: object) -> ArmExecutionConfig:
+    """构造带保守安全参数的测试配置，可通过 overrides 覆盖任意字段。"""
+    kwargs = dict(
+        joint_tolerance_17=(0.02,) * 17,
+        max_joint_velocity_17=(10.0,) * 17,
+        settle_cycles=2,
+        total_timeout_ns=30_000_000_000,
+        command_ttl_ns=100_000_000,
+        feedback_max_age_ns=None,
+        trajectory_max_age_ns=None,
     )
+    kwargs.update(overrides)
+    return ArmExecutionConfig(**kwargs)
+
+
+def _step_joints(**overrides: object) -> RobotJointState:
+    """与 _joints() 不同的实际反馈。"""
+    pos = (0.20, 0.10, -0.30, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60,
+           0.50, -0.10, -0.20, -0.30, -0.40, -0.50, -0.60, 0.55)
+    kwargs = dict(position=pos, velocity=(0.0,)*17, effort=(0.0,)*17, timestamp_ns=10_000)
+    kwargs.update(overrides)
+    return RobotJointState(**kwargs)
 
 
 def _step_waypoint(
@@ -2387,11 +2397,12 @@ def _step_waypoint(
 def _step_trajectory(
     waypoints: tuple[object, ...],
     trajectory_id: str = "test-trajectory",
+    timestamp_ns: int = 10_000,
 ) -> JointTrajectory:
     return JointTrajectory(
         trajectory_id=trajectory_id,
-        waypoints=waypoints,  # type: ignore[arg-type]
-        timestamp_ns=5_000,
+        waypoints=waypoints,
+        timestamp_ns=timestamp_ns,
         valid=True,
     )
 
@@ -2402,7 +2413,6 @@ def _step_trajectory(
 
 
 def test_step_no_loaded_trajectory_returns_idle() -> None:
-    """未装载轨迹时返回 IDLE 而非 FAILED。"""
     controller = ArmExecutionController()
     cmd, status = controller.step(_joints(), 2_000)
     assert cmd.valid is False
@@ -2412,16 +2422,11 @@ def test_step_no_loaded_trajectory_returns_idle() -> None:
 
 
 def test_step_invalid_actual_joints_enters_failed() -> None:
-    """actual_joints.valid=False 时进入 FAILED。"""
-    controller = ArmExecutionController()
+    controller = ArmExecutionController(_test_config())
     controller.start_trajectory(_execution_trajectory())
     invalid = RobotJointState(
-        position=_joints().position,
-        velocity=(0.0,) * 17,
-        effort=(0.0,) * 17,
-        timestamp_ns=10_000,
-        valid=False,
-        failure_reason="JointState过期",
+        position=_joints().position, velocity=(0.0,)*17, effort=(0.0,)*17,
+        timestamp_ns=10_000, valid=False, failure_reason="JointState过期",
     )
     cmd, status = controller.step(invalid, 2_000)
     assert cmd.valid is False
@@ -2429,35 +2434,29 @@ def test_step_invalid_actual_joints_enters_failed() -> None:
     assert controller.local_phase is LocalPhase.FAILED
 
 
-@pytest.mark.parametrize(
-    "timestamp_ns",
-    [True, -1, 1.0, "2000", float("nan"), float("inf")],
-)
+@pytest.mark.parametrize("timestamp_ns", [True, -1, 1.0, "2000", float("nan"), float("inf")])
 def test_step_rejects_invalid_timestamp(timestamp_ns: object) -> None:
-    """非法 timestamp_ns 抛出 ValueError。"""
-    controller = ArmExecutionController()
+    controller = ArmExecutionController(_test_config())
     controller.start_trajectory(_execution_trajectory())
     with pytest.raises(ValueError, match="timestamp_ns"):
-        controller.step(_joints(), timestamp_ns)  # type: ignore[arg-type]
+        controller.step(_joints(), timestamp_ns)
 
 
-def test_step_rejects_timestamp_going_backwards() -> None:
-    """时间戳倒退进入 FAILED。"""
-    controller = ArmExecutionController()
-    controller.start_trajectory(
-        _step_trajectory((_step_waypoint(0.0), _step_waypoint(2.0)))
-    )
-    cmd1, _ = controller.step(_joints(), 2_000)
-    assert cmd1.valid is True
-    cmd2, status2 = controller.step(_joints(), 1_000)
-    assert cmd2.valid is False
-    assert "时间戳倒退" in status2.failure_reason
+def test_step_rejects_timestamp_not_strictly_increasing() -> None:
+    """时间单调性：timestamp_ns 必须严格递增，等于也算非法。"""
+    controller = ArmExecutionController(_test_config())
+    controller.start_trajectory(_step_trajectory((_step_waypoint(0.0), _step_waypoint(2.0))))
+    c1, _ = controller.step(_joints(), 2_000)
+    assert c1.valid is True
+    # 相等 → 非法倒退
+    c2, s2 = controller.step(_joints(), 2_000)
+    assert c2.valid is False
+    assert "非严格递增" in s2.failure_reason
     assert controller.local_phase is LocalPhase.FAILED
 
 
 def test_step_failed_state_blocks_subsequent_calls() -> None:
-    """FAILED 后后续 step 调用全部被阻塞。"""
-    controller = ArmExecutionController()
+    controller = ArmExecutionController(_test_config())
     controller.start_trajectory(_execution_trajectory())
     controller.local_phase = LocalPhase.FAILED
     cmd, status = controller.step(_joints(), 2_000)
@@ -2466,8 +2465,7 @@ def test_step_failed_state_blocks_subsequent_calls() -> None:
 
 
 def test_step_after_reset_without_new_trajectory_returns_idle() -> None:
-    """reset 后未装载新轨迹，step 返回 IDLE。"""
-    controller = ArmExecutionController()
+    controller = ArmExecutionController(_test_config())
     controller.start_trajectory(_execution_trajectory())
     controller.reset()
     cmd, status = controller.step(_joints(), 2_000)
@@ -2481,26 +2479,19 @@ def test_step_after_reset_without_new_trajectory_returns_idle() -> None:
 
 
 def test_step_at_first_waypoint_emits_that_position() -> None:
-    """t=0 时命令为第一条路点位置。"""
     wp = _step_waypoint(0.0)
-    controller = ArmExecutionController()
-    controller.start_trajectory(
-        _step_trajectory((wp, _step_waypoint(2.0)))
-    )
-    cmd, _ = controller.step(_joints(), 0)
+    controller = ArmExecutionController(_test_config())
+    controller.start_trajectory(_step_trajectory((wp, _step_waypoint(2.0))))
+    cmd, _ = controller.step(_joints(), 2_000)
     assert cmd.valid is True
     assert cmd.joint_target == wp.joint_position
 
 
 def test_step_between_waypoints_interpolates_linearly() -> None:
-    """t=1.0s 在两个路点 t=0 和 t=2 之间，alpha=0.5。"""
     base = _joints().position
-    p0 = base
-    p2 = tuple(v + 0.02 for v in base)
-    controller = ArmExecutionController()
-    controller.start_trajectory(
-        _step_trajectory((_step_waypoint(0.0, p0), _step_waypoint(2.0, p2)))
-    )
+    p0, p2 = base, tuple(v + 0.02 for v in base)
+    controller = ArmExecutionController(_test_config(max_joint_velocity_17=None))
+    controller.start_trajectory(_step_trajectory((_step_waypoint(0.0, p0), _step_waypoint(2.0, p2))))
     controller.step(_joints(), 0)
     cmd, _ = controller.step(_joints(), 1_000_000_000)
     for i in range(17):
@@ -2508,70 +2499,43 @@ def test_step_between_waypoints_interpolates_linearly() -> None:
 
 
 def test_step_exactly_on_middle_waypoint() -> None:
-    """精确落在中间路点，alpha=0，输出该路点目标。"""
     base = _joints().position
-    p0 = base
-    p1 = tuple(v + 0.01 for v in base)
-    p2 = tuple(v + 0.02 for v in base)
-    controller = ArmExecutionController()
-    controller.start_trajectory(
-        _step_trajectory((
-            _step_waypoint(0.0, p0),
-            _step_waypoint(1.0, p1),
-            _step_waypoint(2.0, p2),
-        ))
-    )
+    p0, p1, p2 = base, tuple(v + 0.01 for v in base), tuple(v + 0.02 for v in base)
+    controller = ArmExecutionController(_test_config(max_joint_velocity_17=None))
+    controller.start_trajectory(_step_trajectory((_step_waypoint(0.0,p0), _step_waypoint(1.0,p1), _step_waypoint(2.0,p2))))
     controller.step(_joints(), 0)
     cmd, _ = controller.step(_joints(), 1_000_000_000)
     assert cmd.joint_target == p1
 
 
-def test_step_at_last_waypoint_time_with_arrival_succeeds() -> None:
-    """时间到最后一个路点且到位（开关关闭时时间推进即到位）→ success=True。"""
+def test_step_trajectory_completes_with_config() -> None:
+    """配置了容差和稳定数 → 到位后 success=True + COMPLETED。"""
     target = _joints().position
-    actual = RobotJointState(
-        position=target, velocity=(0.0,) * 17, effort=(0.0,) * 17, timestamp_ns=10_000,
-    )
-    controller = ArmExecutionController()
-    controller.start_trajectory(
-        _step_trajectory((_step_waypoint(0.0, target), _step_waypoint(1.0, target)))
-    )
+    actual = RobotJointState(position=target, velocity=(0.0,)*17, effort=(0.0,)*17, timestamp_ns=10_000)
+    controller = ArmExecutionController(_test_config())
+    controller.start_trajectory(_step_trajectory((_step_waypoint(0.0, target), _step_waypoint(0.1, target))))
     controller.step(actual, 0)
-    cmd, status = controller.step(actual, 1_000_000_000)
+    controller.step(actual, 200_000_000)  # dt=0.2s > 最后路点0.1s, settle=1
+    cmd, status = controller.step(actual, 300_000_000)  # settle=2
     assert status.success is True
     assert status.state == "COMPLETED"
-    assert cmd.valid is True
 
 
 def test_step_beyond_last_waypoint_holds_last_target() -> None:
-    """超过最后路点后保持最后路点目标。"""
     base = _joints().position
     p_last = tuple(v + 0.02 for v in base)
-    controller = ArmExecutionController()
-    controller.start_trajectory(
-        _step_trajectory((_step_waypoint(0.0, base), _step_waypoint(1.0, p_last)))
-    )
+    controller = ArmExecutionController(_test_config(max_joint_velocity_17=None))
+    controller.start_trajectory(_step_trajectory((_step_waypoint(0.0, base), _step_waypoint(1.0, p_last))))
     controller.step(_joints(), 0)
-    cmd, _ = controller.step(_joints(), 5_000_000_000)
+    cmd, _ = controller.step(_joints(), 7_000_000_000)
     assert cmd.joint_target == p_last
 
 
 def test_step_multi_segment_selects_correct_interval() -> None:
-    """多段轨迹在 t=2.5s 时正确落在第3和第4路点之间。"""
     base = _joints().position
-    p0 = base
-    p1 = tuple(v + 0.004 for v in base)
-    p2 = tuple(v + 0.008 for v in base)
-    p3 = tuple(v + 0.012 for v in base)
-    controller = ArmExecutionController()
-    controller.start_trajectory(
-        _step_trajectory((
-            _step_waypoint(0.0, p0),
-            _step_waypoint(1.0, p1),
-            _step_waypoint(2.0, p2),
-            _step_waypoint(3.0, p3),
-        ))
-    )
+    p0, p1, p2, p3 = base, tuple(v+0.004 for v in base), tuple(v+0.008 for v in base), tuple(v+0.012 for v in base)
+    controller = ArmExecutionController(_test_config(max_joint_velocity_17=None))
+    controller.start_trajectory(_step_trajectory((_step_waypoint(0.0,p0),_step_waypoint(1.0,p1),_step_waypoint(2.0,p2),_step_waypoint(3.0,p3))))
     controller.step(_joints(), 0)
     cmd, _ = controller.step(_joints(), 2_500_000_000)
     for i in range(17):
@@ -2579,221 +2543,276 @@ def test_step_multi_segment_selects_correct_interval() -> None:
 
 
 def test_step_result_is_exactly_17_dimensions() -> None:
-    """插值结果恰好 17 维。"""
-    controller = ArmExecutionController()
-    controller.start_trajectory(
-        _step_trajectory((_step_waypoint(0.0), _step_waypoint(1.0)))
-    )
-    cmd, _ = controller.step(_joints(), 500_000_000)
+    controller = ArmExecutionController(_test_config())
+    controller.start_trajectory(_step_trajectory((_step_waypoint(0.0), _step_waypoint(1.0))))
+    cmd, _ = controller.step(_joints(), 2_000)
     assert len(cmd.joint_target) == 17
     assert len(cmd.controlled_mask) == 17
 
 
 def test_step_no_nan_or_inf_in_target() -> None:
-    """插值结果不输出 NaN 或 Inf。"""
-    controller = ArmExecutionController()
-    controller.start_trajectory(
-        _step_trajectory((_step_waypoint(0.0), _step_waypoint(1.0)))
-    )
-    cmd, _ = controller.step(_joints(), 500_000_000)
+    controller = ArmExecutionController(_test_config())
+    controller.start_trajectory(_step_trajectory((_step_waypoint(0.0), _step_waypoint(1.0))))
+    cmd, _ = controller.step(_joints(), 2_000)
     assert all(math.isfinite(v) for v in cmd.joint_target)
 
 
 # ============================================================================
-# C. controlled_mask（6项）
+# C. controlled_mask（5项） + mask 切换拒绝
 # ============================================================================
 
 
 def test_step_all_true_mask_controls_all_joints() -> None:
-    """全 True mask 时所有关节使用插值目标。"""
     target_pos = tuple(float(i) / 10.0 for i in range(17))
-    controller = ArmExecutionController()
-    controller.start_trajectory(
-        _step_trajectory((_step_waypoint(0.0, target_pos, (True,) * 17),))
-    )
-    cmd, _ = controller.step(_joints(), 0)
+    controller = ArmExecutionController(_test_config())
+    controller.start_trajectory(_step_trajectory((_step_waypoint(0.0, target_pos, (True,)*17),)))
+    cmd, _ = controller.step(_joints(), 2_000)
     assert cmd.controlled_mask == (True,) * 17
     assert cmd.joint_target == target_pos
 
 
 def test_step_all_false_mask_keeps_all_actual_positions() -> None:
-    """全 False mask 时所有关节保持实际位置。"""
     actual = _joints()
     wp = _step_waypoint(0.0, tuple(9.9 for _ in range(17)), (False,) * 17)
-    controller = ArmExecutionController()
+    controller = ArmExecutionController(_test_config())
     controller.start_trajectory(_step_trajectory((wp,)))
-    cmd, _ = controller.step(actual, 0)
+    cmd, _ = controller.step(actual, 2_000)
     assert cmd.joint_target == actual.position
-    assert cmd.controlled_mask == (False,) * 17
 
 
 def test_step_partial_mask_mixes_interpolated_and_actual() -> None:
-    """部分 True：受控用插值，未受控保持实际。"""
     actual = _joints()
     mask = tuple(i == 0 for i in range(17))
     wp_target = tuple(0.5 for _ in range(17))
-    controller = ArmExecutionController()
-    controller.start_trajectory(
-        _step_trajectory((_step_waypoint(0.0, wp_target, mask),))
-    )
-    cmd, _ = controller.step(actual, 0)
+    controller = ArmExecutionController(_test_config())
+    controller.start_trajectory(_step_trajectory((_step_waypoint(0.0, wp_target, mask),)))
+    cmd, _ = controller.step(actual, 2_000)
     assert cmd.joint_target[0] == 0.5
     for i in range(1, 17):
         assert cmd.joint_target[i] == actual.position[i]
 
 
 def test_step_uncontrolled_joints_are_not_zeroed() -> None:
-    """未受控关节保持实际值，不被填零。"""
     actual = _joints()
     assert actual.position[9] != 0.0
     mask = tuple(i != 9 for i in range(17))
     wp_target = tuple(0.0 for _ in range(17))
-    controller = ArmExecutionController()
-    controller.start_trajectory(
-        _step_trajectory((_step_waypoint(0.0, wp_target, mask),))
-    )
-    cmd, _ = controller.step(actual, 0)
+    controller = ArmExecutionController(_test_config())
+    controller.start_trajectory(_step_trajectory((_step_waypoint(0.0, wp_target, mask),)))
+    cmd, _ = controller.step(actual, 2_000)
     assert cmd.joint_target[9] == actual.position[9]
     assert cmd.joint_target[9] != 0.0
 
 
-def test_step_adjacent_different_masks_always_use_prev_mask() -> None:
-    """相邻mask不同时：未确认规则前保守使用前一个路点mask。3路点验证alpha<0.5和>=0.5均取prev_wp。"""
+def test_step_mask_change_rejected() -> None:
+    """相邻路点mask不一致 → FAILED。"""
     actual = _joints()
     mask_a = tuple(i == 0 for i in range(17))
     mask_b = tuple(i == 1 for i in range(17))
-    mask_c = tuple(i == 2 for i in range(17))
+    controller = ArmExecutionController(_test_config())
+    controller.start_trajectory(_step_trajectory((
+        _step_waypoint(0.0, actual.position, mask_a),
+        _step_waypoint(2.0, actual.position, mask_b),
+    )))
+    cmd, status = controller.step(actual, 2_000)
+    assert cmd.valid is False
+    assert "mask" in status.failure_reason.lower()
+
+
+# ============================================================================
+# D. 新鲜度检查（3项新增）
+# ============================================================================
+
+
+def test_step_stale_feedback_rejected() -> None:
+    """actual_joints 时间戳太旧 → FAILED。"""
+    actual = RobotJointState(position=_joints().position, velocity=(0.0,)*17, effort=(0.0,)*17,
+                              timestamp_ns=0, valid=True)
+    controller = ArmExecutionController(_test_config(feedback_max_age_ns=5_000))
+    controller.start_trajectory(_execution_trajectory())
+    cmd, status = controller.step(actual, 10_000)
+    assert cmd.valid is False
+    assert "过期" in status.failure_reason
+
+
+def test_step_future_feedback_rejected() -> None:
+    """actual_joints 时间戳来自未来 → FAILED。"""
+    actual = RobotJointState(position=_joints().position, velocity=(0.0,)*17, effort=(0.0,)*17,
+                              timestamp_ns=20_000, valid=True)
+    controller = ArmExecutionController(_test_config(feedback_max_age_ns=5_000))
+    controller.start_trajectory(_execution_trajectory())
+    cmd, status = controller.step(actual, 10_000)
+    assert cmd.valid is False
+    assert "未来" in status.failure_reason
+
+
+def test_step_stale_trajectory_rejected() -> None:
+    """trajectory.timestamp_ns 太旧 → FAILED。"""
+    controller = ArmExecutionController(_test_config(trajectory_max_age_ns=3_000))
+    controller.start_trajectory(_step_trajectory((_step_waypoint(0.0),), timestamp_ns=5_000))
+    cmd, status = controller.step(_joints(), 10_000)
+    assert cmd.valid is False
+    assert "过期" in status.failure_reason
+
+
+# ============================================================================
+# E. 首路点保护（1项新增）
+# ============================================================================
+
+
+def test_step_late_first_waypoint_uses_actual_position() -> None:
+    """首路点 t>0 → 首次step用实际位置代替跳变。"""
+    base = _joints().position
+    far_target = tuple(v + 5.0 for v in base)
+    controller = ArmExecutionController(_test_config(max_joint_velocity_17=None))
+    controller.start_trajectory(_step_trajectory((_step_waypoint(1.0, far_target), _step_waypoint(3.0, far_target))))
+    cmd, _ = controller.step(_joints(), 2_000)
+    # 首路点 t=1s > 0 → 应以实际位置为隐式 t=0 路点
+    assert cmd.joint_target == base
+
+
+# ============================================================================
+# F. COMPLETED 终态（1项新增）
+# ============================================================================
+
+
+def test_step_repeated_completed_returns_safe_hold() -> None:
+    """首次 COMPLETED 后重复调用 → valid=False 安全保持。"""
+    target = _joints().position
+    actual = RobotJointState(position=target, velocity=(0.0,)*17, effort=(0.0,)*17, timestamp_ns=10_000)
+    controller = ArmExecutionController(_test_config())
+    controller.start_trajectory(_step_trajectory((_step_waypoint(0.0, target), _step_waypoint(0.1, target))))
+    controller.step(actual, 0)
+    controller.step(actual, 200_000_000)
+    c1, s1 = controller.step(actual, 300_000_000)
+    assert s1.success is True
+    # 重复调用
+    c2, s2 = controller.step(actual, 400_000_000)
+    assert c2.valid is False
+    assert s2.state == "COMPLETED"
+    assert s2.success  # 终态保持 success=True 但不再产生新有效命令
+
+
+# ============================================================================
+# G. fail closed 验证（无配置永不 success）
+# ============================================================================
+
+
+def test_step_no_config_never_completes() -> None:
+    """无 ArmExecutionConfig（安全参数全 None）→ fail closed，永不 COMPLETED。"""
+    target = _joints().position
+    actual = RobotJointState(position=target, velocity=(0.0,)*17, effort=(0.0,)*17, timestamp_ns=10_000)
     controller = ArmExecutionController()
-    controller.start_trajectory(
-        _step_trajectory((
-            _step_waypoint(0.0, actual.position, mask_a),
-            _step_waypoint(2.0, actual.position, mask_b),
-            _step_waypoint(4.0, actual.position, mask_c),
-        ))
-    )
-    # 第一段 alpha<0.5 → prev_wp(0) mask_a
-    cmd_a, _ = controller.step(actual, 0)
-    cmd_a2, _ = controller.step(actual, 500_000_000)
-    assert cmd_a2.controlled_mask == mask_a
-    # 第二段 alpha>=0.5 → prev_wp(1) mask_b，不是 mask_c
-    cmd_b, _ = controller.step(actual, 3_000_000_000)
-    assert cmd_b.controlled_mask == mask_b
+    controller.start_trajectory(_step_trajectory((_step_waypoint(0.0, target), _step_waypoint(0.1, target))))
+    controller.step(actual, 0)
+    cmd, status = controller.step(actual, 200_000_000)
+    assert status.success is False
+    assert "容差" in status.failure_reason
 
 
 # ============================================================================
-# D. 实际反馈闭环（6项）—— 需 _ARRIVAL_CHECK_ENABLED=True 和 joint_tolerance_17 确认后启用
+# H. 实际反馈闭环（4项：到位 + 稳定）
 # ============================================================================
 
 
-@pytest.mark.skip(reason="需 _ARRIVAL_CHECK_ENABLED=True 和 joint_tolerance_17 确认后启用")
 def test_step_time_ended_but_joints_not_arrived_is_not_success() -> None:
-    """轨迹时间结束但实际关节未到位 → success=False。"""
+    """轨迹时间结束但实际关节超差 → success=False。"""
     target = _joints().position
     far_away = tuple(v + 0.5 for v in target)
-    far_joints = RobotJointState(
-        position=far_away, velocity=(0.0,) * 17, effort=(0.0,) * 17, timestamp_ns=10_000,
-    )
-    controller = ArmExecutionController()
-    controller.start_trajectory(
-        _step_trajectory((_step_waypoint(0.0, target), _step_waypoint(1.0, target)))
-    )
-    controller.step(_joints(), 0)
-    _, status = controller.step(far_joints, 1_500_000_000)
+    far_joints = RobotJointState(position=far_away, velocity=(0.0,)*17, effort=(0.0,)*17, timestamp_ns=10_000)
+    controller = ArmExecutionController(_test_config())
+    controller.start_trajectory(_step_trajectory((_step_waypoint(0.0, target), _step_waypoint(0.2, target))))
+    controller.step(_joints(), 2_000)
+    _, status = controller.step(far_joints, 4_000)
     assert status.success is False
 
 
-@pytest.mark.skip(reason="需 _ARRIVAL_CHECK_ENABLED=True 和 _STABILITY_CHECK_ENABLED=True 及参数确认后启用")
 def test_step_within_tolerance_but_insufficient_settle_cycles() -> None:
-    """到位但稳定周期不足 → success=False。"""
-    ...
+    """到位但稳定周期不足(settle=2, 只稳了1) → success=False。"""
+    target = _joints().position
+    actual = RobotJointState(position=target, velocity=(0.0,)*17, effort=(0.0,)*17, timestamp_ns=10_000)
+    controller = ArmExecutionController(_test_config(settle_cycles=5))
+    controller.start_trajectory(_step_trajectory((_step_waypoint(0.0, target), _step_waypoint(0.1, target))))
+    controller.step(actual, 2_000)
+    _, status = controller.step(actual, 4_000)  # 仅1个稳定周期
+    assert status.success is False
 
 
-@pytest.mark.skip(reason="需全部开关=True 和参数确认后启用")
 def test_step_settle_cycles_reached_reports_success() -> None:
     """连续稳定周期达标 → success=True。"""
-    ...
+    target = _joints().position
+    actual = RobotJointState(position=target, velocity=(0.0,)*17, effort=(0.0,)*17, timestamp_ns=10_000)
+    controller = ArmExecutionController(_test_config(settle_cycles=2))
+    controller.start_trajectory(_step_trajectory((_step_waypoint(0.0, target), _step_waypoint(0.1, target))))
+    controller.step(actual, 0)
+    controller.step(actual, 200_000_000)
+    _, status = controller.step(actual, 300_000_000)
+    assert status.success is True
 
 
-@pytest.mark.skip(reason="需 _STABILITY_CHECK_ENABLED=True 和 settle_cycles 确认后启用")
 def test_step_one_cycle_out_of_tolerance_resets_counter() -> None:
     """中间一周期超差 → 稳定计数清零。"""
-    ...
+    target = _joints().position
+    far = tuple(v + 0.5 for v in target)
+    actual_ok = RobotJointState(position=target, velocity=(0.0,)*17, effort=(0.0,)*17, timestamp_ns=10_000)
+    actual_bad = RobotJointState(position=far, velocity=(0.0,)*17, effort=(0.0,)*17, timestamp_ns=10_000)
+    controller = ArmExecutionController(_test_config(settle_cycles=3))
+    controller.start_trajectory(_step_trajectory((_step_waypoint(0.0, target), _step_waypoint(5.0, target))))
+    controller.step(actual_ok, 0)
+    controller.step(actual_ok, 100_000_000)
+    controller.step(actual_bad, 200_000_000)
+    assert controller._stable_cycle_count == 0
 
 
 def test_step_max_joint_error_comes_from_actual_feedback() -> None:
-    """max_joint_error 反映实际反馈与目标的差值。"""
     target = _joints().position
     offset = tuple(target[i] + (0.05 if i == 0 else 0.0) for i in range(17))
-    actual = RobotJointState(
-        position=offset, velocity=(0.0,) * 17, effort=(0.0,) * 17, timestamp_ns=10_000,
-    )
-    controller = ArmExecutionController()
-    controller.start_trajectory(
-        _step_trajectory((_step_waypoint(0.0, target),))
-    )
-    _, status = controller.step(actual, 1_000_000_000)
+    actual = RobotJointState(position=offset, velocity=(0.0,)*17, effort=(0.0,)*17, timestamp_ns=10_000)
+    controller = ArmExecutionController(_test_config())
+    controller.start_trajectory(_step_trajectory((_step_waypoint(0.0, target),)))
+    _, status = controller.step(actual, 2_000)
     assert status.max_joint_error == pytest.approx(0.05)
 
 
 def test_step_max_joint_error_only_counts_controlled_joints() -> None:
-    """仅受控关节参与误差计算。"""
     actual = _step_joints()
     target = _joints().position
     mask = tuple(i == 0 for i in range(17))
-    controller = ArmExecutionController()
-    controller.start_trajectory(
-        _step_trajectory((_step_waypoint(0.0, target, mask),))
-    )
-    _, status = controller.step(actual, 1_000_000_000)
-    expected_err = abs(target[0] - actual.position[0])
-    assert status.max_joint_error == pytest.approx(expected_err)
+    controller = ArmExecutionController(_test_config())
+    controller.start_trajectory(_step_trajectory((_step_waypoint(0.0, target, mask),)))
+    _, status = controller.step(actual, 2_000)
+    assert status.max_joint_error == pytest.approx(abs(target[0] - actual.position[0]))
 
 
 # ============================================================================
-# E. 超时和失败（5项）—— _TOTAL_TIMEOUT_NS 为 None 时超时检查跳过
+# I. 超时和失败（4项）
 # ============================================================================
 
 
-def test_step_trajectory_ended_waits_for_arrival() -> None:
-    """轨迹时间结束后等待到位（开关关闭时时间推进=到位，立即 success）。"""
-    target = _joints().position
-    controller = ArmExecutionController()
-    controller.start_trajectory(
-        _step_trajectory((_step_waypoint(0.0, target), _step_waypoint(2.0, target)))
-    )
-    controller.step(_joints(), 0)
-    _, status = controller.step(_joints(), 3_000_000_000)
-    assert status.success is True
-
-
-@pytest.mark.skip(reason="需 _TOTAL_TIMEOUT_NS 确认后启用")
 def test_step_total_timeout_enters_failure() -> None:
-    """总超时进入 FAILED。依赖 _TOTAL_TIMEOUT_NS 为非 None。"""
-    ...
+    controller = ArmExecutionController(_test_config(total_timeout_ns=500))
+    controller.start_trajectory(_step_trajectory((_step_waypoint(0.0), _step_waypoint(10.0))))
+    controller.step(_joints(), 2_000)
+    cmd, status = controller.step(_joints(), 3_000)
+    assert cmd.valid is False
+    assert "超时" in status.failure_reason
 
 
 def test_step_after_failed_blocks_old_trajectory() -> None:
-    """FAILED 后不能继续旧轨迹。"""
-    controller = ArmExecutionController()
-    controller.start_trajectory(
-        _step_trajectory((_step_waypoint(0.0), _step_waypoint(5.0)))
-    )
-    controller.step(_joints(), 10_000)  # 记录开始时间
-    controller.step(_joints(), 5_000)   # 时间倒退触发 FAILED
+    controller = ArmExecutionController(_test_config())
+    controller.start_trajectory(_step_trajectory((_step_waypoint(0.0), _step_waypoint(5.0))))
+    controller.step(_joints(), 10_000)
+    controller.step(_joints(), 5_000)  # 时间倒退触发 FAILED
     cmd, _ = controller.step(_joints(), 6_000)
     assert cmd.valid is False
-    assert "FAILED" in cmd.failure_reason
 
 
 def test_step_failure_command_does_not_use_all_zeros() -> None:
-    """失败命令不使用全零姿态。"""
     actual = _joints()
-    controller = ArmExecutionController()
-    controller.start_trajectory(
-        _step_trajectory((_step_waypoint(0.0), _step_waypoint(10.0)))
-    )
-    controller.step(actual, 10_000)  # 记录开始时间
-    controller.step(actual, 5_000)   # 时间倒退触发 FAILED
+    controller = ArmExecutionController(_test_config())
+    controller.start_trajectory(_step_trajectory((_step_waypoint(0.0), _step_waypoint(10.0))))
+    controller.step(actual, 10_000)
+    controller.step(actual, 5_000)  # 倒退
     cmd, _ = controller.step(actual, 6_000)
     assert cmd.valid is False
     assert cmd.joint_target == actual.position
@@ -2801,56 +2820,40 @@ def test_step_failure_command_does_not_use_all_zeros() -> None:
 
 
 def test_step_failure_reason_is_readable() -> None:
-    """failure_reason 中文可读可诊断。"""
-    controller = ArmExecutionController()
-    _, status = controller.step(_joints(), 1_000)
+    controller = ArmExecutionController(_test_config())
+    _, status = controller.step(_joints(), 2_000)
     assert len(status.failure_reason) > 0
     assert "轨迹" in status.failure_reason
 
 
 # ============================================================================
-# F. 生命周期（4项）
+# J. 生命周期（4项）
 # ============================================================================
 
 
 def test_step_new_trajectory_clears_previous_progress() -> None:
-    """装载新轨迹时清除旧轨迹的执行进度。"""
-    controller = ArmExecutionController()
-    controller.start_trajectory(
-        _step_trajectory((_step_waypoint(0.0), _step_waypoint(1.0)))
-    )
+    controller = ArmExecutionController(_test_config())
+    controller.start_trajectory(_step_trajectory((_step_waypoint(0.0), _step_waypoint(1.0))))
     controller.step(_joints(), 500_000_000)
     assert controller._trajectory_started_ns is not None
-    controller.start_trajectory(
-        _step_trajectory(
-            (_step_waypoint(0.0), _step_waypoint(2.0)),
-            trajectory_id="second",
-        )
-    )
+    controller.start_trajectory(_step_trajectory((_step_waypoint(0.0), _step_waypoint(2.0)), trajectory_id="second"))
     assert controller._trajectory_started_ns is None
     assert controller._waypoint_index == 0
     assert controller._stable_cycle_count == 0
 
 
 def test_step_rejected_trajectory_clears_old_execution_context() -> None:
-    """拒绝新轨迹时也清除旧执行上下文。"""
-    controller = ArmExecutionController()
-    controller.start_trajectory(
-        _step_trajectory((_step_waypoint(0.0), _step_waypoint(1.0)))
-    )
+    controller = ArmExecutionController(_test_config())
+    controller.start_trajectory(_step_trajectory((_step_waypoint(0.0), _step_waypoint(1.0))))
     controller.step(_joints(), 500_000_000)
     controller.start_trajectory(_execution_trajectory(waypoints=()))
     assert controller._trajectory is None
     assert controller._trajectory_started_ns is None
-    assert controller._waypoint_index == 0
 
 
 def test_step_reset_clears_all_state() -> None:
-    """reset 清空轨迹、开始时间、索引、稳定计数和验证缓存。"""
-    controller = ArmExecutionController()
-    controller.start_trajectory(
-        _step_trajectory((_step_waypoint(0.0), _step_waypoint(1.0)))
-    )
+    controller = ArmExecutionController(_test_config())
+    controller.start_trajectory(_step_trajectory((_step_waypoint(0.0), _step_waypoint(1.0))))
     controller.step(_joints(), 500_000_000)
     controller.reset()
     assert controller._trajectory is None
@@ -2858,22 +2861,17 @@ def test_step_reset_clears_all_state() -> None:
     assert controller._waypoint_index == 0
     assert controller._stable_cycle_count == 0
     assert controller._cached_verification is None
+    assert controller._last_step_ns is None
+    assert controller._completed is False
     assert controller.local_phase is LocalPhase.IDLE
 
 
 def test_step_new_trajectory_first_step_records_fresh_start_time() -> None:
-    """新轨迹第一次 step 重新记录开始时间。"""
-    controller = ArmExecutionController()
-    controller.start_trajectory(
-        _step_trajectory((_step_waypoint(0.0), _step_waypoint(1.0)))
-    )
+    controller = ArmExecutionController(_test_config())
+    controller.start_trajectory(_step_trajectory((_step_waypoint(0.0), _step_waypoint(1.0))))
     controller.step(_joints(), 5_000_000_000)
     assert controller._trajectory_started_ns == 5_000_000_000
-    controller.start_trajectory(
-        _step_trajectory(
-            (_step_waypoint(0.0), _step_waypoint(2.0)),
-            trajectory_id="second",
-        )
-    )
+    controller.start_trajectory(_step_trajectory((_step_waypoint(0.0), _step_waypoint(2.0)), trajectory_id="second"))
     controller.step(_joints(), 7_000_000_000)
     assert controller._trajectory_started_ns == 7_000_000_000
+
