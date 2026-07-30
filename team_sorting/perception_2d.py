@@ -15,7 +15,7 @@ RGBFrame（ROS 消息转换后的彩色帧）
   → 原始字典检测（每个 dict 含 class/x/y/w/h/conf，中心宽高格式）
   → 合法性检查（类别过滤、置信度阈值、NaN/Inf 拒绝、宽高正数检查、越界裁剪）
   → Detection2D（团队统一二维框，bbox_xyxy 为 RGB 像素坐标）
-  → 可供后续 ROS 薄接线调用的多帧稳定器（当前尚未接入 PerceptionNode）
+  → ROS 薄接线调用的多帧稳定器（输出稳定 track_id）
   → perception_3d（结合深度和内参做三维反投影）
 """
 
@@ -344,6 +344,7 @@ class OfficialYoloAdapter:
                     bbox_xyxy=(x0, y0, x1, y1),
                     confidence=confidence,
                     timestamp_ns=rgb.timestamp_ns,
+                    frame_id=rgb.frame_id,
                 )
             )
 
@@ -389,7 +390,10 @@ class _DetectionTrack:
 
     track_id: int
     class_id: str
+    frame_id: str
     bbox_xyxy: tuple[float, float, float, float]
+    observed_bbox_xyxy: tuple[float, float, float, float]
+    velocity_xy_per_ns: tuple[float, float]
     confidence: float
     last_timestamp_ns: int
     hit_count: int
@@ -447,6 +451,8 @@ def _normalized_detection(detection: Any) -> Optional[Detection2D]:
     timestamp_ns = _detection_timestamp(detection.timestamp_ns)
     if timestamp_ns is None:
         return None
+    if not isinstance(detection.frame_id, str):
+        return None
 
     bbox = detection.bbox_xyxy
     if isinstance(bbox, (str, bytes)):
@@ -485,6 +491,7 @@ def _normalized_detection(detection: Any) -> Optional[Detection2D]:
         bbox_xyxy=(x0, y0, x1, y1),
         confidence=confidence,
         timestamp_ns=timestamp_ns,
+        frame_id=detection.frame_id,
     )
 
 
@@ -514,22 +521,56 @@ def _bbox_iou(
     return score if math.isfinite(score) else 0.0
 
 
+def _bbox_center(
+    bbox_xyxy: tuple[float, float, float, float],
+) -> tuple[float, float]:
+    return (
+        (bbox_xyxy[0] + bbox_xyxy[2]) / 2.0,
+        (bbox_xyxy[1] + bbox_xyxy[3]) / 2.0,
+    )
+
+
+def _predicted_bbox(
+    track: _DetectionTrack,
+    timestamp_ns: int,
+) -> tuple[float, float, float, float]:
+    """按最近两次原始观测的中心速度预测当前框，避免交叉时按位置换ID。"""
+
+    delta_ns = timestamp_ns - track.last_timestamp_ns
+    if delta_ns <= 0:
+        return track.observed_bbox_xyxy
+    offset_x = track.velocity_xy_per_ns[0] * delta_ns
+    offset_y = track.velocity_xy_per_ns[1] * delta_ns
+    predicted = (
+        track.observed_bbox_xyxy[0] + offset_x,
+        track.observed_bbox_xyxy[1] + offset_y,
+        track.observed_bbox_xyxy[2] + offset_x,
+        track.observed_bbox_xyxy[3] + offset_y,
+    )
+    if not all(math.isfinite(value) for value in predicted):
+        return track.observed_bbox_xyxy
+    return predicted
+
+
 class Detection2DStabilizer:
     """轻量、确定的二维多目标多帧稳定器。
 
-    每次 ``update`` 视为处理一帧检测：只允许同类别轨迹按 IoU 做贪心一对一关联；
-    新轨迹连续命中 ``min_confirmed_hits`` 次后才输出，匹配框和置信度分别使用 EMA
-    平滑。当前帧未匹配的轨迹只保留在实例内部，超过 ``max_missed_frames`` 后删除，
-    丢失帧不会重复输出旧检测。
+    每次 ``update`` 视为处理一帧检测：只允许同类别、同 frame 轨迹按最近观测速度
+    预测框与当前框的 IoU 做确定的一对一关联。预测框避免两个目标交叉时让轨迹身份
+    简单跟随当前位置交换；新轨迹连续命中 ``min_confirmed_hits`` 次后才输出，匹配框
+    和置信度分别使用 EMA 平滑。当前帧未匹配的轨迹只保留在实例内部，超过
+    ``max_missed_frames`` 后删除，丢失帧不会重复输出旧检测。
 
     非空输入中，合法检测应来自同一 RGB 帧并具有同一纳秒时间戳；防御性处理混合
     时间戳时只采用其中最新的合法检测组。该时间戳若不严格晚于最近已处理的非空帧，
-    整次更新会被视为乱序/重复帧：不修改轨迹、不增加丢失计数并返回空元组。空输入
-    没有可用时间戳，因此只增加丢失计数，不修改最近处理时间。
+    整次更新会被视为乱序/重复帧：不修改轨迹、不增加丢失计数并返回空元组。ROS
+    接线必须通过 ``frame_timestamp_ns``/``frame_id`` 传入当前 RGB 上下文，使空检测
+    帧同样能执行时序检查；兼容调用若不给空帧时间，则只增加一次丢失计数。
 
     输入和输出均为 ``tuple[Detection2D, ...]``，bbox 始终是 RGB 像素坐标
-    ``(x0,y0,x1,y1)``。内部轨迹编号不会写入公共字段。调用 ``reset`` 可恢复到刚
-    构造的状态。
+    ``(x0,y0,x1,y1)``。确认后的输出把实例内非负轨迹编号写入
+    ``Detection2D.track_id``，并保留 RGB ``frame_id``，供三维估计维持同类多目标
+    的稳定身份。调用 ``reset`` 可恢复到刚构造的状态。
     """
 
     def __init__(
@@ -572,12 +613,29 @@ class Detection2DStabilizer:
         self._next_track_id = 0
         self._last_timestamp_ns = None
 
-    def update(self, detections: tuple[Detection2D, ...]) -> tuple[Detection2D, ...]:
+    def update(
+        self,
+        detections: tuple[Detection2D, ...],
+        *,
+        frame_timestamp_ns: Optional[int] = None,
+        frame_id: Optional[str] = None,
+    ) -> tuple[Detection2D, ...]:
         """关联并平滑当前帧检测，只返回本帧实际匹配且已确认的目标。
 
         无效检测会逐条忽略。空帧会让现有轨迹增加一次丢失，但返回空元组；乱序或
-        重复的非空帧则完全不改变状态。输出时间戳始终来自本帧实际检测，不做平均。
+        重复帧则完全不改变状态。节点接线应始终传入 RGB 帧时间与 frame，使空帧也
+        具有明确上下文。输出时间戳始终来自本帧实际检测，不做平均。
         """
+
+        explicit_timestamp_ns: Optional[int] = None
+        if frame_timestamp_ns is not None:
+            explicit_timestamp_ns = _detection_timestamp(frame_timestamp_ns)
+            if explicit_timestamp_ns is None:
+                raise ValueError("frame_timestamp_ns 必须是非负整数纳秒")
+        if frame_id is not None and (
+            not isinstance(frame_id, str) or not frame_id.strip()
+        ):
+            raise ValueError("frame_id 必须是非空字符串或None")
 
         normalized = tuple(
             item
@@ -585,12 +643,27 @@ class Detection2DStabilizer:
             if (item := _normalized_detection(detection)) is not None
         )
 
-        if normalized:
+        if explicit_timestamp_ns is not None:
+            mismatched = tuple(
+                item
+                for item in normalized
+                if item.timestamp_ns != explicit_timestamp_ns
+                or (frame_id is not None and item.frame_id != frame_id)
+            )
+            if mismatched:
+                raise ValueError(
+                    "Detection2D 与显式 RGB 帧的 timestamp/frame不一致"
+                )
+            current = normalized
+            current_timestamp_ns = explicit_timestamp_ns
+        elif normalized:
             # OfficialYoloAdapter 会给同帧所有框相同时间；若上游违反该约定，只处理
             # 最新一组，避免较旧检测让某条轨迹的时间倒退。
-            frame_timestamp_ns = max(item.timestamp_ns for item in normalized)
+            current_timestamp_ns = max(item.timestamp_ns for item in normalized)
             current = tuple(
-                item for item in normalized if item.timestamp_ns == frame_timestamp_ns
+                item
+                for item in normalized
+                if item.timestamp_ns == current_timestamp_ns
             )
         else:
             # 即使检测的类别、框或置信度无效，只要它携带合法帧时间，就仍可判断这
@@ -604,15 +677,15 @@ class Detection2DStabilizer:
             if not timestamps:
                 self._mark_tracks_missed(set(self._tracks))
                 return ()
-            frame_timestamp_ns = max(timestamps)
+            current_timestamp_ns = max(timestamps)
             current = ()
 
         if (
             self._last_timestamp_ns is not None
-            and frame_timestamp_ns <= self._last_timestamp_ns
+            and current_timestamp_ns <= self._last_timestamp_ns
         ):
             return ()
-        self._last_timestamp_ns = frame_timestamp_ns
+        self._last_timestamp_ns = current_timestamp_ns
 
         # 先按类别和几何排序，避免后端输出顺序影响相同输入集合的关联结果。
         class_order = {
@@ -635,7 +708,18 @@ class Detection2DStabilizer:
             for detection_index, detection in enumerate(ordered):
                 if track.class_id != detection.class_id:
                     continue
-                score = _bbox_iou(track.bbox_xyxy, detection.bbox_xyxy)
+                if track.frame_id != detection.frame_id:
+                    continue
+                score = max(
+                    _bbox_iou(
+                        _predicted_bbox(track, current_timestamp_ns),
+                        detection.bbox_xyxy,
+                    ),
+                    _bbox_iou(
+                        track.observed_bbox_xyxy,
+                        detection.bbox_xyxy,
+                    ),
+                )
                 # 即使调用者把阈值设为 0，也不能把完全无重叠的远目标合并。
                 if score > 0.0 and score >= self.iou_match_threshold:
                     candidates.append((score, track_id, detection_index))
@@ -677,6 +761,8 @@ class Detection2DStabilizer:
                     timestamp_ns=track.last_timestamp_ns,
                     valid=True,
                     failure_reason="",
+                    frame_id=track.frame_id,
+                    track_id=track.track_id,
                 ),
             )
             for track_id in matched_track_ids
@@ -698,7 +784,10 @@ class Detection2DStabilizer:
         track = _DetectionTrack(
             track_id=self._next_track_id,
             class_id=detection.class_id,
+            frame_id=detection.frame_id,
             bbox_xyxy=detection.bbox_xyxy,
+            observed_bbox_xyxy=detection.bbox_xyxy,
+            velocity_xy_per_ns=(0.0, 0.0),
             confidence=detection.confidence,
             last_timestamp_ns=detection.timestamp_ns,
             hit_count=1,
@@ -733,7 +822,21 @@ class Detection2DStabilizer:
         if not math.isfinite(smoothed_confidence):
             return False
 
+        previous_center = _bbox_center(track.observed_bbox_xyxy)
+        current_center = _bbox_center(detection.bbox_xyxy)
+        delta_ns = detection.timestamp_ns - track.last_timestamp_ns
+        if delta_ns <= 0:
+            return False
+        velocity_xy_per_ns = (
+            (current_center[0] - previous_center[0]) / delta_ns,
+            (current_center[1] - previous_center[1]) / delta_ns,
+        )
+        if not all(math.isfinite(value) for value in velocity_xy_per_ns):
+            return False
+
         track.bbox_xyxy = (x0, y0, x1, y1)
+        track.observed_bbox_xyxy = detection.bbox_xyxy
+        track.velocity_xy_per_ns = velocity_xy_per_ns
         track.confidence = min(1.0, max(0.0, smoothed_confidence))
         track.last_timestamp_ns = detection.timestamp_ns
         track.hit_count += 1

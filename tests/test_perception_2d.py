@@ -135,6 +135,8 @@ def _make_detection(
     confidence: float = 0.8,
     timestamp_ns: int = 100,
     valid: bool = True,
+    frame_id: str = "camera_optical_frame",
+    track_id: Optional[int] = None,
 ) -> Detection2D:
     """构造稳定器输入；测试可显式覆盖字段来验证防御性过滤。"""
 
@@ -145,6 +147,8 @@ def _make_detection(
         timestamp_ns=timestamp_ns,
         valid=valid,
         failure_reason="" if valid else "上游检测无效",
+        frame_id=frame_id,
+        track_id=track_id,
     )
 
 
@@ -206,9 +210,9 @@ def test_self_check_searches_examples_material_sorting_paths(tmp_path: Path) -> 
     ):
         adapter.self_check()
 
-    searched_str = " ".join(adapter._searched)
+    searched_str = " ".join(adapter._searched).replace("\\", "/")
     assert "examples/material_sorting/perception" in searched_str
-    assert str(checkpoint) in searched_str
+    assert str(checkpoint).replace("\\", "/") in searched_str
     fake_module.YoloBackend.assert_called_once_with(str(checkpoint), conf_thresh=0.65)
     assert adapter._backend is fake_module.YoloBackend.return_value
 
@@ -230,9 +234,8 @@ def test_resolve_checkpoint_searches_standard_layouts(tmp_path: Path) -> None:
     result = adapter._resolve_checkpoint("", [tmp_path])
     assert result is not None
     assert result.name == "material_box.pt"
-    assert "material_sorting/perception/checkpoints" in str(result).replace(
-        str(tmp_path), ""
-    )
+    relative_result = str(result).replace(str(tmp_path), "").replace("\\", "/")
+    assert "material_sorting/perception/checkpoints" in relative_result
 
 
 def test_resolve_checkpoint_direct_path_takes_priority(tmp_path: Path) -> None:
@@ -299,6 +302,8 @@ def test_detect_converts_center_wh_to_xyxy() -> None:
     assert det.class_id == "pink"
     assert det.bbox_xyxy == (280.0, 190.0, 360.0, 290.0)
     assert det.confidence == 0.85
+    assert det.frame_id == "camera_optical_frame"
+    assert det.track_id is None
     assert det.valid
 
 
@@ -570,8 +575,23 @@ def test_stabilizer_requires_consecutive_confirmation_and_preserves_contract() -
     assert output is not second
     assert output.class_id == "pink"
     assert output.timestamp_ns == 200
+    assert output.frame_id == "camera_optical_frame"
+    assert isinstance(output.track_id, int)
+    assert not isinstance(output.track_id, bool)
+    assert output.track_id >= 0
     assert output.valid is True
     assert output.failure_reason == ""
+
+    third = _make_detection(
+        bbox_xyxy=(14.0, 20.0, 34.0, 40.0),
+        confidence=0.7,
+        timestamp_ns=300,
+    )
+    continued = stabilizer.update((third,))
+
+    assert len(continued) == 1
+    assert continued[0].frame_id == "camera_optical_frame"
+    assert continued[0].track_id == output.track_id
 
 
 def test_stabilizer_smooths_bbox_and_confidence_with_ema() -> None:
@@ -714,6 +734,61 @@ def test_stabilizer_keeps_far_same_class_targets_separate() -> None:
     assert result[1].bbox_xyxy[0] > 90.0
 
 
+def test_stabilizer_motion_prediction_preserves_ids_through_crossing() -> None:
+    """同类目标交叉时，ID应沿运动方向前进，不能简单跟随当前位置交换。"""
+
+    stabilizer = Detection2DStabilizer(
+        min_confirmed_hits=1,
+        iou_match_threshold=0.3,
+        bbox_smoothing_alpha=1.0,
+    )
+    first = stabilizer.update(
+        (
+            _make_detection(
+                bbox_xyxy=(10.0, 0.0, 30.0, 20.0),
+                timestamp_ns=100,
+            ),
+            _make_detection(
+                bbox_xyxy=(30.0, 0.0, 50.0, 20.0),
+                timestamp_ns=100,
+            ),
+        )
+    )
+    second = stabilizer.update(
+        (
+            _make_detection(
+                bbox_xyxy=(18.0, 0.0, 38.0, 20.0),
+                timestamp_ns=200,
+            ),
+            _make_detection(
+                bbox_xyxy=(22.0, 0.0, 42.0, 20.0),
+                timestamp_ns=200,
+            ),
+        )
+    )
+    crossed = stabilizer.update(
+        (
+            # 原右侧目标继续向左，故意先给出以打乱后端顺序。
+            _make_detection(
+                bbox_xyxy=(14.0, 0.0, 34.0, 20.0),
+                timestamp_ns=300,
+            ),
+            # 原左侧目标继续向右。
+            _make_detection(
+                bbox_xyxy=(26.0, 0.0, 46.0, 20.0),
+                timestamp_ns=300,
+            ),
+        )
+    )
+
+    assert len(first) == len(second) == len(crossed) == 2
+    initial_left_id = min(first, key=lambda item: item.bbox_xyxy[0]).track_id
+    initial_right_id = max(first, key=lambda item: item.bbox_xyxy[0]).track_id
+    crossed_by_id = {item.track_id: item for item in crossed}
+    assert crossed_by_id[initial_left_id].bbox_xyxy[0] == pytest.approx(26.0)
+    assert crossed_by_id[initial_right_id].bbox_xyxy[0] == pytest.approx(14.0)
+
+
 def test_stabilizer_matches_each_detection_to_at_most_one_track() -> None:
     """一个同时覆盖两条同类轨迹的框，本帧也只能更新并输出其中一条。"""
 
@@ -796,6 +871,60 @@ def test_stabilizer_rejects_out_of_order_and_duplicate_timestamps_transactionall
     )
     assert current[0].bbox_xyxy == pytest.approx((2.5, 0.0, 12.5, 10.0))
     assert current[0].timestamp_ns == 300
+
+
+def test_stabilizer_explicit_empty_frame_context_rejects_stale_miss_counts() -> None:
+    """重复/倒序空帧不能重复计miss并提前删除仍可恢复的稳定轨迹。"""
+
+    stabilizer = Detection2DStabilizer(
+        min_confirmed_hits=1,
+        max_missed_frames=1,
+    )
+    first = stabilizer.update(
+        (_make_detection(timestamp_ns=100),),
+        frame_timestamp_ns=100,
+        frame_id="camera_optical_frame",
+    )[0]
+    assert stabilizer.update(
+        (),
+        frame_timestamp_ns=200,
+        frame_id="camera_optical_frame",
+    ) == ()
+    assert stabilizer.update(
+        (),
+        frame_timestamp_ns=200,
+        frame_id="camera_optical_frame",
+    ) == ()
+    assert stabilizer.update(
+        (),
+        frame_timestamp_ns=150,
+        frame_id="camera_optical_frame",
+    ) == ()
+    recovered = stabilizer.update(
+        (_make_detection(timestamp_ns=300),),
+        frame_timestamp_ns=300,
+        frame_id="camera_optical_frame",
+    )
+
+    assert len(recovered) == 1
+    assert recovered[0].track_id == first.track_id
+
+
+def test_stabilizer_rejects_explicit_rgb_context_mismatch() -> None:
+    stabilizer = Detection2DStabilizer()
+
+    with pytest.raises(ValueError, match="timestamp/frame不一致"):
+        stabilizer.update(
+            (_make_detection(timestamp_ns=100),),
+            frame_timestamp_ns=101,
+            frame_id="camera_optical_frame",
+        )
+    with pytest.raises(ValueError, match="timestamp/frame不一致"):
+        stabilizer.update(
+            (_make_detection(timestamp_ns=100),),
+            frame_timestamp_ns=100,
+            frame_id="other_camera",
+        )
 
 
 def test_stabilizer_reset_clears_tracks_misses_and_timestamp_history() -> None:
