@@ -48,6 +48,7 @@ from team_sorting.interfaces import (
 )
 from team_sorting.navigation import (
     Bounds3D,
+    NavigationConfig,
     NavigationController,
     classify_slot_type,
     distance_xy,
@@ -366,35 +367,236 @@ def test_slot_classification_boundaries_invalid_points_and_overlap_policy() -> N
 
 
 # ---------------------------------------------------------------------------
-# NavigationController临时未实现约束
+# NavigationController站位和闭环控制
 # ---------------------------------------------------------------------------
 
-# 当前作用：防止站位和导航算法尚未实现时返回空值、零值或伪成功。
-# TODO(navigation-implementation)：三个生产方法真正实现时，必须在同一提交中把本组替换
-# 为抓取停车目标、放置停车目标、距离与航向控制、到达判定、TTL、超时和无效Odom测试；
-# 在生产方法仍未实现时不得删除本组。
-def test_navigation_controller_methods_remain_explicitly_unimplemented() -> None:
-    controller = NavigationController()
-    task = TaskSpec(
-        task_id=1,
-        instruction="move the pink box",
-        target_kind="box",
-        target_body="box_body",
-        target_color="pink",
-        place_type="point",
-        place_world_xyz=(1.0, 2.0, 0.5),
-        place_radius=0.1,
+def _nav_base(
+    x: float = 0.0,
+    y: float = 0.0,
+    yaw: float = 0.0,
+    *,
+    frame: str = "odom",
+    stamp: int = 1_000_000_000,
+    valid: bool = True,
+) -> BaseState:
+    return BaseState(
+        (x, y, 0.0),
+        (0.0, 0.0, math.sin(yaw / 2.0), math.cos(yaw / 2.0)),
+        yaw,
+        (0.0, 0.0, 0.0),
+        (0.0, 0.0, 0.0),
+        frame,
+        stamp,
+        valid,
     )
-    target = ObjectEstimate3D("pink", (0.5, 0.0, 0.8), 0.9, "odom", 100)
-    base = _base()
-    goal = NavGoal("pick-1", "pick", (0.4, 0.0, 0.0), "odom", 0.05, 0.1, 1_000)
 
-    with pytest.raises(NotImplementedError, match="底盘2负责人"):
-        controller.build_pick_goal(task, target, base, 100)
-    with pytest.raises(NotImplementedError, match="底盘2负责人"):
-        controller.build_place_goal(task, base, 100)
-    with pytest.raises(NotImplementedError, match="底盘2负责人"):
-        controller.update(base, goal, 100)
+
+def _nav_task(place: tuple[float, float, float] = (2.0, 0.0, 0.5)) -> TaskSpec:
+    return TaskSpec(1, "move box", "box", "box_body", "pink", "point", place, 0.1)
+
+
+def _nav_goal(
+    x: float,
+    y: float,
+    yaw: float,
+    *,
+    deadline: int = 2_000_000_000,
+    frame: str = "odom",
+    valid: bool = True,
+) -> NavGoal:
+    return NavGoal("goal", "pick", (x, y, yaw), frame, 0.05, 0.1, deadline, valid)
+
+
+def test_navigation_pick_goal_stands_off_and_faces_object() -> None:
+    controller = NavigationController()
+    target = ObjectEstimate3D("pink", (2.0, 0.0, 0.8), 0.9, "odom", 1_000_000_000)
+    goal = controller.build_pick_goal(_nav_task(), target, _nav_base(), 1_000_000_000)
+    assert goal.pose_xyyaw[:2] != pytest.approx(target.position_xyz[:2])
+    assert distance_xy(goal.pose_xyyaw, target.position_xyz) == pytest.approx(0.6)
+    assert goal.pose_xyyaw[2] == pytest.approx(
+        math.atan2(
+            target.position_xyz[1] - goal.pose_xyyaw[1],
+            target.position_xyz[0] - goal.pose_xyyaw[0],
+        )
+    )
+
+
+@pytest.mark.parametrize("bad_x", [math.nan, math.inf])
+def test_navigation_pick_goal_rejects_invalid_coordinates_and_frame(bad_x: float) -> None:
+    controller = NavigationController()
+    with pytest.raises(ValueError):
+        controller.build_pick_goal(
+            _nav_task(),
+            ObjectEstimate3D("pink", (bad_x, 0.0, 0.8), 0.9, "odom", 1_000_000_000),
+            _nav_base(),
+            1_000_000_000,
+        )
+    with pytest.raises(ValueError, match="frame"):
+        controller.build_pick_goal(
+            _nav_task(),
+            ObjectEstimate3D("pink", (2.0, 0.0, 0.8), 0.9, "base_link", 1_000_000_000),
+            _nav_base(),
+            1_000_000_000,
+        )
+
+
+def test_navigation_place_goal_requires_approved_world_to_planning_transform() -> None:
+    controller = NavigationController()
+    task = _nav_task()
+    with pytest.raises(NotImplementedError, match="world→planning"):
+        controller.build_place_goal(task, _nav_base(frame="odom"), 1_000_000_000)
+    with pytest.raises(NotImplementedError, match="world→planning"):
+        controller.build_place_goal(
+            task, _nav_base(frame="world"), 1_000_000_000
+        )
+    with pytest.raises(ValueError):
+        controller.build_place_goal(
+            _nav_task((math.nan, 0.0, 0.5)),
+            _nav_base(frame="world"),
+            1_000_000_000,
+        )
+
+
+def test_navigation_goal_generation_rejects_stale_base_and_target_at_boundary() -> None:
+    config = NavigationConfig(odom_max_age_ns=100, target_max_age_ns=100)
+    controller = NavigationController(config)
+    task = _nav_task()
+    target_at_boundary = ObjectEstimate3D(
+        "pink", (2.0, 0.0, 0.8), 0.9, "odom", 900
+    )
+    controller.build_pick_goal(
+        task, target_at_boundary, _nav_base(stamp=900), 1_000
+    )
+    with pytest.raises(ValueError, match="Odom 已过期"):
+        controller.build_pick_goal(
+            task, target_at_boundary, _nav_base(stamp=899), 1_000
+        )
+    with pytest.raises(ValueError, match="ObjectEstimate3D 已过期"):
+        controller.build_pick_goal(
+            task,
+            ObjectEstimate3D("pink", (2.0, 0.0, 0.8), 0.9, "odom", 899),
+            _nav_base(stamp=900),
+            1_000,
+        )
+
+
+def test_navigation_config_is_injected_and_validated() -> None:
+    config = NavigationConfig(max_abs_v_mps=0.1, max_abs_w_radps=0.2)
+    command, _ = NavigationController(config).update(
+        _nav_base(), _nav_goal(1.0, 1.0, 0.0), 1_000_000_000
+    )
+    assert abs(command.v) <= 0.1
+    assert abs(command.w) <= 0.2
+    with pytest.raises(ValueError, match="standoff_m"):
+        NavigationConfig(standoff_m=math.nan)
+
+
+@pytest.mark.parametrize(
+    ("goal", "expected_w_sign"),
+    [
+        (_nav_goal(1.0, 0.0, 0.0), 0),
+        (_nav_goal(1.0, 1.0, 0.0), 1),
+        (_nav_goal(1.0, -1.0, 0.0), -1),
+    ],
+)
+def test_navigation_update_steers_toward_goal(
+    goal: NavGoal, expected_w_sign: int
+) -> None:
+    command, status = NavigationController().update(
+        _nav_base(), goal, 1_000_000_000
+    )
+    assert not status.success
+    assert command.v >= 0.0
+    assert (command.w > 0) - (command.w < 0) == expected_w_sign
+    assert abs(command.v) <= 0.25
+    assert abs(command.w) <= 0.5
+
+
+def test_navigation_update_wraps_heading_and_gates_large_error() -> None:
+    base = _nav_base(yaw=math.pi - 0.05)
+    goal = _nav_goal(-1.0, -0.01, -math.pi + 0.05)
+    command, _ = NavigationController().update(base, goal, 1_000_000_000)
+    assert abs(command.w) < 0.2
+    side_command, _ = NavigationController().update(
+        _nav_base(), _nav_goal(0.0, 1.0, 0.0), 1_000_000_000
+    )
+    assert side_command.v == 0.0
+    assert side_command.w > 0.0
+
+
+def test_navigation_update_slows_near_goal_and_requires_final_yaw() -> None:
+    controller = NavigationController()
+    far, far_status = controller.update(
+        _nav_base(), _nav_goal(1.0, 0.0, 0.0), 1_000_000_000
+    )
+    near, near_status = controller.update(
+        _nav_base(), _nav_goal(0.1, 0.0, 0.0), 1_000_000_000
+    )
+    assert 0.0 < near.v < far.v
+    assert not far_status.success and not near_status.success
+    align, align_status = controller.update(
+        _nav_base(), _nav_goal(0.01, 0.0, 0.5), 1_000_000_000
+    )
+    assert align.v == 0.0 and align.w > 0.0
+    assert not align_status.success
+    arrived, arrived_status = controller.update(
+        _nav_base(), _nav_goal(0.01, 0.0, 0.05), 1_000_000_000
+    )
+    assert (arrived.v, arrived.w) == (0.0, 0.0)
+    assert arrived_status.success
+
+
+def test_navigation_update_safely_stops_on_timeout_invalid_and_stale_odom() -> None:
+    controller = NavigationController()
+    cases = (
+        (_nav_base(), _nav_goal(1.0, 0.0, 0.0, deadline=999_999_999)),
+        (_nav_base(valid=False), _nav_goal(1.0, 0.0, 0.0)),
+        (_nav_base(stamp=800_000_000), _nav_goal(1.0, 0.0, 0.0)),
+        (_nav_base(), _nav_goal(math.nan, 0.0, 0.0)),
+        (_nav_base(), _nav_goal(1.0, 0.0, 0.0, frame="world")),
+    )
+    for base, goal in cases:
+        command, status = controller.update(base, goal, 1_000_000_000)
+        assert (command.v, command.w) == (0.0, 0.0)
+        assert not status.success
+        assert status.failure_reason
+
+
+def test_navigation_deadline_is_exclusive_and_stops_at_equal_timestamp() -> None:
+    command, status = NavigationController().update(
+        _nav_base(),
+        _nav_goal(1.0, 0.0, 0.0, deadline=1_000_000_000),
+        1_000_000_000,
+    )
+    assert (command.v, command.w) == (0.0, 0.0)
+    assert not command.valid
+    assert status.state == "timeout"
+    assert not status.success
+
+
+def test_navigation_fails_closed_when_finite_arithmetic_overflows() -> None:
+    controller = NavigationController()
+    with pytest.raises(ValueError):
+        controller.build_pick_goal(
+            _nav_task(),
+            ObjectEstimate3D(
+                "pink", (1e308, 0.0, 0.8), 0.9, "odom", 1_000_000_000
+            ),
+            _nav_base(x=-1e308),
+            1_000_000_000,
+        )
+
+    command, status = controller.update(
+        _nav_base(x=-1e308),
+        _nav_goal(1e308, 0.0, 0.0),
+        1_000_000_000,
+    )
+    assert (command.v, command.w) == (0.0, 0.0)
+    assert not command.valid
+    assert not status.success
+    assert status.failure_reason
+    assert math.isfinite(status.distance_error)
+    assert math.isfinite(status.yaw_error)
 
 
 # ---------------------------------------------------------------------------
