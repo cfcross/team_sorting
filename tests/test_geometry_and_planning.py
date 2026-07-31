@@ -35,6 +35,7 @@ import pytest
 import yaml
 
 import team_sorting.perception_3d as perception_3d_module
+import team_sorting.arm_planning as arm_planning_module
 from team_sorting.arm_planning import ArmPlanner, OfficialKDLAdapter, _pose_to_matrix
 from team_sorting.interfaces import (
     ArmPlanningConfig,
@@ -45,6 +46,8 @@ from team_sorting.interfaces import (
     DepthFrame,
     GraspContext,
     GraspTarget,
+    GlobalPhase,
+    IKResult,
     NavGoal,
     ObjectEstimate3D,
     PlaceTarget,
@@ -632,8 +635,6 @@ def test_navigation_fails_closed_when_finite_arithmetic_overflows() -> None:
 # 延迟依赖导入烟雾测试
 # ---------------------------------------------------------------------------
 
-# 其中plan_grasp异常是临时防伪成功约束。ArmPlanner实现时，应在同一提交中把本测试
-# 收窄为“构造与延迟导入不加载官方依赖”，具体规划行为由末尾ArmPlanner分区验证。
 def test_projection_and_delayed_adapters_import_without_official_environment() -> None:
     intrinsics = _intrinsics()
     assert project_pixel_to_camera(320.0, 240.0, 2.0, intrinsics) == pytest.approx(
@@ -642,10 +643,8 @@ def test_projection_and_delayed_adapters_import_without_official_environment() -
 
     adapters = (OfficialYoloAdapter(), CameraTransformProvider(), OfficialKDLAdapter())
     assert all(adapter is not None for adapter in adapters)
-    with pytest.raises(NotImplementedError, match="机械臂1负责人"):
-            ArmPlanner(OfficialKDLAdapter(), ArmPlanningConfig()).plan_grasp(
-                None, None, None, None, None, 0  # type: ignore[arg-type]
-            )
+    planner = ArmPlanner(adapters[-1], ArmPlanningConfig())
+    assert planner._ik_adapter is adapters[-1]
 
 
 # ---------------------------------------------------------------------------
@@ -3428,32 +3427,793 @@ def test_ros_rejects_partial_zero_size_sentinel() -> None:
     with pytest.raises(ValueError, match="全零或三轴均为正数"):
         _estimates_from_vision(message)
 
-# 当前作用：防止抓放Pose和轨迹尚未实现时返回零路点、空轨迹或伪成功。
-# TODO(arm-planner-implementation)：plan_grasp/plan_place真正实现时，必须在同一提交中
-# 替换为抓取Pose、多阶段IK、17维路点、不可达失败和放置上下文测试；生产方法仍未实现
-# 时不得删除本组。
-def test_arm_planner_methods_remain_explicitly_unimplemented() -> None:
-    fake_adapter = _InjectedIKAdapter()
-    planner = ArmPlanner(fake_adapter, ArmPlanningConfig())  # type: ignore[arg-type]
-    assert planner._ik_adapter is fake_adapter
-    assert not fake_adapter.self_check_called
-    joints = _planning_joints()
-    target = ObjectEstimate3D("pink", (1.0, 2.0, 0.5), 0.9, "odom", 100)
-    task = TaskSpec(
-        task_id=1,
-        instruction="move pink box",
+# ---------------------------------------------------------------------------
+# ArmPlanner纯Python抓放规划
+# ---------------------------------------------------------------------------
+
+# 下列参数是“测试专用已验证配置，用于验证算法结构，不代表官方环境真实标定值”。
+def _verified_planner_config(**overrides: object) -> ArmPlanningConfig:
+    values: dict[str, object] = {
+        "min_object_confidence": 0.7,
+        "transform_max_age_ns": 1_000,
+        "object_estimate_max_age_ns": 1_000,
+        "joint_state_max_age_ns": 1_000,
+        "planned_context_max_age_ns": 1_000,
+        "confirmed_context_max_age_ns": 1_000,
+        "pregrasp_distance_m": 0.10,
+        "grasp_contact_offset_m": 0.02,
+        "lift_distance_m": 0.15,
+        "retreat_distance_m": 0.20,
+        "preplace_height_m": 0.20,
+        "release_offset_m": 0.05,
+        "post_release_retreat_distance_m": 0.25,
+        "settle_time_s": 0.30,
+        "max_slide_waypoint_delta_m": 0.50,
+        "max_arm_waypoint_delta_rad": 0.50,
+        "max_gripper_waypoint_delta": 1.0,
+        "pregrasp_duration_s": 1.0,
+        "grasp_duration_s": 2.0,
+        "lift_duration_s": 3.0,
+        "retreat_duration_s": 4.0,
+        "preplace_duration_s": 1.5,
+        "lower_duration_s": 2.5,
+        "release_duration_s": 0.5,
+        "post_release_retreat_duration_s": 3.5,
+        "left_gripper_min": 0.0,
+        "left_gripper_max": 1.0,
+        "right_gripper_min": 0.0,
+        "right_gripper_max": 1.0,
+        "left_gripper_open": 0.8,
+        "left_gripper_closed": 0.2,
+        "right_gripper_open": 0.8,
+        "right_gripper_closed": 0.2,
+        "gripper_verified_in_official_environment": True,
+    }
+    values.update(overrides)
+    return ArmPlanningConfig(**values)  # type: ignore[arg-type]
+
+
+def _planner_task(
+    *, color: str = "pink", place_type: str = "table_point",
+    place_world_xyz: tuple[float, float, float] = (2.0, 0.5, 0.4),
+) -> TaskSpec:
+    side_fields = (
+        {"ref_prop": "shelf", "ref_prop_body": "shelf_body", "direction": "left"}
+        if place_type == "shelf_prop_side" else {}
+    )
+    return TaskSpec(
+        task_id=7,
+        instruction=f"move {color} box",
         target_kind="box",
-        target_body="box_body",
-        target_color="pink",
-        place_type="table_point",
-        place_world_xyz=(2.0, 3.0, 0.5),
+        target_body=f"box_{color}",
+        target_color=color,
+        place_type=place_type,
+        place_world_xyz=place_world_xyz,
         place_frame_id="world",
         place_radius=0.1,
+        timestamp_ns=90,
+        **side_fields,
     )
-    with pytest.raises(NotImplementedError, match="机械臂1负责人"):
-        planner.plan_grasp(task, target, None, None, joints, 100)  # type: ignore[arg-type]
-    with pytest.raises(NotImplementedError, match="机械臂1负责人"):
-        planner.plan_place(task, None, None, joints, 100)  # type: ignore[arg-type]
+
+
+def _planner_target(
+    *, color: str = "pink", position: tuple[float, float, float] = (1.0, 0.0, 0.5),
+    orientation: tuple[float, float, float, float] | None = (0.0, 0.0, 0.0, 1.0),
+    size: tuple[float, float, float] | None = (0.40, 0.20, 0.30),
+    object_id: str | None = "track-3", timestamp_ns: int = 100,
+    confidence: float = 0.9, valid: bool = True,
+) -> ObjectEstimate3D:
+    return ObjectEstimate3D(
+        color, position, confidence, "camera", timestamp_ns,
+        valid=valid, failure_reason="感知无效" if not valid else "",
+        object_id=object_id, orientation_xyzw=orientation, size_xyz_m=size,
+    )
+
+
+def _planner_actual_joints(
+    *, timestamp_ns: int = 100, valid: bool = True,
+    left_gripper: float = 0.8, right_gripper: float = 0.8,
+) -> RobotJointState:
+    position = (
+        0.1, 0.25, -0.25, *(0.0,) * 6, left_gripper,
+        *(0.0,) * 6, right_gripper,
+    )
+    return RobotJointState(
+        position=position,
+        velocity=(0.0,) * 17,
+        effort=(0.0,) * 17,
+        timestamp_ns=timestamp_ns,
+        valid=valid,
+        failure_reason="关节反馈无效" if not valid else "",
+    )
+
+
+def _target_transforms(
+    *, footprint_timestamp: int = 100, world_timestamp: int = 100,
+) -> tuple[RigidTransform3D, RigidTransform3D]:
+    return (
+        RigidTransform3D("camera", "footprint", (0, 0, 0), (0, 0, 0, 1),
+                         footprint_timestamp, True),
+        RigidTransform3D("camera", "world", (4, 2, 0), (0, 0, 0, 1),
+                         world_timestamp, True),
+    )
+
+
+class _FakePlannerKDL:
+    """只记录规划器调用；确定性解不是官方标定或可达性结论。"""
+
+    def __init__(
+        self, *, fail_at: int | None = None, half_at: int | None = None,
+        raise_at: int | None = None, arm_values: tuple[float, ...] | None = None,
+    ) -> None:
+        self.fail_at = fail_at
+        self.half_at = half_at
+        self.raise_at = raise_at
+        self.arm_values = arm_values
+        self.calls: list[dict[str, object]] = []
+        self.self_check_called = False
+
+    def self_check(self) -> None:
+        self.self_check_called = True
+        raise AssertionError("ArmPlanner构造或规划不得调用self_check")
+
+    def solve_ik(self, **kwargs: object) -> IKResult:
+        index = len(self.calls)
+        self.calls.append(dict(kwargs))
+        if index == self.raise_at:
+            raise RuntimeError("fake KDL依赖异常")
+        slide = float(kwargs["target_slide"])
+        if index == self.fail_at:
+            return IKResult(slide, None, None, False, f"阶段{index}无解")
+        value = 0.01 * (index + 1)
+        left = self.arm_values if self.arm_values is not None else (value,) * 6
+        right = self.arm_values if self.arm_values is not None else (-value,) * 6
+        if index == self.half_at:
+            right = None
+        return IKResult(slide, left, right, True)
+
+
+def _run_grasp(
+    adapter: _FakePlannerKDL | None = None,
+    *, config: ArmPlanningConfig | None = None, task: TaskSpec | None = None,
+    target: ObjectEstimate3D | None = None, joints: RobotJointState | None = None,
+    transforms: tuple[RigidTransform3D, RigidTransform3D] | None = None,
+    now_ns: int = 110,
+) -> tuple[GraspTarget, object, _FakePlannerKDL]:
+    fake = adapter or _FakePlannerKDL()
+    footprint, world = transforms or _target_transforms()
+    result = ArmPlanner(fake, config or _verified_planner_config()).plan_grasp(  # type: ignore[arg-type]
+        task or _planner_task(), target or _planner_target(), footprint, world,
+        joints or _planner_actual_joints(), now_ns,
+    )
+    return result[0], result[1], fake
+
+
+def _confirmed_context() -> GraspContext:
+    target, trajectory, _ = _run_grasp()
+    assert target.valid and trajectory.valid and target.grasp_context is not None
+    return replace(target.grasp_context, confirmed=True, confirmed_at_ns=120)
+
+
+def _run_place(
+    adapter: _FakePlannerKDL | None = None,
+    *, config: ArmPlanningConfig | None = None, task: TaskSpec | None = None,
+    context: GraspContext | None = None, joints: RobotJointState | None = None,
+    transform: RigidTransform3D | None = None, now_ns: int = 130,
+) -> tuple[PlaceTarget, object, _FakePlannerKDL]:
+    fake = adapter or _FakePlannerKDL()
+    world_to_footprint = transform or RigidTransform3D(
+        "world", "footprint", (-1, 0, 0), (0, 0, 0, 1), 125, True
+    )
+    result = ArmPlanner(fake, config or _verified_planner_config()).plan_place(  # type: ignore[arg-type]
+        task or _planner_task(), world_to_footprint, context or _confirmed_context(),
+        joints or _planner_actual_joints(timestamp_ns=125), now_ns,
+    )
+    return result[0], result[1], fake
+
+
+def test_arm_planner_constructor_only_saves_injected_dependencies() -> None:
+    fake = _FakePlannerKDL()
+    config = _verified_planner_config()
+    planner = ArmPlanner(fake, config)  # type: ignore[arg-type]
+    assert planner._ik_adapter is fake and planner._config is config
+    assert not fake.self_check_called and fake.calls == []
+
+
+def test_default_uncalibrated_config_fails_closed_for_both_operations() -> None:
+    fake = _FakePlannerKDL()
+    planner = ArmPlanner(fake, ArmPlanningConfig())  # type: ignore[arg-type]
+    footprint, world = _target_transforms()
+    grasp, pick = planner.plan_grasp(
+        _planner_task(), _planner_target(), footprint, world,
+        _planner_actual_joints(), 110,
+    )
+    place, place_trajectory = planner.plan_place(
+        _planner_task(), RigidTransform3D("world", "footprint", (0, 0, 0),
+                                         (0, 0, 0, 1), 100, True),
+        _confirmed_context(), _planner_actual_joints(), 130,
+    )
+    assert not grasp.valid and not pick.valid and pick.waypoints == ()
+    assert not place.valid and not place_trajectory.valid and place_trajectory.waypoints == ()
+    assert fake.calls == []
+
+
+def test_grasp_rejects_missing_perception_facts_and_identity_mismatch() -> None:
+    cases = (
+        (replace(_planner_task(), valid=False, failure_reason="任务无效"), _planner_target(), "任务无效"),
+        (_planner_task(), _planner_target(valid=False), "感知无效"),
+        (_planner_task(), _planner_target(color="yellow"), "不匹配"),
+        (_planner_task(), _planner_target(object_id=None), "object_id"),
+        (_planner_task(), _planner_target(orientation=None), "orientation"),
+        (_planner_task(), _planner_target(size=None), "size_xyz"),
+        (_planner_task(), _planner_target(confidence=0.6), "confidence"),
+    )
+    for task, target, reason in cases:
+        grasp, trajectory, fake = _run_grasp(task=task, target=target)
+        assert not grasp.valid and not trajectory.valid and trajectory.waypoints == ()
+        assert grasp.failure_reason == trajectory.failure_reason
+        assert reason in grasp.failure_reason and fake.calls == []
+
+
+def test_grasp_rejects_wrong_transform_directions_without_inversion() -> None:
+    wrong_footprint = RigidTransform3D(
+        "footprint", "camera", (0, 0, 0), (0, 0, 0, 1), 100, True
+    )
+    wrong_world = RigidTransform3D(
+        "world", "camera", (0, 0, 0), (0, 0, 0, 1), 100, True
+    )
+    for transforms, expected in (
+        ((wrong_footprint, _target_transforms()[1]), "camera→footprint"),
+        ((_target_transforms()[0], wrong_world), "camera→world"),
+    ):
+        grasp, trajectory, fake = _run_grasp(transforms=transforms)
+        assert not grasp.valid and not trajectory.valid and expected in grasp.failure_reason
+        assert fake.calls == []
+
+
+def test_grasp_rejects_stale_future_and_invalid_time_inputs() -> None:
+    config = _verified_planner_config(
+        transform_max_age_ns=10, object_estimate_max_age_ns=10,
+        joint_state_max_age_ns=10,
+    )
+    cases = (
+        {"transforms": _target_transforms(footprint_timestamp=80), "now_ns": 110},
+        {"transforms": _target_transforms(world_timestamp=120), "now_ns": 110},
+        {"target": _planner_target(timestamp_ns=80), "now_ns": 110},
+        {"target": _planner_target(timestamp_ns=120), "now_ns": 110},
+        {"joints": _planner_actual_joints(timestamp_ns=80), "now_ns": 110},
+        {"joints": _planner_actual_joints(timestamp_ns=120), "now_ns": 110},
+        {"joints": _planner_actual_joints(valid=False), "now_ns": 110},
+        {"task": replace(_planner_task(), timestamp_ns=120), "now_ns": 110},
+        {"now_ns": True},
+        {"now_ns": -1},
+    )
+    for kwargs in cases:
+        grasp, trajectory, fake = _run_grasp(config=config, **kwargs)  # type: ignore[arg-type]
+        assert not grasp.valid and not trajectory.valid and trajectory.waypoints == ()
+        assert grasp.failure_reason == trajectory.failure_reason and fake.calls == []
+
+
+def test_grasp_transforms_are_bound_to_object_observation_time() -> None:
+    config = _verified_planner_config(transform_max_age_ns=10)
+    identity = (0.0, 0.0, 0.0, 1.0)
+    cases = (
+        (
+            _planner_target(timestamp_ns=100),
+            (
+                RigidTransform3D("camera", "footprint", (0, 0, 0), identity, 0, True),
+                RigidTransform3D("camera", "world", (0, 0, 0), identity, 100, True),
+            ),
+            110,
+            "过期",
+        ),
+        (
+            _planner_target(timestamp_ns=100),
+                (
+                    RigidTransform3D("camera", "footprint", (0, 0, 0), identity, 111, True),
+                    RigidTransform3D("camera", "world", (0, 0, 0), identity, 101, True),
+            ),
+            111,
+            "target.timestamp_ns时间不匹配",
+        ),
+        (
+            _planner_target(timestamp_ns=100),
+                (
+                    RigidTransform3D("camera", "footprint", (0, 0, 0), identity, 101, True),
+                RigidTransform3D("camera", "world", (0, 0, 0), identity, 111, True),
+            ),
+            111,
+            "target.timestamp_ns时间不匹配",
+        ),
+        # 两个变换对now都很新，但都与物体观测相差15ns。
+        (
+            _planner_target(timestamp_ns=100),
+            (
+                RigidTransform3D("camera", "footprint", (0, 0, 0), identity, 115, True),
+                RigidTransform3D("camera", "world", (0, 0, 0), identity, 115, True),
+            ),
+            115,
+            "target.timestamp_ns时间不匹配",
+        ),
+    )
+    for target, transforms, now_ns, expected in cases:
+        grasp, trajectory, fake = _run_grasp(
+            config=config, target=target, transforms=transforms, now_ns=now_ns
+        )
+        assert not grasp.valid and not trajectory.valid and trajectory.waypoints == ()
+        assert expected in grasp.failure_reason
+        assert fake.calls == []
+
+
+def test_grasp_transform_observation_time_boundary_is_allowed() -> None:
+    config = _verified_planner_config(transform_max_age_ns=10)
+    target = _planner_target(timestamp_ns=110)
+    transforms = _target_transforms(footprint_timestamp=100, world_timestamp=100)
+    grasp, trajectory, fake = _run_grasp(
+        config=config, target=target, transforms=transforms, now_ns=110
+    )
+    assert grasp.valid and trajectory.valid and len(fake.calls) == 4
+
+
+def test_grasp_rejects_actual_grippers_outside_official_ranges_before_ik() -> None:
+    config = _verified_planner_config(max_gripper_waypoint_delta=100.0)
+    for joints, expected in (
+        (_planner_actual_joints(left_gripper=-0.01), "left gripper"),
+        (_planner_actual_joints(right_gripper=1.01), "right gripper"),
+    ):
+        grasp, trajectory, fake = _run_grasp(config=config, joints=joints)
+        assert not grasp.valid and not trajectory.valid and trajectory.waypoints == ()
+        assert expected in grasp.failure_reason and fake.calls == []
+
+
+def test_actual_gripper_range_boundaries_are_allowed_for_grasp_and_place() -> None:
+    grasp_joints = _planner_actual_joints(left_gripper=0.0, right_gripper=1.0)
+    grasp, pick, grasp_fake = _run_grasp(joints=grasp_joints)
+    place_joints = _planner_actual_joints(
+        timestamp_ns=125, left_gripper=0.0, right_gripper=1.0
+    )
+    place, place_trajectory, place_fake = _run_place(joints=place_joints)
+    assert grasp.valid and pick.valid and len(grasp_fake.calls) == 4
+    assert place.valid and place_trajectory.valid and len(place_fake.calls) == 3
+
+
+def test_grasp_geometry_uses_object_sides_preplace_lift_and_radial_retreat() -> None:
+    grasp, trajectory, _ = _run_grasp()
+    assert grasp.valid and trajectory.valid
+    assert grasp.left_grasp is not None and grasp.right_grasp is not None
+    assert grasp.left_pregrasp is not None and grasp.right_pregrasp is not None
+    assert grasp.left_lift is not None and grasp.right_lift is not None
+    assert grasp.left_retreat is not None and grasp.right_retreat is not None
+    center = (1.0, 0.0, 0.5)
+    assert grasp.left_grasp.position_xyz != center != grasp.right_grasp.position_xyz
+    assert grasp.left_grasp.position_xyz == pytest.approx((1.0, 0.12, 0.5))
+    assert grasp.right_grasp.position_xyz == pytest.approx((1.0, -0.12, 0.5))
+    assert grasp.left_pregrasp.position_xyz == pytest.approx((1.0, 0.22, 0.5))
+    assert grasp.right_pregrasp.position_xyz == pytest.approx((1.0, -0.22, 0.5))
+    assert grasp.left_lift.position_xyz == pytest.approx((1.0, 0.12, 0.65))
+    assert grasp.right_lift.position_xyz == pytest.approx((1.0, -0.12, 0.65))
+    assert grasp.left_retreat.position_xyz == pytest.approx((0.8, 0.12, 0.65))
+    assert grasp.right_retreat.position_xyz == pytest.approx((0.8, -0.12, 0.65))
+
+
+@pytest.mark.parametrize("yaw", [0.2, 0.7, 1.4, 2.3, -1.1])
+def test_grasp_axis_is_deterministic_for_random_yaw(yaw: float) -> None:
+    quaternion = (0.0, 0.0, math.sin(yaw / 2.0), math.cos(yaw / 2.0))
+    first, _, _ = _run_grasp(target=_planner_target(orientation=quaternion))
+    second, _, _ = _run_grasp(target=_planner_target(orientation=quaternion))
+    assert first.valid and second.valid
+    assert first.left_grasp == second.left_grasp
+    assert first.right_grasp == second.right_grasp
+    assert first.left_grasp is not None and first.right_grasp is not None
+    side = np.subtract(first.left_grasp.position_xyz, first.right_grasp.position_xyz)
+    assert np.linalg.norm(side[:2]) > 0.0 and side[2] == pytest.approx(0.0)
+
+
+def test_grasp_strategy_does_not_depend_on_color_or_task_id() -> None:
+    pink, _, _ = _run_grasp(task=_planner_task(color="pink"), target=_planner_target(color="pink"))
+    yellow_task = replace(_planner_task(color="yellow"), task_id=99)
+    yellow, _, _ = _run_grasp(task=yellow_task, target=_planner_target(color="yellow"))
+    assert pink.left_grasp == yellow.left_grasp
+    assert pink.right_grasp == yellow.right_grasp
+
+
+def test_grasp_axis_tie_uses_smaller_dimension_then_local_y() -> None:
+    yaw = math.pi / 4.0
+    quaternion = (0.0, 0.0, math.sin(yaw / 2), math.cos(yaw / 2))
+    small_x, _, _ = _run_grasp(
+        target=_planner_target(orientation=quaternion, size=(0.1, 0.3, 0.2))
+    )
+    equal, _, _ = _run_grasp(
+        target=_planner_target(orientation=quaternion, size=(0.2, 0.2, 0.2))
+    )
+    assert small_x.left_grasp is not None and equal.left_grasp is not None
+    assert small_x.left_grasp.position_xyz != equal.left_grasp.position_xyz
+
+
+def test_grasp_rejects_degenerate_center_and_nonvertical_object() -> None:
+    tilted = (math.sin(0.2), 0.0, 0.0, math.cos(0.2))
+    for target, expected in (
+        (_planner_target(position=(0.0, 0.0, 0.5)), "退化"),
+        (_planner_target(orientation=tilted), "竖直向上"),
+        (_planner_target(orientation=(1.0, 0.0, 0.0, 0.0)), "竖直向上"),
+    ):
+        grasp, trajectory, fake = _run_grasp(target=target)
+        assert not grasp.valid and not trajectory.valid and expected in grasp.failure_reason
+        assert fake.calls == []
+
+
+def test_grasp_rejects_world_orientation_tilt_created_by_transform_before_ik() -> None:
+    half = math.sqrt(0.5)
+    footprint, _ = _target_transforms()
+    tilted_world = RigidTransform3D(
+        "camera", "world", (4, 2, 0), (half, 0, 0, half), 100, True
+    )
+    grasp, trajectory, fake = _run_grasp(transforms=(footprint, tilted_world))
+    assert not grasp.valid and not trajectory.valid and trajectory.waypoints == ()
+    assert "world物体姿态" in grasp.failure_reason and fake.calls == []
+
+
+def test_grasp_tool_orientations_are_finite_unit_footprint_poses() -> None:
+    grasp, _, _ = _run_grasp()
+    poses = (
+        grasp.left_pregrasp, grasp.right_pregrasp, grasp.left_grasp, grasp.right_grasp,
+        grasp.left_lift, grasp.right_lift, grasp.left_retreat, grasp.right_retreat,
+    )
+    for pose in poses:
+        assert pose is not None and pose.frame_id == "footprint"
+        assert all(math.isfinite(value) for value in pose.orientation_xyzw)
+        assert math.hypot(*pose.orientation_xyzw) == pytest.approx(1.0)
+    assert grasp.left_grasp is not None and grasp.right_grasp is not None
+    assert arm_planning_module._rotate_vector(
+        grasp.left_grasp.orientation_xyzw, (1.0, 0.0, 0.0)
+    ) == pytest.approx((1.0, 0.0, 0.0))
+    assert arm_planning_module._rotate_vector(
+        grasp.left_grasp.orientation_xyzw, (0.0, 0.0, 1.0)
+    ) == pytest.approx((0.0, 1.0, 0.0))
+    assert arm_planning_module._rotate_vector(
+        grasp.right_grasp.orientation_xyzw, (0.0, 0.0, 1.0)
+    ) == pytest.approx((0.0, -1.0, 0.0))
+
+
+def test_grasp_calls_four_unique_ik_stages_with_original_feedback_and_slide() -> None:
+    joints = _planner_actual_joints()
+    grasp, trajectory, fake = _run_grasp(joints=joints)
+    assert grasp.valid and trajectory.valid and len(fake.calls) == 4
+    assert all(call["actual_joints"] is joints for call in fake.calls)
+    assert all(call["target_slide"] == joints.position[0] for call in fake.calls)
+    assert [call["left_target"] for call in fake.calls] == [
+        grasp.left_pregrasp, grasp.left_grasp, grasp.left_lift, grasp.left_retreat,
+    ]
+    assert [call["right_target"] for call in fake.calls] == [
+        grasp.right_pregrasp, grasp.right_grasp, grasp.right_lift, grasp.right_retreat,
+    ]
+
+
+@pytest.mark.parametrize(("mode", "index"), [("fail_at", 2), ("half_at", 1), ("raise_at", 3)])
+def test_grasp_any_ik_failure_or_half_solution_fails_atomically(mode: str, index: int) -> None:
+    adapter = _FakePlannerKDL(**{mode: index})
+    grasp, trajectory, _ = _run_grasp(adapter)
+    assert not grasp.valid and grasp.grasp_context is None
+    assert not trajectory.valid and trajectory.waypoints == ()
+    assert grasp.failure_reason == trajectory.failure_reason
+
+
+@pytest.mark.parametrize("returned_slide", [0.2, float("nan")])
+def test_grasp_rejects_inconsistent_or_nonfinite_ik_slide(returned_slide: float) -> None:
+    class _BadSlideKDL(_FakePlannerKDL):
+        def solve_ik(self, **kwargs: object) -> IKResult:
+            result = super().solve_ik(**kwargs)
+            return replace(result, target_slide=returned_slide)
+
+    grasp, trajectory, _ = _run_grasp(_BadSlideKDL())
+    assert not grasp.valid and not trajectory.valid and trajectory.waypoints == ()
+    assert "slide" in grasp.failure_reason
+
+
+def test_grasp_trajectory_maps_13_to_17_and_preserves_head() -> None:
+    joints = _planner_actual_joints()
+    _, trajectory, _ = _run_grasp(joints=joints)
+    assert trajectory.valid and trajectory.execution_phase is GlobalPhase.EXECUTE_PICK
+    assert trajectory.trajectory_id == "pick-7-box_pink-track-3-110"
+    assert len(trajectory.waypoints) == 5
+    assert [waypoint.phase for waypoint in trajectory.waypoints] == [
+        ArmMotionPhase.PREGRASP, ArmMotionPhase.GRASP, ArmMotionPhase.GRASP,
+        ArmMotionPhase.LIFT, ArmMotionPhase.RETREAT,
+    ]
+    assert [waypoint.time_from_start_s for waypoint in trajectory.waypoints] == [1, 2, 3, 6, 10]
+    assert [waypoint.joint_position[9] for waypoint in trajectory.waypoints] == [0.8, 0.8, 0.2, 0.2, 0.2]
+    assert [waypoint.joint_position[16] for waypoint in trajectory.waypoints] == [0.8, 0.8, 0.2, 0.2, 0.2]
+    for waypoint in trajectory.waypoints:
+        assert waypoint.joint_position[0] == joints.position[0]
+        assert waypoint.joint_position[1:3] == joints.position[1:3]
+        assert waypoint.controlled_mask == (True, False, False, *(True,) * 14)
+        assert len(waypoint.joint_position[3:9]) == len(waypoint.joint_position[10:16]) == 6
+    assert trajectory.waypoints[0].joint_position[3:9] == pytest.approx((0.01,) * 6)
+    assert trajectory.waypoints[0].joint_position[10:16] == pytest.approx((-0.01,) * 6)
+
+
+def test_grasp_continuity_checks_first_arm_and_gripper_transitions() -> None:
+    first_arm, first_trajectory, _ = _run_grasp(
+        _FakePlannerKDL(arm_values=(0.2,) * 6),
+        config=_verified_planner_config(max_arm_waypoint_delta_rad=0.1),
+    )
+    gripper, gripper_trajectory, _ = _run_grasp(
+        config=_verified_planner_config(max_gripper_waypoint_delta=0.3)
+    )
+    assert not first_arm.valid and not first_trajectory.valid and "arm" in first_arm.failure_reason
+    assert not gripper.valid and not gripper_trajectory.valid and "gripper" in gripper.failure_reason
+
+
+def test_continuity_helper_rejects_adjacent_slide_and_arm_deltas_by_unit() -> None:
+    actual = _planner_actual_joints().position
+    config = _verified_planner_config(
+        max_slide_waypoint_delta_m=0.05, max_arm_waypoint_delta_rad=0.05
+    )
+    mask = (True, False, False, *(True,) * 14)
+    first = arm_planning_module.JointWaypoint(
+        ArmMotionPhase.PREGRASP, 1.0, actual, mask
+    )
+    slide_position = list(actual)
+    slide_position[0] += 0.1
+    slide = arm_planning_module.JointWaypoint(
+        ArmMotionPhase.GRASP, 2.0, tuple(slide_position), mask
+    )
+    with pytest.raises(ValueError, match="slide"):
+        arm_planning_module._validate_waypoint_continuity(actual, (first, slide), config)
+    arm_position = list(actual)
+    arm_position[3] += 0.1
+    arm = arm_planning_module.JointWaypoint(
+        ArmMotionPhase.GRASP, 2.0, tuple(arm_position), mask
+    )
+    with pytest.raises(ValueError, match="arm"):
+        arm_planning_module._validate_waypoint_continuity(actual, (first, arm), config)
+
+
+def test_planned_grasp_context_identity_orientation_and_relative_transforms() -> None:
+    grasp, trajectory, _ = _run_grasp()
+    context = grasp.grasp_context
+    assert trajectory.valid and context is not None and context.valid
+    assert not context.confirmed and context.confirmed_at_ns is None
+    assert (context.task_id, context.target_body, context.target_class_id,
+            context.object_id, context.object_frame) == (
+                7, "box_pink", "pink", "track-3", "object/track-3"
+            )
+    assert context.object_size_xyz_m == (0.4, 0.2, 0.3)
+    assert context.object_orientation_world_xyzw_at_grasp == (0.0, 0.0, 0.0, 1.0)
+    assert context.orientation_observed_at_ns == 100 and context.planned_at_ns == 110
+    object_pose = Pose3D((1.0, 0.0, 0.5), (0, 0, 0, 1), "footprint")
+    assert context.object_from_left_gripper is not None
+    assert context.object_from_right_gripper is not None
+    reconstructed_left = arm_planning_module._compose_pose_with_transform(
+        object_pose, context.object_from_left_gripper
+    )
+    reconstructed_right = arm_planning_module._compose_pose_with_transform(
+        object_pose, context.object_from_right_gripper
+    )
+    assert reconstructed_left == grasp.left_grasp
+    assert reconstructed_right == grasp.right_grasp
+
+
+def test_grasp_context_saves_composed_world_object_orientation() -> None:
+    target_yaw = 0.3
+    transform_yaw = 0.4
+    target_q = (0.0, 0.0, math.sin(target_yaw / 2), math.cos(target_yaw / 2))
+    transform_q = (
+        0.0, 0.0, math.sin(transform_yaw / 2), math.cos(transform_yaw / 2)
+    )
+    footprint, _ = _target_transforms()
+    world = RigidTransform3D(
+        "camera", "world", (4, 2, 0), transform_q, 100, True
+    )
+    grasp, trajectory, _ = _run_grasp(
+        target=_planner_target(orientation=target_q), transforms=(footprint, world)
+    )
+    assert grasp.valid and trajectory.valid and grasp.grasp_context is not None
+    expected = (
+        0.0, 0.0,
+        math.sin((target_yaw + transform_yaw) / 2),
+        math.cos((target_yaw + transform_yaw) / 2),
+    )
+    assert grasp.grasp_context.object_orientation_world_xyzw_at_grasp == pytest.approx(expected)
+
+
+def test_planner_does_not_store_grasp_context_across_calls() -> None:
+    fake = _FakePlannerKDL()
+    planner = ArmPlanner(fake, _verified_planner_config())  # type: ignore[arg-type]
+    footprint, world = _target_transforms()
+    first, _ = planner.plan_grasp(
+        _planner_task(), _planner_target(object_id="first"), footprint, world,
+        _planner_actual_joints(), 110,
+    )
+    second, _ = planner.plan_grasp(
+        _planner_task(), _planner_target(object_id="second"), footprint, world,
+        _planner_actual_joints(), 111,
+    )
+    assert first.grasp_context is not None and second.grasp_context is not None
+    assert first.grasp_context.object_id == "first"
+    assert second.grasp_context.object_id == "second"
+    assert not any("context" in name for name in vars(planner))
+
+
+def test_place_rejects_unconfirmed_mismatched_stale_and_wrong_frame_context() -> None:
+    confirmed = _confirmed_context()
+    cases = (
+        (replace(confirmed, confirmed=False, confirmed_at_ns=None), None, "confirmed"),
+        (replace(confirmed, task_id=999), None, "身份不匹配"),
+        (replace(confirmed, target_class_id="yellow"), None, "target_class_id"),
+        (confirmed, _verified_planner_config(confirmed_context_max_age_ns=5), "过期"),
+    )
+    for context, config, expected in cases:
+        place, trajectory, fake = _run_place(
+            context=context, config=config, now_ns=130
+        )
+        assert not place.valid and not trajectory.valid and expected in place.failure_reason
+        assert place.failure_reason == trajectory.failure_reason and fake.calls == []
+    wrong = RigidTransform3D("footprint", "world", (0, 0, 0), (0, 0, 0, 1), 125, True)
+    place, trajectory, fake = _run_place(transform=wrong)
+    assert not place.valid and not trajectory.valid and "world→footprint" in place.failure_reason
+    assert fake.calls == []
+
+
+def test_place_rejects_task_without_world_goal_and_future_task() -> None:
+    invalid = TaskSpec(7, "bad", "", "", "", valid=False, failure_reason="缺少place_world_xyz")
+    for task in (invalid, replace(_planner_task(), timestamp_ns=140)):
+        place, trajectory, fake = _run_place(task=task, now_ns=130)
+        assert not place.valid and not trajectory.valid and trajectory.waypoints == ()
+        assert fake.calls == []
+
+
+def test_place_rejects_stale_or_future_transform_joints_and_context() -> None:
+    config = _verified_planner_config(
+        transform_max_age_ns=10, joint_state_max_age_ns=10,
+        confirmed_context_max_age_ns=10,
+    )
+    cases = (
+        {"transform": RigidTransform3D("world", "footprint", (0, 0, 0),
+                                       (0, 0, 0, 1), 100, True)},
+        {"transform": RigidTransform3D("world", "footprint", (0, 0, 0),
+                                       (0, 0, 0, 1), 140, True)},
+        {"joints": _planner_actual_joints(timestamp_ns=100)},
+        {"joints": _planner_actual_joints(timestamp_ns=140)},
+        {"context": _confirmed_context(), "now_ns": 140},
+        {"context": replace(_confirmed_context(), confirmed_at_ns=140)},
+    )
+    for kwargs in cases:
+        place, trajectory, fake = _run_place(config=config, **kwargs)
+        assert not place.valid and not trajectory.valid and trajectory.waypoints == ()
+        assert place.failure_reason == trajectory.failure_reason and fake.calls == []
+
+
+def test_place_rejects_actual_gripper_out_of_range_before_ik() -> None:
+    config = _verified_planner_config(max_gripper_waypoint_delta=100.0)
+    for joints in (
+        _planner_actual_joints(timestamp_ns=125, left_gripper=-0.01),
+        _planner_actual_joints(timestamp_ns=125, right_gripper=1.01),
+    ):
+        place, trajectory, fake = _run_place(config=config, joints=joints)
+        assert not place.valid and not trajectory.valid and trajectory.waypoints == ()
+        assert "gripper" in place.failure_reason and fake.calls == []
+
+
+def test_place_rejects_damaged_context_transform_direction() -> None:
+    context = _confirmed_context()
+    damaged = object.__new__(GraspContext)
+    for name in context.__dataclass_fields__:
+        object.__setattr__(damaged, name, getattr(context, name))
+    object.__setattr__(
+        damaged,
+        "object_from_left_gripper",
+        RigidTransform3D(
+            context.object_frame, "left_gripper", (0, 0, 0),
+            (0, 0, 0, 1), 110, True,
+        ),
+    )
+    place, trajectory, fake = _run_place(context=damaged)
+    assert not place.valid and not trajectory.valid
+    assert "left_gripper→object/track-3" in place.failure_reason
+    assert fake.calls == []
+
+
+@pytest.mark.parametrize("place_type", ["shelf_point", "table_point", "shelf_prop_side"])
+def test_all_official_place_types_use_same_exact_center_pipeline(place_type: str) -> None:
+    place, trajectory, _ = _run_place(task=_planner_task(place_type=place_type))
+    assert place.valid and trajectory.valid and place.object_goal_pose is not None
+    assert place.object_goal_pose.position_xyz == pytest.approx((1.0, 0.5, 0.4))
+
+
+def test_place_geometry_preserves_goal_orientation_offsets_and_common_retreat() -> None:
+    context = _confirmed_context()
+    place, trajectory, _ = _run_place(context=context)
+    assert place.valid and trajectory.valid and place.object_goal_pose is not None
+    assert place.left_preplace is not None and place.right_preplace is not None
+    assert place.left_release is not None and place.right_release is not None
+    assert place.left_post_release_retreat is not None
+    assert place.right_post_release_retreat is not None
+    assert place.object_goal_pose.position_xyz == pytest.approx((1.0, 0.5, 0.4))
+    assert place.object_goal_pose.orientation_xyzw == context.object_orientation_world_xyzw_at_grasp
+    assert place.left_preplace.position_xyz[2] - place.left_release.position_xyz[2] == pytest.approx(0.2)
+    assert place.right_preplace.position_xyz[2] - place.right_release.position_xyz[2] == pytest.approx(0.2)
+    radial = np.asarray((1.0, 0.5, 0.0))
+    radial /= np.linalg.norm(radial)
+    assert np.subtract(
+        place.left_post_release_retreat.position_xyz, place.left_release.position_xyz
+    ) == pytest.approx(-radial * 0.25)
+    assert np.subtract(
+        place.right_post_release_retreat.position_xyz, place.right_release.position_xyz
+    ) == pytest.approx(-radial * 0.25)
+    # 最终目标不含release_offset；release夹爪由抬高0.05m的物体Pose派生。
+    assert place.left_release.position_xyz[2] == pytest.approx(0.45)
+    assert place.right_release.position_xyz[2] == pytest.approx(0.45)
+
+
+def test_place_converts_world_object_orientation_into_footprint() -> None:
+    yaw = -0.4
+    rotation = (0.0, 0.0, math.sin(yaw / 2), math.cos(yaw / 2))
+    transform = RigidTransform3D(
+        "world", "footprint", (-1, 0, 0), rotation, 125, True
+    )
+    place, trajectory, _ = _run_place(transform=transform)
+    assert place.valid and trajectory.valid and place.object_goal_pose is not None
+    expected = (0.0, 0.0, math.sin(yaw / 2), math.cos(yaw / 2))
+    assert place.object_goal_pose.orientation_xyzw == pytest.approx(expected)
+
+
+@pytest.mark.parametrize(
+    "orientation",
+    [
+        (math.sqrt(0.5), 0.0, 0.0, math.sqrt(0.5)),
+        (0.0, math.sin(1e-4), 0.0, math.cos(1e-4)),
+    ],
+)
+def test_place_rejects_tilted_confirmed_context_before_ik(
+    orientation: tuple[float, float, float, float],
+) -> None:
+    context = replace(
+        _confirmed_context(), object_orientation_world_xyzw_at_grasp=orientation
+    )
+    place, trajectory, fake = _run_place(context=context)
+    assert not place.valid and not trajectory.valid and trajectory.waypoints == ()
+    assert "竖直向上" in place.failure_reason and fake.calls == []
+
+
+@pytest.mark.parametrize("yaw", [-2.7, -0.3, 0.0, 1.2, math.pi])
+def test_place_allows_arbitrary_pure_yaw_context(yaw: float) -> None:
+    orientation = (0.0, 0.0, math.sin(yaw / 2), math.cos(yaw / 2))
+    context = replace(
+        _confirmed_context(), object_orientation_world_xyzw_at_grasp=orientation
+    )
+    place, trajectory, fake = _run_place(context=context)
+    assert place.valid and trajectory.valid and len(fake.calls) == 3
+
+
+def test_place_calls_three_ik_stages_and_builds_four_waypoints() -> None:
+    context = _confirmed_context()
+    joints = _planner_actual_joints(timestamp_ns=125)
+    before = context
+    place, trajectory, fake = _run_place(context=context, joints=joints)
+    assert place.valid and trajectory.valid and context == before
+    assert len(fake.calls) == 3
+    assert all(call["actual_joints"] is joints for call in fake.calls)
+    assert all(call["target_slide"] == joints.position[0] for call in fake.calls)
+    assert [call["left_target"] for call in fake.calls] == [
+        place.left_preplace, place.left_release, place.left_post_release_retreat,
+    ]
+    assert [waypoint.phase for waypoint in trajectory.waypoints] == [
+        ArmMotionPhase.PREPLACE, ArmMotionPhase.LOWER, ArmMotionPhase.RELEASE,
+        ArmMotionPhase.POST_RELEASE_RETREAT,
+    ]
+    assert [waypoint.time_from_start_s for waypoint in trajectory.waypoints] == [1.5, 4.0, 4.5, 8.0]
+    assert [waypoint.joint_position[9] for waypoint in trajectory.waypoints] == [0.2, 0.2, 0.8, 0.8]
+    assert [waypoint.joint_position[16] for waypoint in trajectory.waypoints] == [0.2, 0.2, 0.8, 0.8]
+    assert trajectory.trajectory_id == "place-7-box_pink-track-3-130"
+
+
+@pytest.mark.parametrize(("mode", "index"), [("fail_at", 0), ("half_at", 1), ("raise_at", 2)])
+def test_place_any_ik_failure_fails_atomically(mode: str, index: int) -> None:
+    adapter = _FakePlannerKDL(**{mode: index})
+    place, trajectory, _ = _run_place(adapter)
+    assert not place.valid and not trajectory.valid and trajectory.waypoints == ()
+    assert place.failure_reason == trajectory.failure_reason
 
 
 def test_arm_planner_rejects_dependency_without_solve_ik() -> None:
