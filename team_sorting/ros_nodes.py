@@ -82,7 +82,7 @@ _create_recorder_node()
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import replace
+from dataclasses import fields, replace
 import importlib
 import json
 import math
@@ -106,6 +106,7 @@ from .fsm import FSMEvent, GlobalFSM, InstructionParser
 from .interfaces import (
     ActionDispatchRecord,
     ActionMuxDecision,
+    ArmPlanningConfig,
     BaseCommand,
     BaseState,
     CameraIntrinsics,
@@ -641,8 +642,12 @@ def _validate_vision_schema(ros: SimpleNamespace) -> None:
     result = ros.ObjectHypothesisWithPose()
     if not hasattr(array, "header") or not hasattr(array, "detections"):
         raise RuntimeError("Detection3DArray 缺少 header/detections")
-    if not hasattr(detection, "results"):
-        raise RuntimeError("Detection3D 缺少 results")
+    if not all(hasattr(detection, name) for name in ("results", "id", "bbox")):
+        raise RuntimeError("Detection3D 缺少 results/id/bbox")
+    if not hasattr(detection.bbox, "size") or not all(
+        hasattr(detection.bbox.size, axis) for axis in ("x", "y", "z")
+    ):
+        raise RuntimeError("Detection3D.bbox 缺少三轴 size")
     hypothesis = getattr(result, "hypothesis", result)
     if not (hasattr(hypothesis, "class_id") or hasattr(hypothesis, "id")):
         raise RuntimeError("ObjectHypothesisWithPose 缺少 class_id/id")
@@ -666,8 +671,38 @@ def _load_config() -> dict[str, Any]:
         validate_controller_config(data)
     except ValueError as exc:
         raise RuntimeError(f"配置与MMK2 Controller Manifest V1不一致 {path}: {exc}") from exc
+    try:
+        _arm_planning_config_from_config(data)
+    except ValueError as exc:
+        raise RuntimeError(f"机械臂规划配置无效 {path}: {exc}") from exc
     _validated_action_dispatch_topic(data.get("topics"))
     return data
+
+
+def _arm_planning_config_from_config(
+    config: Mapping[str, Any],
+) -> tuple[bool, ArmPlanningConfig]:
+    """严格读取默认关闭的机械臂规划配置，但不构造规划器或官方依赖。"""
+
+    if not isinstance(config, Mapping):
+        raise ValueError("config 必须是 Mapping")
+    section = config.get("arm_planning")
+    if not isinstance(section, Mapping):
+        raise ValueError("config['arm_planning'] 必须是 Mapping")
+    enabled = section.get("enabled")
+    if type(enabled) is not bool:
+        raise ValueError("arm_planning.enabled 必须是严格 bool")
+
+    config_fields = tuple(field.name for field in fields(ArmPlanningConfig))
+    allowed = {"enabled", *config_fields}
+    unknown = tuple(sorted(str(key) for key in section.keys() if key not in allowed))
+    if unknown:
+        raise ValueError(f"arm_planning 包含未知字段：{unknown}")
+    missing = tuple(name for name in config_fields if name not in section)
+    if missing:
+        raise ValueError(f"arm_planning 缺少显式字段：{missing}")
+    values = {name: section[name] for name in config_fields}
+    return enabled, ArmPlanningConfig(**values)
 
 
 def _resolve_config_path() -> Path:
@@ -1007,6 +1042,9 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                         slot_type=classify_slot_type(item.position_xyz, table, shelf),
                         valid=item.valid,
                         failure_reason=item.failure_reason,
+                        object_id=item.object_id,
+                        orientation_xyzw=item.orientation_xyzw,
+                        size_xyz_m=item.size_xyz_m,
                     )
                     for item in estimates
                 )
@@ -2274,11 +2312,40 @@ def _estimates_to_vision(
         hypothesis.score = confidence
         pose = _vision_result_pose(result)
         pose.position.x, pose.position.y, pose.position.z = xyz
-        # 单位四元数只是满足 Pose 消息结构，不表示已估计出物体的真实朝向。
-        pose.orientation.x = 0.0
-        pose.orientation.y = 0.0
-        pose.orientation.z = 0.0
-        pose.orientation.w = 1.0
+        orientation = estimate.orientation_xyzw
+        if orientation is None:
+            # 团队内部 /team/object_estimates 契约：零四元数表示姿态不可用。
+            orientation = (0.0, 0.0, 0.0, 0.0)
+        else:
+            orientation = tuple(float(value) for value in orientation)
+            if len(orientation) != 4 or not all(
+                math.isfinite(value) for value in orientation
+            ):
+                raise ValueError("ObjectEstimate3D 姿态必须是四项有限数")
+            orientation_norm = math.sqrt(
+                sum(value * value for value in orientation)
+            )
+            if orientation_norm <= 1e-12:
+                raise ValueError("ObjectEstimate3D 已提供姿态的四元数范数接近零")
+            orientation = tuple(value / orientation_norm for value in orientation)
+        (
+            pose.orientation.x,
+            pose.orientation.y,
+            pose.orientation.z,
+            pose.orientation.w,
+        ) = orientation
+        if not hasattr(detection, "id") or not hasattr(detection, "bbox"):
+            raise RuntimeError("vision_msgs Detection3D 缺少 id/bbox 字段")
+        detection.id = estimate.object_id or ""
+        if estimate.size_xyz_m is None:
+            size = (0.0, 0.0, 0.0)
+        else:
+            size = tuple(float(value) for value in estimate.size_xyz_m)
+            if len(size) != 3 or not all(
+                math.isfinite(value) and value > 0.0 for value in size
+            ):
+                raise ValueError("ObjectEstimate3D 已提供尺寸必须三轴均为有限正数")
+        detection.bbox.size.x, detection.bbox.size.y, detection.bbox.size.z = size
         detection.results.append(result)
         message.detections.append(detection)
     return message
@@ -2302,6 +2369,34 @@ def _estimates_from_vision(message: Any) -> tuple[ObjectEstimate3D, ...]:
         if not all(math.isfinite(value) for value in xyz):
             raise ValueError("vision_msgs 三维位置包含 NaN/Inf")
         confidence = _validated_confidence(hypothesis.score, "vision_msgs 三维结果")
+        pose = _vision_result_pose(result)
+        orientation_values = (
+            float(pose.orientation.x),
+            float(pose.orientation.y),
+            float(pose.orientation.z),
+            float(pose.orientation.w),
+        )
+        if not all(math.isfinite(value) for value in orientation_values):
+            raise ValueError("vision_msgs 三维姿态包含 NaN/Inf")
+        orientation_norm = math.sqrt(
+            sum(value * value for value in orientation_values)
+        )
+        orientation = None if orientation_norm <= 1e-12 else orientation_values
+        if not hasattr(detection, "id") or not hasattr(detection, "bbox"):
+            raise RuntimeError("vision_msgs Detection3D 缺少 id/bbox 字段")
+        size_values = (
+            float(detection.bbox.size.x),
+            float(detection.bbox.size.y),
+            float(detection.bbox.size.z),
+        )
+        if not all(math.isfinite(value) for value in size_values):
+            raise ValueError("vision_msgs bbox.size 包含 NaN/Inf")
+        if all(value == 0.0 for value in size_values):
+            size = None
+        elif not all(value > 0.0 for value in size_values):
+            raise ValueError("vision_msgs bbox.size 必须全零或三轴均为正数")
+        else:
+            size = size_values
         try:
             timestamp_ns = _stamp_to_ns(header.stamp)
         except (AttributeError, TypeError, ValueError):
@@ -2316,6 +2411,9 @@ def _estimates_from_vision(message: Any) -> tuple[ObjectEstimate3D, ...]:
                 frame_id=str(getattr(header, "frame_id", "") or array_frame_id),
                 timestamp_ns=timestamp_ns,
                 slot_type=SlotType.UNKNOWN,
+                object_id=str(detection.id).strip() or None,
+                orientation_xyzw=orientation,
+                size_xyz_m=size,
             )
         )
     return tuple(converted)

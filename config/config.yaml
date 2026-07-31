@@ -101,13 +101,77 @@ perception:
     max_track_age_s: 1.0
     # 相邻稳定轨迹的三维中心若跳变超过该值则作为离群值拒绝，不污染EMA。
     max_position_jump_m: 1.0
-    # 顺序为[width_m,height_m,depth_extent_m]。数值来自正式
+    # 顺序为[width_m,height_m,camera_ray_depth_extent_m]，当前只服务启发式中心补偿。
+    # 它不是随机yaw下经过frame语义确认的物体局部XYZ尺寸，不得写入size_xyz_m。数值来自正式
     # material_sorting/mjcf/material_competition.xml：三类movable_box的MuJoCo
     # 半尺寸均为[0.12,0.08,0.095]m，因此这里填写完整尺寸[0.24,0.16,0.19]m。
     object_dimensions_m:
       pink: [0.24, 0.16, 0.19]
       yellow: [0.24, 0.16, 0.19]
       brown: [0.24, 0.16, 0.19]
+
+# 提交1只冻结配置契约，不构造ArmPlanner。enabled默认关闭；null表示尚未标定，不能由
+# 代码补隐藏默认值。抓取与放置启用前分别调用ArmPlanningConfig的操作级验证。
+arm_planning:
+  enabled: false
+  min_object_confidence: null
+  transform_max_age_ns: null
+  object_estimate_max_age_ns: null
+  joint_state_max_age_ns: null
+  planned_context_max_age_ns: null
+  confirmed_context_max_age_ns: null
+  pregrasp_distance_m: null
+  grasp_contact_offset_m: null
+  lift_distance_m: null
+  retreat_distance_m: null
+  preplace_height_m: null
+  release_offset_m: null
+  post_release_retreat_distance_m: null
+  settle_time_s: null
+  max_slide_waypoint_delta_m: null
+  max_arm_waypoint_delta_rad: null
+  max_gripper_waypoint_delta: null
+  pregrasp_duration_s: null
+  grasp_duration_s: null
+  lift_duration_s: null
+  retreat_duration_s: null
+  preplace_duration_s: null
+  lower_duration_s: null
+  release_duration_s: null
+  post_release_retreat_duration_s: null
+  # 官方离线mmk2_control.xml左右夹爪actuator ctrlrange均为[0,1]；仅冻结硬范围。
+  left_gripper_min: 0.0
+  left_gripper_max: 1.0
+  right_gripper_min: 0.0
+  right_gripper_max: 1.0
+  # 硬范围已确认不等于开闭值或夹持效果已标定；以下值继续显式关闭。
+  left_gripper_open: null
+  left_gripper_closed: null
+  right_gripper_open: null
+  right_gripper_closed: null
+  gripper_verified_in_official_environment: false
+
+# 提交3A只冻结并实现纯Python轨迹执行；本节全部为显式未标定值，因此运行配置默认关闭。
+# 未来ROS组装层获准接线前必须逐项填写并构造ArmExecutionConfig，执行器不得补默认值。
+# 夹爪位置范围是[0,1]；max_gripper_velocity_per_s单位为控制量/秒，不受位置上限1约束，
+# 但具体速度仍须在官方仿真中标定。
+arm_execution:
+  feedback_max_age_ns: null
+  trajectory_max_age_ns: null
+  command_ttl_ns: null
+  max_control_period_ns: null
+  waypoint_timeout_margin_ns: null
+  total_timeout_margin_ns: null
+  max_slide_velocity_m_s: null
+  max_arm_velocity_rad_s: null
+  max_gripper_velocity_per_s: null
+  slide_tolerance_m: null
+  arm_tolerance_rad: null
+  gripper_tolerance: null
+  settle_cycles: null
+  initial_slide_error_limit_m: null
+  initial_arm_error_limit_rad: null
+  initial_gripper_error_limit: null
 
 fsm:
   # 客户端在抓取失败后重新进入REFINE_TARGET的次数，不等于裁判允许的总尝试规则。
