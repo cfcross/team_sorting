@@ -4,7 +4,7 @@
 
 ``JointTrajectory``
 → ``ArmExecutionController.start_trajectory`` 装载并校验
-→ ``step``（待机械臂2实现）按实际 ``RobotJointState`` 插值和判断进度
+→ ``step`` 按实际 ``RobotJointState`` 插值和判断进度
 → ``ManipulationCommand`` 候选关节目标 + ``ManipulationStatus`` 执行状态
 → ``ActionMux`` 结合实际反馈、TTL和FSM安全阶段生成 ``FinalAction[19]``
 → ``OfficialCommandPublisher`` 拆分并发布官方关节话题。
@@ -13,9 +13,9 @@
 和抓放验证必须依据实际反馈，不能只看目标命令或等待时间。本文件不负责IK、抓取位姿
 规划、ROS2发布、全局FSM推进或视觉算法，也不能绕过 ``ActionMux``。
 
-当前骨架只实现轨迹入口校验和基于实际反馈的安全保持。完整插值、限速、局部抓放阶段、
-试抬验证与恢复仍由机械臂2负责人实现；未实现部分继续明确抛出
-``NotImplementedError``，不会返回伪成功。
+当前定位为：通用轨迹采样器——负责时间插值、controlled_mask、关节限速、到位判断和
+稳定确认。不负责抓放局部阶段状态机（MOVE_PREGRASP 等），local_phase 不驱动 FSM 阶段
+推进。FSM 应依据 ManipulationStatus.success 和 failure_reason 判断执行结果。
 """
 
 from __future__ import annotations
@@ -129,6 +129,29 @@ class ArmExecutionConfig:
     feedback_max_age_ns: int | None = None
     trajectory_max_age_ns: int | None = None
 
+    def __post_init__(self) -> None:
+        if self.joint_tolerance_17 is not None:
+            err = _finite_vector_error(self.joint_tolerance_17, 17, "joint_tolerance_17")
+            if err:
+                raise ValueError(err)
+            if not all(v > 0.0 for v in self.joint_tolerance_17):
+                raise ValueError("joint_tolerance_17 各项必须为正")
+        if self.max_joint_velocity_17 is not None:
+            err = _finite_vector_error(self.max_joint_velocity_17, 17, "max_joint_velocity_17")
+            if err:
+                raise ValueError(err)
+            if not all(v > 0.0 for v in self.max_joint_velocity_17):
+                raise ValueError("max_joint_velocity_17 各项必须为正")
+        for name, value in (
+            ("settle_cycles", self.settle_cycles),
+            ("total_timeout_ns", self.total_timeout_ns),
+            ("command_ttl_ns", self.command_ttl_ns),
+            ("feedback_max_age_ns", self.feedback_max_age_ns),
+            ("trajectory_max_age_ns", self.trajectory_max_age_ns),
+        ):
+            if value is not None:
+                _require_integer_ns(value, name, positive=True)
+
 
 class ArmExecutionController:
     """双臂轨迹执行器和局部状态机骨架。
@@ -159,6 +182,7 @@ class ArmExecutionController:
         self._cached_verification = None
         self._last_step_ns: int | None = None
         self._completed = False
+        self._implicit_start_position: tuple[float, ...] | None = None
 
     def create_hold_command(
         self, actual_joints: RobotJointState, timestamp_ns: int, valid_for_ns: int
@@ -249,6 +273,7 @@ class ArmExecutionController:
         self._cached_verification = None
         self._last_step_ns = None
         self._completed = False
+        self._implicit_start_position: tuple[float, ...] | None = None
         self.local_phase = LocalPhase.IDLE
 
     def step(
@@ -318,12 +343,9 @@ class ArmExecutionController:
                 ),
                 ManipulationStatus(
                     local_phase=self.local_phase,
-                    state="FAILED",
-                    progress=0.0,
-                    max_joint_error=float("inf"),
-                    success=False,
-                    failure_reason=reason,
-                    timestamp_ns=timestamp_ns,
+                    state="FAILED", progress=0.0,
+                    max_joint_error=float("inf"), success=False,
+                    failure_reason=reason, timestamp_ns=timestamp_ns,
                 ),
             )
         position_error = _finite_vector_error(
@@ -344,16 +366,13 @@ class ArmExecutionController:
                 ),
                 ManipulationStatus(
                     local_phase=self.local_phase,
-                    state="FAILED",
-                    progress=0.0,
-                    max_joint_error=float("inf"),
-                    success=False,
-                    failure_reason=position_error,
-                    timestamp_ns=timestamp_ns,
+                    state="FAILED", progress=0.0,
+                    max_joint_error=float("inf"), success=False,
+                    failure_reason=position_error, timestamp_ns=timestamp_ns,
                 ),
             )
 
-        # ---- 2. 先检查 FAILED（必须在检查 _trajectory 之前） ----
+        # ---- 2. 先检查 FAILED ----
         if self.local_phase is LocalPhase.FAILED:
             return (
                 ManipulationCommand(
@@ -393,77 +412,128 @@ class ArmExecutionController:
                 ),
             )
 
-        # ---- 4. 反馈新鲜度检查（_trajectory 已确保非 None） ----
+        # ---- 4. 配置完整性检查 ----
         cfg = self._config
-        if cfg.feedback_max_age_ns is not None:
-            if actual_joints.timestamp_ns > timestamp_ns:
-                self.local_phase = LocalPhase.FAILED
-                self._trajectory = None
-                reason = "实际关节反馈时间来自未来，不可信"
-                return (
-                    ManipulationCommand(
-                        joint_target=actual_joints.position,
-                        controlled_mask=(True,) * 17,
-                        local_phase=self.local_phase,
-                        timestamp_ns=timestamp_ns,
-                        valid_until_ns=timestamp_ns,
-                        valid=False,
-                        failure_reason=reason,
-                    ),
-                    ManipulationStatus(
-                        local_phase=self.local_phase,
-                        state="FAILED", progress=0.0,
-                        max_joint_error=float("inf"), success=False,
-                        failure_reason=reason, timestamp_ns=timestamp_ns,
-                    ),
-                )
-            age_ns = timestamp_ns - actual_joints.timestamp_ns
-            if age_ns > cfg.feedback_max_age_ns:
-                self.local_phase = LocalPhase.FAILED
-                self._trajectory = None
-                reason = f"实际关节反馈过期（{age_ns}ns > {cfg.feedback_max_age_ns}ns）"
-                return (
-                    ManipulationCommand(
-                        joint_target=actual_joints.position,
-                        controlled_mask=(True,) * 17,
-                        local_phase=self.local_phase,
-                        timestamp_ns=timestamp_ns,
-                        valid_until_ns=timestamp_ns,
-                        valid=False,
-                        failure_reason=reason,
-                    ),
-                    ManipulationStatus(
-                        local_phase=self.local_phase,
-                        state="FAILED", progress=0.0,
-                        max_joint_error=float("inf"), success=False,
-                        failure_reason=reason, timestamp_ns=timestamp_ns,
-                    ),
-                )
-        if cfg.trajectory_max_age_ns is not None:
-            traj_age_ns = timestamp_ns - self._trajectory.timestamp_ns
-            if traj_age_ns > cfg.trajectory_max_age_ns:
-                self.local_phase = LocalPhase.FAILED
-                self._trajectory = None
-                reason = f"轨迹规划时间过期（{traj_age_ns}ns > {cfg.trajectory_max_age_ns}ns）"
-                return (
-                    ManipulationCommand(
-                        joint_target=actual_joints.position,
-                        controlled_mask=(True,) * 17,
-                        local_phase=self.local_phase,
-                        timestamp_ns=timestamp_ns,
-                        valid_until_ns=timestamp_ns,
-                        valid=False,
-                        failure_reason=reason,
-                    ),
-                    ManipulationStatus(
-                        local_phase=self.local_phase,
-                        state="FAILED", progress=0.0,
-                        max_joint_error=float("inf"), success=False,
-                        failure_reason=reason, timestamp_ns=timestamp_ns,
-                    ),
-                )
+        config_errors: list[str] = []
+        if cfg.max_joint_velocity_17 is None:
+            config_errors.append("max_joint_velocity_17")
+        if cfg.total_timeout_ns is None:
+            config_errors.append("total_timeout_ns")
+        if cfg.feedback_max_age_ns is None:
+            config_errors.append("feedback_max_age_ns")
+        if cfg.trajectory_max_age_ns is None:
+            config_errors.append("trajectory_max_age_ns")
+        if config_errors:
+            self.local_phase = LocalPhase.FAILED
+            self._trajectory = None
+            reason = f"安全关键配置缺失，拒绝执行：{', '.join(config_errors)}"
+            return (
+                ManipulationCommand(
+                    joint_target=actual_joints.position,
+                    controlled_mask=(True,) * 17,
+                    local_phase=self.local_phase,
+                    timestamp_ns=timestamp_ns,
+                    valid_until_ns=timestamp_ns,
+                    valid=False,
+                    failure_reason=reason,
+                ),
+                ManipulationStatus(
+                    local_phase=self.local_phase,
+                    state="FAILED", progress=0.0,
+                    max_joint_error=float("inf"), success=False,
+                    failure_reason=reason, timestamp_ns=timestamp_ns,
+                ),
+            )
 
-        # ---- 5. 时间单调性检查 ----
+        # ---- 5. 反馈和轨迹新鲜度检查 ----
+        if actual_joints.timestamp_ns > timestamp_ns:
+            self.local_phase = LocalPhase.FAILED
+            self._trajectory = None
+            reason = "实际关节反馈时间来自未来，不可信"
+            return (
+                ManipulationCommand(
+                    joint_target=actual_joints.position,
+                    controlled_mask=(True,) * 17,
+                    local_phase=self.local_phase,
+                    timestamp_ns=timestamp_ns,
+                    valid_until_ns=timestamp_ns,
+                    valid=False,
+                    failure_reason=reason,
+                ),
+                ManipulationStatus(
+                    local_phase=self.local_phase,
+                    state="FAILED", progress=0.0,
+                    max_joint_error=float("inf"), success=False,
+                    failure_reason=reason, timestamp_ns=timestamp_ns,
+                ),
+            )
+        age_ns = timestamp_ns - actual_joints.timestamp_ns
+        if age_ns > cfg.feedback_max_age_ns:
+            self.local_phase = LocalPhase.FAILED
+            self._trajectory = None
+            reason = f"实际关节反馈过期（{age_ns}ns > {cfg.feedback_max_age_ns}ns）"
+            return (
+                ManipulationCommand(
+                    joint_target=actual_joints.position,
+                    controlled_mask=(True,) * 17,
+                    local_phase=self.local_phase,
+                    timestamp_ns=timestamp_ns,
+                    valid_until_ns=timestamp_ns,
+                    valid=False,
+                    failure_reason=reason,
+                ),
+                ManipulationStatus(
+                    local_phase=self.local_phase,
+                    state="FAILED", progress=0.0,
+                    max_joint_error=float("inf"), success=False,
+                    failure_reason=reason, timestamp_ns=timestamp_ns,
+                ),
+            )
+        if self._trajectory.timestamp_ns > timestamp_ns:
+            self.local_phase = LocalPhase.FAILED
+            self._trajectory = None
+            reason = "轨迹规划时间来自未来，拒绝执行"
+            return (
+                ManipulationCommand(
+                    joint_target=actual_joints.position,
+                    controlled_mask=(True,) * 17,
+                    local_phase=self.local_phase,
+                    timestamp_ns=timestamp_ns,
+                    valid_until_ns=timestamp_ns,
+                    valid=False,
+                    failure_reason=reason,
+                ),
+                ManipulationStatus(
+                    local_phase=self.local_phase,
+                    state="FAILED", progress=0.0,
+                    max_joint_error=float("inf"), success=False,
+                    failure_reason=reason, timestamp_ns=timestamp_ns,
+                ),
+            )
+        traj_age_ns = timestamp_ns - self._trajectory.timestamp_ns
+        if traj_age_ns > cfg.trajectory_max_age_ns:
+            self.local_phase = LocalPhase.FAILED
+            self._trajectory = None
+            reason = f"轨迹规划时间过期（{traj_age_ns}ns > {cfg.trajectory_max_age_ns}ns）"
+            return (
+                ManipulationCommand(
+                    joint_target=actual_joints.position,
+                    controlled_mask=(True,) * 17,
+                    local_phase=self.local_phase,
+                    timestamp_ns=timestamp_ns,
+                    valid_until_ns=timestamp_ns,
+                    valid=False,
+                    failure_reason=reason,
+                ),
+                ManipulationStatus(
+                    local_phase=self.local_phase,
+                    state="FAILED", progress=0.0,
+                    max_joint_error=float("inf"), success=False,
+                    failure_reason=reason, timestamp_ns=timestamp_ns,
+                ),
+            )
+
+        # ---- 6. 时间单调性检查 ----
         if self._last_step_ns is not None and timestamp_ns <= self._last_step_ns:
             self.local_phase = LocalPhase.FAILED
             self._trajectory = None
@@ -486,14 +556,15 @@ class ArmExecutionController:
                 ),
             )
 
-        # ---- 6. 时间基准 ----
+        # ---- 7. 首次计时 + 隐式起点 ----
         if self._trajectory_started_ns is None:
             self._trajectory_started_ns = timestamp_ns
+            self._implicit_start_position = actual_joints.position
         elapsed_ns = timestamp_ns - self._trajectory_started_ns
         elapsed_s = elapsed_ns / 1e9
 
-        # ---- 7. 总超时检查 ----
-        if cfg.total_timeout_ns is not None and elapsed_ns > cfg.total_timeout_ns:
+        # ---- 8. 总超时检查 ----
+        if elapsed_ns > cfg.total_timeout_ns:
             self.local_phase = LocalPhase.FAILED
             self._trajectory = None
             reason = f"轨迹执行总超时（{elapsed_ns}ns > {cfg.total_timeout_ns}ns）"
@@ -515,15 +586,15 @@ class ArmExecutionController:
                 ),
             )
 
-        # ---- 8. 路点查找（策略1：轨迹时间插值） ----
+        # ---- 9. 路点查找（策略1） + mask 切换检查（问题8） ----
         waypoints = self._trajectory.waypoints
+        first_wp_time = waypoints[0].time_from_start_s
         prev_wp = waypoints[-1]
         next_wp = waypoints[-1]
         alpha = 0.0
         found = False
         prev_mask = waypoints[0].controlled_mask
         for i in range(len(waypoints)):
-            # 检查相邻路点 mask 是否一致（阻断问题8）
             if i > 0 and waypoints[i].controlled_mask != prev_mask:
                 self.local_phase = LocalPhase.FAILED
                 self._trajectory = None
@@ -583,14 +654,16 @@ class ArmExecutionController:
             prev_wp = waypoints[-1]
             next_wp = waypoints[-1]
 
-        # ---- 9. 首路点保护（阻断问题4） ----
-        first_wp_time = waypoints[0].time_from_start_s
-        if self._trajectory_started_ns == timestamp_ns and first_wp_time > 0.0:
-            # 首次 step 且轨迹不从 0 秒开始 → 以当前实际姿态为隐式 t=0 路点
-            target = actual_joints.position
-            mask = waypoints[0].controlled_mask
-        else:
-            # ---- 10. 线性插值（策略1续） ----
+        # ---- 10. 隐式起点插值（首路点保护：问题2 + gap A） ----
+        if self._implicit_start_position is not None and elapsed_s < first_wp_time and first_wp_time > 0.0:
+            _IMPLICIT_RAMP_S = 0.05  # 待队长确认
+            implicit_alpha = min(elapsed_s / _IMPLICIT_RAMP_S, 1.0)
+            interpolated = tuple(
+                self._implicit_start_position[i]
+                + implicit_alpha * (waypoints[0].joint_position[i] - self._implicit_start_position[i])
+                for i in range(17)
+            )
+        elif found or elapsed_s >= first_wp_time:
             if alpha < 0.0:
                 alpha = 0.0
             elif alpha > 1.0:
@@ -599,15 +672,40 @@ class ArmExecutionController:
                 prev_wp.joint_position[i] + alpha * (next_wp.joint_position[i] - prev_wp.joint_position[i])
                 for i in range(17)
             )
-            # ---- 11. controlled_mask（策略2） ----
-            mask = prev_wp.controlled_mask
-            target = tuple(
-                interpolated[i] if mask[i] else actual_joints.position[i]
-                for i in range(17)
-            )
+        else:
+            interpolated = self._implicit_start_position if self._implicit_start_position is not None else waypoints[0].joint_position
 
-        # ---- 12. 关节限速（策略3） ----
-        if cfg.max_joint_velocity_17 is not None and self._last_step_ns is not None:
+        # ---- 11. controlled_mask（策略2） + 全 False 拒绝（问题6） ----
+        mask = prev_wp.controlled_mask
+        if not any(mask):
+            self.local_phase = LocalPhase.FAILED
+            self._trajectory = None
+            reason = "轨迹所有关节均不受控（controlled_mask 全 False），拒绝执行"
+            return (
+                ManipulationCommand(
+                    joint_target=actual_joints.position,
+                    controlled_mask=(True,) * 17,
+                    local_phase=self.local_phase,
+                    timestamp_ns=timestamp_ns,
+                    valid_until_ns=timestamp_ns,
+                    valid=False,
+                    failure_reason=reason,
+                ),
+                ManipulationStatus(
+                    local_phase=self.local_phase,
+                    state="FAILED", progress=0.0,
+                    max_joint_error=float("inf"), success=False,
+                    failure_reason=reason, timestamp_ns=timestamp_ns,
+                ),
+            )
+        raw_target = tuple(
+            interpolated[i] if mask[i] else actual_joints.position[i]
+            for i in range(17)
+        )
+
+        # ---- 12. 关节限速（策略3）—— 命令用限速后 target，到位/误差用 raw_target ----
+        target = raw_target
+        if self._last_step_ns is not None:
             dt_s = (timestamp_ns - self._last_step_ns) / 1e9
             if dt_s > 0.0:
                 target_list = list(target)
@@ -654,23 +752,24 @@ class ArmExecutionController:
             valid=True,
         )
 
-        # ---- 14. 实际误差计算 ----
+        # ---- 14. 实际误差计算（基于 raw_target） ----
         controlled_errors = [
-            abs(target[i] - actual_joints.position[i])
+            abs(raw_target[i] - actual_joints.position[i])
             for i in range(17) if mask[i]
         ]
         max_err = max(controlled_errors) if controlled_errors else 0.0
 
-        # ---- 15. 到位判断（fail closed：容差未配置 → 永不 success） ----
+        # ---- 15. 到位判断（基于最终路点位置，不是本周期 raw_target） ----
         trajectory_ended = elapsed_s >= waypoints[-1].time_from_start_s
+        final_wp = waypoints[-1]
         arrived = False
         if cfg.joint_tolerance_17 is not None:
             arrived = all(
-                abs(target[i] - actual_joints.position[i]) <= cfg.joint_tolerance_17[i]
+                abs(final_wp.joint_position[i] - actual_joints.position[i]) <= cfg.joint_tolerance_17[i]
                 for i in range(17) if mask[i]
             )
 
-        # ---- 16. 稳定性确认（fail closed：周期数未配置 → 永不 success） ----
+        # ---- 16. 稳定性确认（fail closed） ----
         if cfg.settle_cycles is not None and cfg.joint_tolerance_17 is not None:
             if arrived:
                 self._stable_cycle_count += 1
@@ -678,9 +777,9 @@ class ArmExecutionController:
                 self._stable_cycle_count = 0
             settled = self._stable_cycle_count >= cfg.settle_cycles
         else:
-            settled = False  # fail closed：参数缺失永不成功
+            settled = False
 
-        # ---- 17. 完成判断 + 终态锁定（阻断问题1、7） ----
+        # ---- 17. 完成判断 + 终态锁定 ----
         if trajectory_ended and arrived and settled:
             success = True
             state = "COMPLETED"

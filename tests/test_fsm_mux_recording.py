@@ -77,7 +77,7 @@ def _joints() -> RobotJointState:
                   0.40, -0.01, -0.02, -0.03, -0.04, -0.05, -0.06, 0.45),
         velocity=(0.0,) * 17,
         effort=(0.0,) * 17,
-        timestamp_ns=1_000,
+        timestamp_ns=0,
     )
 
 
@@ -148,7 +148,7 @@ def _execution_trajectory(
     return JointTrajectory(
         trajectory_id=trajectory_id,
         waypoints=selected_waypoints,  # type: ignore[arg-type]
-        timestamp_ns=2_000,
+        timestamp_ns=0,
         valid=valid,
         failure_reason=failure_reason,
     )
@@ -2366,8 +2366,8 @@ def _test_config(**overrides: object) -> ArmExecutionConfig:
         settle_cycles=2,
         total_timeout_ns=30_000_000_000,
         command_ttl_ns=100_000_000,
-        feedback_max_age_ns=None,
-        trajectory_max_age_ns=None,
+        feedback_max_age_ns=300_000_000_000,
+        trajectory_max_age_ns=300_000_000_000,
     )
     kwargs.update(overrides)
     return ArmExecutionConfig(**kwargs)
@@ -2377,7 +2377,7 @@ def _step_joints(**overrides: object) -> RobotJointState:
     """与 _joints() 不同的实际反馈。"""
     pos = (0.20, 0.10, -0.30, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60,
            0.50, -0.10, -0.20, -0.30, -0.40, -0.50, -0.60, 0.55)
-    kwargs = dict(position=pos, velocity=(0.0,)*17, effort=(0.0,)*17, timestamp_ns=10_000)
+    kwargs = dict(position=pos, velocity=(0.0,)*17, effort=(0.0,)*17, timestamp_ns=0)
     kwargs.update(overrides)
     return RobotJointState(**kwargs)
 
@@ -2397,7 +2397,7 @@ def _step_waypoint(
 def _step_trajectory(
     waypoints: tuple[object, ...],
     trajectory_id: str = "test-trajectory",
-    timestamp_ns: int = 10_000,
+    timestamp_ns: int = 0,
 ) -> JointTrajectory:
     return JointTrajectory(
         trajectory_id=trajectory_id,
@@ -2426,7 +2426,7 @@ def test_step_invalid_actual_joints_enters_failed() -> None:
     controller.start_trajectory(_execution_trajectory())
     invalid = RobotJointState(
         position=_joints().position, velocity=(0.0,)*17, effort=(0.0,)*17,
-        timestamp_ns=10_000, valid=False, failure_reason="JointState过期",
+        timestamp_ns=0, valid=False, failure_reason="JointState过期",
     )
     cmd, status = controller.step(invalid, 2_000)
     assert cmd.valid is False
@@ -2490,7 +2490,7 @@ def test_step_at_first_waypoint_emits_that_position() -> None:
 def test_step_between_waypoints_interpolates_linearly() -> None:
     base = _joints().position
     p0, p2 = base, tuple(v + 0.02 for v in base)
-    controller = ArmExecutionController(_test_config(max_joint_velocity_17=None))
+    controller = ArmExecutionController(_test_config())
     controller.start_trajectory(_step_trajectory((_step_waypoint(0.0, p0), _step_waypoint(2.0, p2))))
     controller.step(_joints(), 0)
     cmd, _ = controller.step(_joints(), 1_000_000_000)
@@ -2501,7 +2501,7 @@ def test_step_between_waypoints_interpolates_linearly() -> None:
 def test_step_exactly_on_middle_waypoint() -> None:
     base = _joints().position
     p0, p1, p2 = base, tuple(v + 0.01 for v in base), tuple(v + 0.02 for v in base)
-    controller = ArmExecutionController(_test_config(max_joint_velocity_17=None))
+    controller = ArmExecutionController(_test_config())
     controller.start_trajectory(_step_trajectory((_step_waypoint(0.0,p0), _step_waypoint(1.0,p1), _step_waypoint(2.0,p2))))
     controller.step(_joints(), 0)
     cmd, _ = controller.step(_joints(), 1_000_000_000)
@@ -2511,7 +2511,7 @@ def test_step_exactly_on_middle_waypoint() -> None:
 def test_step_trajectory_completes_with_config() -> None:
     """配置了容差和稳定数 → 到位后 success=True + COMPLETED。"""
     target = _joints().position
-    actual = RobotJointState(position=target, velocity=(0.0,)*17, effort=(0.0,)*17, timestamp_ns=10_000)
+    actual = RobotJointState(position=target, velocity=(0.0,)*17, effort=(0.0,)*17, timestamp_ns=0)
     controller = ArmExecutionController(_test_config())
     controller.start_trajectory(_step_trajectory((_step_waypoint(0.0, target), _step_waypoint(0.1, target))))
     controller.step(actual, 0)
@@ -2524,7 +2524,7 @@ def test_step_trajectory_completes_with_config() -> None:
 def test_step_beyond_last_waypoint_holds_last_target() -> None:
     base = _joints().position
     p_last = tuple(v + 0.02 for v in base)
-    controller = ArmExecutionController(_test_config(max_joint_velocity_17=None))
+    controller = ArmExecutionController(_test_config())
     controller.start_trajectory(_step_trajectory((_step_waypoint(0.0, base), _step_waypoint(1.0, p_last))))
     controller.step(_joints(), 0)
     cmd, _ = controller.step(_joints(), 7_000_000_000)
@@ -2534,7 +2534,7 @@ def test_step_beyond_last_waypoint_holds_last_target() -> None:
 def test_step_multi_segment_selects_correct_interval() -> None:
     base = _joints().position
     p0, p1, p2, p3 = base, tuple(v+0.004 for v in base), tuple(v+0.008 for v in base), tuple(v+0.012 for v in base)
-    controller = ArmExecutionController(_test_config(max_joint_velocity_17=None))
+    controller = ArmExecutionController(_test_config())
     controller.start_trajectory(_step_trajectory((_step_waypoint(0.0,p0),_step_waypoint(1.0,p1),_step_waypoint(2.0,p2),_step_waypoint(3.0,p3))))
     controller.step(_joints(), 0)
     cmd, _ = controller.step(_joints(), 2_500_000_000)
@@ -2664,7 +2664,7 @@ def test_step_late_first_waypoint_uses_actual_position() -> None:
     """首路点 t>0 → 首次step用实际位置代替跳变。"""
     base = _joints().position
     far_target = tuple(v + 5.0 for v in base)
-    controller = ArmExecutionController(_test_config(max_joint_velocity_17=None))
+    controller = ArmExecutionController(_test_config())
     controller.start_trajectory(_step_trajectory((_step_waypoint(1.0, far_target), _step_waypoint(3.0, far_target))))
     cmd, _ = controller.step(_joints(), 2_000)
     # 首路点 t=1s > 0 → 应以实际位置为隐式 t=0 路点
@@ -2679,7 +2679,7 @@ def test_step_late_first_waypoint_uses_actual_position() -> None:
 def test_step_repeated_completed_returns_safe_hold() -> None:
     """首次 COMPLETED 后重复调用 → valid=False 安全保持。"""
     target = _joints().position
-    actual = RobotJointState(position=target, velocity=(0.0,)*17, effort=(0.0,)*17, timestamp_ns=10_000)
+    actual = RobotJointState(position=target, velocity=(0.0,)*17, effort=(0.0,)*17, timestamp_ns=0)
     controller = ArmExecutionController(_test_config())
     controller.start_trajectory(_step_trajectory((_step_waypoint(0.0, target), _step_waypoint(0.1, target))))
     controller.step(actual, 0)
@@ -2699,15 +2699,14 @@ def test_step_repeated_completed_returns_safe_hold() -> None:
 
 
 def test_step_no_config_never_completes() -> None:
-    """无 ArmExecutionConfig（安全参数全 None）→ fail closed，永不 COMPLETED。"""
+    """无 ArmExecutionConfig（安全参数全 None）→ 配置缺失直接 FAILED。"""
     target = _joints().position
-    actual = RobotJointState(position=target, velocity=(0.0,)*17, effort=(0.0,)*17, timestamp_ns=10_000)
+    actual = RobotJointState(position=target, velocity=(0.0,)*17, effort=(0.0,)*17, timestamp_ns=0)
     controller = ArmExecutionController()
     controller.start_trajectory(_step_trajectory((_step_waypoint(0.0, target), _step_waypoint(0.1, target))))
-    controller.step(actual, 0)
-    cmd, status = controller.step(actual, 200_000_000)
-    assert status.success is False
-    assert "容差" in status.failure_reason
+    cmd, status = controller.step(actual, 2_000)
+    assert cmd.valid is False
+    assert "配置缺失" in status.failure_reason
 
 
 # ============================================================================
@@ -2719,7 +2718,7 @@ def test_step_time_ended_but_joints_not_arrived_is_not_success() -> None:
     """轨迹时间结束但实际关节超差 → success=False。"""
     target = _joints().position
     far_away = tuple(v + 0.5 for v in target)
-    far_joints = RobotJointState(position=far_away, velocity=(0.0,)*17, effort=(0.0,)*17, timestamp_ns=10_000)
+    far_joints = RobotJointState(position=far_away, velocity=(0.0,)*17, effort=(0.0,)*17, timestamp_ns=0)
     controller = ArmExecutionController(_test_config())
     controller.start_trajectory(_step_trajectory((_step_waypoint(0.0, target), _step_waypoint(0.2, target))))
     controller.step(_joints(), 2_000)
@@ -2730,7 +2729,7 @@ def test_step_time_ended_but_joints_not_arrived_is_not_success() -> None:
 def test_step_within_tolerance_but_insufficient_settle_cycles() -> None:
     """到位但稳定周期不足(settle=2, 只稳了1) → success=False。"""
     target = _joints().position
-    actual = RobotJointState(position=target, velocity=(0.0,)*17, effort=(0.0,)*17, timestamp_ns=10_000)
+    actual = RobotJointState(position=target, velocity=(0.0,)*17, effort=(0.0,)*17, timestamp_ns=0)
     controller = ArmExecutionController(_test_config(settle_cycles=5))
     controller.start_trajectory(_step_trajectory((_step_waypoint(0.0, target), _step_waypoint(0.1, target))))
     controller.step(actual, 2_000)
@@ -2741,7 +2740,7 @@ def test_step_within_tolerance_but_insufficient_settle_cycles() -> None:
 def test_step_settle_cycles_reached_reports_success() -> None:
     """连续稳定周期达标 → success=True。"""
     target = _joints().position
-    actual = RobotJointState(position=target, velocity=(0.0,)*17, effort=(0.0,)*17, timestamp_ns=10_000)
+    actual = RobotJointState(position=target, velocity=(0.0,)*17, effort=(0.0,)*17, timestamp_ns=0)
     controller = ArmExecutionController(_test_config(settle_cycles=2))
     controller.start_trajectory(_step_trajectory((_step_waypoint(0.0, target), _step_waypoint(0.1, target))))
     controller.step(actual, 0)
@@ -2754,8 +2753,8 @@ def test_step_one_cycle_out_of_tolerance_resets_counter() -> None:
     """中间一周期超差 → 稳定计数清零。"""
     target = _joints().position
     far = tuple(v + 0.5 for v in target)
-    actual_ok = RobotJointState(position=target, velocity=(0.0,)*17, effort=(0.0,)*17, timestamp_ns=10_000)
-    actual_bad = RobotJointState(position=far, velocity=(0.0,)*17, effort=(0.0,)*17, timestamp_ns=10_000)
+    actual_ok = RobotJointState(position=target, velocity=(0.0,)*17, effort=(0.0,)*17, timestamp_ns=0)
+    actual_bad = RobotJointState(position=far, velocity=(0.0,)*17, effort=(0.0,)*17, timestamp_ns=0)
     controller = ArmExecutionController(_test_config(settle_cycles=3))
     controller.start_trajectory(_step_trajectory((_step_waypoint(0.0, target), _step_waypoint(5.0, target))))
     controller.step(actual_ok, 0)
@@ -2767,7 +2766,7 @@ def test_step_one_cycle_out_of_tolerance_resets_counter() -> None:
 def test_step_max_joint_error_comes_from_actual_feedback() -> None:
     target = _joints().position
     offset = tuple(target[i] + (0.05 if i == 0 else 0.0) for i in range(17))
-    actual = RobotJointState(position=offset, velocity=(0.0,)*17, effort=(0.0,)*17, timestamp_ns=10_000)
+    actual = RobotJointState(position=offset, velocity=(0.0,)*17, effort=(0.0,)*17, timestamp_ns=0)
     controller = ArmExecutionController(_test_config())
     controller.start_trajectory(_step_trajectory((_step_waypoint(0.0, target),)))
     _, status = controller.step(actual, 2_000)
