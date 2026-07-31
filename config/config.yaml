@@ -28,6 +28,26 @@ frames:
   # Arm KDL 要求 footprint，修改此值不会自动补出 odom 到 footprint 的坐标变换。
   planning: "odom"
 
+# 全局官方发布门，独立于External Candidate自身的三道门。默认observe-only允许订阅、
+# FSM、ActionMux和团队遥测，但绝不创建五组官方控制publisher。只有显式同时设置
+# observe_only=false、enable_official_publish=true、simulation_only=true才允许创建
+# OfficialCommandPublisher；simulation_only=false在当前阶段启动即拒绝。
+control:
+  observe_only: true
+  enable_official_publish: false
+  simulation_only: true
+  # 仅用于“官方仿真Server与本节点共同全新启动且刚完成reset”的Stage 2A验证。
+  # enabled与fresh_reset_confirmed都必须由运行时临时配置显式开启；默认不建立head
+  # controller-target shadow。初值固定对应官方reset后的绝对controller target，不能
+  # 用/joint_states反馈替代，也不能推广到Server未reset或节点单独重启的场景。
+  head_target_tracking:
+    enabled: false
+    require_fresh_reset: true
+    fresh_reset_confirmed: false
+    initial_yaw_target: 0.0
+    initial_pitch_target: 0.0
+    require_exclusive_writer: true
+
 topics:
   # 任务：官方 Server 发布；TeamClientNode 和 DatasetRecorderNode 订阅。
   instruction: "/material/instruction"
@@ -40,8 +60,10 @@ topics:
   joint_states: "/joint_states"
   # 团队三维估计：PerceptionNode发布，TeamClientNode消费。
   object_estimates: "/team/object_estimates"
-  # 团队遥测：TeamClientNode发布，Recorder订阅；不能另拼第二份FinalAction。
+  # 团队遥测：TeamClientNode发布。Recorder订阅FinalAction/FSM，并在下方配对功能
+  # 启用时从同一配置入口订阅action_dispatch；两条动作遥测都不是执行确认。
   final_action: "/team/final_action"
+  action_dispatch: "/team/action_dispatch"
   fsm_status: "/team/fsm_status"
   # 唯一官方动作出口：只允许OfficialCommandPublisher向官方控制器发布这五项。
   # 当前字符串与本机官方源码一致，仍须在正式Docker用ros2 topic list/info核对类型和连接。
@@ -61,9 +83,95 @@ timing:
 perception:
   confidence_threshold: 0.65  # OfficialYoloAdapter阈值，无单位，合法范围0到1
   sync_queue_size: 10         # RGB/Depth近似同步队列长度，必须是非bool正整数
-  sync_slop_s: 0.05           # RGB/Depth近似同步容差，单位秒，必须非负
+  # 同时作为Perception3DEstimator对Detection/Depth/CameraInfo的最大绝对时间差；
+  # 必须是非零正有限秒数，三者任何一对超窗都不得产生有效三维结果。
+  sync_slop_s: 0.05
   # 原始深度乘该比例得到米；0.001表示毫米转米，由PerceptionNode构造DepthFrame。
   depth_unit_scale_m: 0.001
+  stabilizer_2d:
+    iou_match_threshold: 0.3
+    min_confirmed_hits: 2
+    max_missed_frames: 2
+    bbox_smoothing_alpha: 0.5
+    confidence_smoothing_alpha: 0.5
+  estimator_3d:
+    depth_radius_px: 4
+    ema_alpha: 0.5
+    converge_frames: 5
+    max_track_age_s: 1.0
+    # 相邻稳定轨迹的三维中心若跳变超过该值则作为离群值拒绝，不污染EMA。
+    max_position_jump_m: 1.0
+    # 顺序为[width_m,height_m,camera_ray_depth_extent_m]，当前只服务启发式中心补偿。
+    # 它不是随机yaw下经过frame语义确认的物体局部XYZ尺寸，不得写入size_xyz_m。数值来自正式
+    # material_sorting/mjcf/material_competition.xml：三类movable_box的MuJoCo
+    # 半尺寸均为[0.12,0.08,0.095]m，因此这里填写完整尺寸[0.24,0.16,0.19]m。
+    object_dimensions_m:
+      pink: [0.24, 0.16, 0.19]
+      yellow: [0.24, 0.16, 0.19]
+      brown: [0.24, 0.16, 0.19]
+
+# 提交1只冻结配置契约，不构造ArmPlanner。enabled默认关闭；null表示尚未标定，不能由
+# 代码补隐藏默认值。抓取与放置启用前分别调用ArmPlanningConfig的操作级验证。
+arm_planning:
+  enabled: false
+  min_object_confidence: null
+  transform_max_age_ns: null
+  object_estimate_max_age_ns: null
+  joint_state_max_age_ns: null
+  planned_context_max_age_ns: null
+  confirmed_context_max_age_ns: null
+  pregrasp_distance_m: null
+  grasp_contact_offset_m: null
+  lift_distance_m: null
+  retreat_distance_m: null
+  preplace_height_m: null
+  release_offset_m: null
+  post_release_retreat_distance_m: null
+  settle_time_s: null
+  max_slide_waypoint_delta_m: null
+  max_arm_waypoint_delta_rad: null
+  max_gripper_waypoint_delta: null
+  pregrasp_duration_s: null
+  grasp_duration_s: null
+  lift_duration_s: null
+  retreat_duration_s: null
+  preplace_duration_s: null
+  lower_duration_s: null
+  release_duration_s: null
+  post_release_retreat_duration_s: null
+  # 官方离线mmk2_control.xml左右夹爪actuator ctrlrange均为[0,1]；仅冻结硬范围。
+  left_gripper_min: 0.0
+  left_gripper_max: 1.0
+  right_gripper_min: 0.0
+  right_gripper_max: 1.0
+  # 硬范围已确认不等于开闭值或夹持效果已标定；以下值继续显式关闭。
+  left_gripper_open: null
+  left_gripper_closed: null
+  right_gripper_open: null
+  right_gripper_closed: null
+  gripper_verified_in_official_environment: false
+
+# 提交3A只冻结并实现纯Python轨迹执行；本节全部为显式未标定值，因此运行配置默认关闭。
+# 未来ROS组装层获准接线前必须逐项填写并构造ArmExecutionConfig，执行器不得补默认值。
+# 夹爪位置范围是[0,1]；max_gripper_velocity_per_s单位为控制量/秒，不受位置上限1约束，
+# 但具体速度仍须在官方仿真中标定。
+arm_execution:
+  feedback_max_age_ns: null
+  trajectory_max_age_ns: null
+  command_ttl_ns: null
+  max_control_period_ns: null
+  waypoint_timeout_margin_ns: null
+  total_timeout_margin_ns: null
+  max_slide_velocity_m_s: null
+  max_arm_velocity_rad_s: null
+  max_gripper_velocity_per_s: null
+  slide_tolerance_m: null
+  arm_tolerance_rad: null
+  gripper_tolerance: null
+  settle_cycles: null
+  initial_slide_error_limit_m: null
+  initial_arm_error_limit_rad: null
+  initial_gripper_error_limit: null
 
 fsm:
   # 客户端在抓取失败后重新进入REFINE_TARGET的次数，不等于裁判允许的总尝试规则。
@@ -84,14 +192,45 @@ action_mux:
   # [slide, head_yaw, head_pitch, left_arm_joint1..6, left_gripper,
   #  right_arm_joint1..6, right_gripper]。
   # slide单位米，head/arm旋转关节单位弧度，gripper使用官方0到1控制量。
-  # 当前具体数值不得视为正式物理限位；尤其六轴臂范围与本机官方MJCF/KDL尚未统一，
-  # 必须在正式Docker确认实际模型、KDL和控制器后再评审，不能仅凭本配置宣称安全。
+  # slide/head/gripper范围与固定场景Server运行时ctrlrange一致；六轴臂范围取原团队范围
+  # 与运行时ctrlrange的交集，不扩大原安全边界。完整实测事实冻结在Controller Manifest V1。
   joint_lower:
-    [-0.04, -0.50, -1.18, -3.14, -2.50, -3.14, -2.60, -3.14, -2.60,
-     0.00, -3.14, -2.50, -3.14, -2.60, -3.14, -2.60, 0.00]
+    [-0.04, -0.50, -1.18, -3.14, -2.50, -0.094, -2.60, -1.859, -2.60,
+     0.00, -3.14, -2.50, -0.094, -2.60, -1.859, -2.60, 0.00]
   joint_upper:
-    [0.87, 0.50, 0.16, 3.14, 2.50, 3.14, 2.60, 3.14, 2.60,
-     1.00, 3.14, 2.50, 3.14, 2.60, 3.14, 2.60, 1.00]
+    [0.87, 0.50, 0.16, 2.089, 0.181, 3.14, 2.60, 1.859, 2.60,
+     1.00, 2.089, 0.181, 3.14, 2.60, 1.859, 2.60, 1.00]
+
+# Stage 2A 外部安全Candidate consumer。三道执行门默认全部关闭；enabled=false时
+# team_client_node连订阅都不创建。这里仅支持adapter显式Trigger产生的fixed_head_yaw，
+# 不接收或映射pi05原生8维动作。
+external_candidate:
+  enabled: false
+  enable_actuation: false
+  simulation_only: true
+  topic: "/mmk2_pi05_adapter/safe_candidate"
+  schema_version: 1
+  expected_source: "fixed_safe_candidate"
+  expected_mode: "fixed_head_yaw"
+  allowed_controlled_indices: [3]
+  candidate_ttl_ms: 250.0
+  instruction_ttl_ms: 1500.0
+  joint_state_ttl_ms: 250.0
+  watchdog_timeout_ms: 300.0
+  max_joint_delta_rad: 0.01
+  max_joint_velocity_rad_s: 0.20
+  nominal_control_period_s: 0.05
+  # 仅为Stage 2仿真临时安全边界，不是官方MMK2物理限位；正式微动前必须在官方镜像验证。
+  provisional_head_yaw_lower_rad: -0.25
+  provisional_head_yaw_upper_rad: 0.25
+  require_unique_request_id: true
+  require_task_identity_match: true
+  require_generation_binding: true
+  allow_generation_binding: false
+  simulation_publish_enabled: false
+  # 必须由启动方显式配置，consumer绝不从Candidate反向采信episode_id。
+  expected_episode_id: ""
+  request_id_cache_size: 128
 
 recorder:
   # 普通launch默认不创建Recorder；record_data:=true时launch创建节点并显式覆盖为true。
@@ -102,6 +241,14 @@ recorder:
   root_dir: "./team_sorting_dataset"
   # EpisodeRecorder生成可读且安全的Episode目录名前缀。
   episode_prefix: "episode"
+  # Recorder旁路配对只关联已经产生的团队遥测，不参与ActionMux、FSM或官方发布。
+  action_pairing:
+    enabled: true
+    max_pending_per_side: 256
+    max_completed_sequences: 1024
+    max_wait_ns: 2000000000
+    prune_period_sec: 0.5
+    raw_payload_preview_chars: 2048
   # rosbag原样保存高带宽传感器、团队遥测和裁判信息；列表必须非空、无重复且以/开头。
   rosbag_topics:
     - "/material/instruction"                         # 原始任务消息

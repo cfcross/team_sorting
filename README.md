@@ -8,7 +8,47 @@
 旁路记录后续 ACT（动作分块 Transformer）/VLA（视觉—语言—动作模型）需要的数据。
 
 > 当前定位是“可导入、可测试、边界清晰的客户端骨架”，不是已经能完成比赛的成品。
-> 完整三维估计、导航、抓放规划、机械臂执行和比赛闭环仍未实现。
+> 真实相机/YOLO/MMK2FK 联调、导航、抓放规划、机械臂执行和比赛闭环仍未完成。
+
+### Stage 2A External Candidate Consumer
+
+当前代码包含对 adapter 提交
+`5fc0f2699645bc3735422e0841383b38a95d4b38` 的版本化 ROS String Candidate 的
+默认关闭 consumer。它只接受显式 Trigger 产生的 `fixed_head_yaw` 安全 Candidate，
+严格复核 JSON、任务身份、指令/JointState 新鲜度、ROS 时间、TTL、generation、request
+去重、单周期 delta、速度和临时仿真限位，再一次性转换为现有
+`ManipulationCommand`。pi05 原生 8D 动作没有被使用或映射。
+
+`enabled`、`enable_actuation` 和临时第三道门 `simulation_publish_enabled` 默认均为
+`false`；默认配置不创建外部 Candidate 订阅，也不会让它进入 ActionMux。即使显式启用，
+Candidate 也不能绕过现有 `ActionMux -> FinalAction[19] -> OfficialCommandPublisher`
+链路。当前阶段只完成 consumer 代码与测试，不代表仿真微动已经完成；head-yaw 临时边界
+也不是官方物理限位，正式运动前仍须在官方镜像验证。
+
+External Candidate三道门之外还有独立的全局官方发布门。默认
+`control.observe_only=true`、`control.enable_official_publish=false`、
+`control.simulation_only=true`：节点可以订阅状态、运行FSM和ActionMux，并发布
+`/team/fsm_status`、`/team/final_action`、`/team/action_dispatch`诊断遥测，但不会创建
+`OfficialCommandPublisher`或五组官方控制publisher，退出时也不会发布紧急底盘命令。
+只有显式同时设置`observe_only=false`、`enable_official_publish=true`且
+`simulation_only=true`才会创建官方发布器；observe-only优先关闭发布，
+`simulation_only=false`在当前阶段直接拒绝启动。运行时覆盖应通过
+`TEAM_SORTING_CONFIG`指向一份非持久配置，不能改写仓库默认值。
+
+Stage 2A的head发布还受`control.head_target_tracking`约束。该shadow默认关闭，只能在
+官方仿真Server与本节点共同全新启动、已确认刚完成reset、初始绝对controller target
+严格为`[0.0, 0.0]`且head话题没有其他publisher时临时启用。`/joint_states`是物理反馈，
+不能用于恢复或覆盖未知controller target；yaw-only发布复用shadow中的pitch target，
+而不是回写当前pitch反馈。节点重启、Server未重启、reset身份不确定或出现其他head
+writer时必须重新授权并fail closed。通用安全恢复仍需官方Server暴露controller target。
+无论全局发布门是否开启，当前Stage 2A节点退出都只取消control timer、清空pending并
+销毁ROS实体，不发布cmd_vel或任何关节controller target；JointState反馈不能作为退出
+安全保持目标。`publish_emergency_base_stop()`仅保留给未来明确授权的底盘故障路径。
+
+防重放状态在 Candidate 成功进入单元素 pending 槽时即生效：generation 在此时绑定、
+request ID 在此时记为已使用。即使 Candidate 随后在控制周期因 JointState、delta 或临时
+限位检查失败，这两项状态也不会回退或允许重放；这只是 fail-closed 防重放语义，不表示
+Candidate 已执行、已发布或已被机器人采用。
 
 ## 2. 官方仓库与团队仓库的边界
 
@@ -18,8 +58,8 @@
 
 | 团队文件 | 官方来源 | 复用能力 | 团队适配接口 | 当前状态 |
 |---|---|---|---|---|
-| `perception_2d.py` | 官方 `backends.py`、YOLO 权重 | 加载官方检测器并执行二维检测 | `OfficialYoloAdapter.self_check()` / `detect()` | 自检和接口骨架完成，正式推理待联调 |
-| `perception_3d.py` | DISCOVERSE 的 `MMK2FK`、官方 `box_detect.py` 的针孔反投影思路 | 根据实际底盘和关节状态获得相机外参 | `CameraTransformProvider.self_check()` / `camera_to_output()` | 接口骨架完成，完整三维中心估计待实现 |
+| `perception_2d.py` | 官方 `backends.py`、YOLO 权重 | 加载官方检测器并执行二维检测 | `OfficialYoloAdapter.self_check()` / `detect()` | 检测转换、稳定轨迹 ID 与回归测试完成，正式推理待联调 |
+| `perception_3d.py` | DISCOVERSE 的 `MMK2FK`、官方 `box_detect.py` 的针孔反投影思路 | 根据实际底盘和关节状态获得相机外参 | `CameraTransformProvider.self_check()` / `camera_to_output()` | 深度中位数、反投影、尺寸中心补偿、稳定 ID EMA 与时帧校验已实现；真实 ROS/FK 待联调 |
 | `arm_planning.py` | 官方 `MMK2Kdl` / `ArmKdl` | FK 自检和固定 slide 的 IK（逆运动学：由末端目标求关节目标） | `OfficialKDLAdapter.self_check()` / `solve_ik()` | 导入和自检骨架完成，抓放规划待实现 |
 | `fsm.py` | 官方 `/material/instruction` JSON | 接收官方任务字段，但解析规则由团队集中维护 | `InstructionParser.parse()` | 已实现并有测试 |
 | `ros_nodes.py` | 官方 `/joint_states` | 按名称把反馈映射成团队固定的 17 维实际关节顺序 | `JointStateMapper.map_message()` | 已实现，待官方环境核对关节名称 |
@@ -76,7 +116,9 @@
 ```
 
 图中 Navigation、Arm Planning 和 Arm Execution 表示目标架构。当前 `team_client_node`
-尚未把完整导航与抓放算法接入控制循环；它只生成底盘零速和基于实际关节反馈的保持命令。
+尚未把完整导航与抓放算法接入控制循环；默认只生成底盘零速候选，不生成主动17维关节
+保持候选。ActionMux仍可基于实际反馈形成诊断FinalAction，但observe-only全局门禁止
+将其发布到官方控制话题。
 
 ## 4. 三个 ROS2 节点
 
@@ -90,26 +132,30 @@ ROS 2 节点可以理解为一个独立运行、通过话题交换消息的程�
   `/head_camera/color/camera_info`、Odom `/slamware_ros_sdk_server_node/odom`、
   `/joint_states`。RGB 与 Depth 近似同步；Odom 和 JointState 取时间上最近且未超出容差的值。
 - **发布**：`/team/object_estimates`，类型为
-  `vision_msgs/msg/Detection3DArray`，载荷包含类别、三维位置、置信度、时间和坐标系；
-  `slot_type` 不通过该消息传输。
-- **调用**：`perception_2d.py` 的 `OfficialYoloAdapter`，`perception_3d.py` 的
-  `CameraTransformProvider` 与 `Perception3DEstimator`，以及 `interfaces.py` 中的感知接口。
+  `vision_msgs/msg/Detection3DArray`，载荷包含类别、稳定身份（可用时）、三维中心、
+  可选姿态/尺寸、置信度、时间和坐标系；`slot_type` 不通过该消息传输。团队内部适配
+  约定以零四元数表示“姿态不可用”、全零 `bbox.size` 表示“尺寸不可用”，接收时恢复
+  为 `None`；零四元数绝不归一化为单位姿态。该哨兵不是官方协议。
+- **调用**：`perception_2d.py` 的 `OfficialYoloAdapter` 与
+  `Detection2DStabilizer`，`perception_3d.py` 的 `CameraTransformProvider` 与
+  `Perception3DEstimator`，以及 `interfaces.py` 中的感知接口。
 - **不负责**：解析任务、目标选择、导航、机械臂规划、动作仲裁或官方控制发布。
-- **是否必需**：默认 launch 会启动；完整比赛链路需要它提供三维目标。但当前
-  `Perception3DEstimator.estimate()` 尚未实现，所以不能声称感知链已经闭环。
+- **是否必需**：默认 launch 会启动；完整比赛链路需要它提供三维目标。纯 Python
+  三维估计与失败语义已有回归测试，但尚未在正式 ROS、相机、YOLO 与 MMK2FK
+  组合环境完成端到端验证，所以仍不能声称感知链已经闭环。
 
 ### `team_client_node`
 
 - **订阅**：`/material/instruction`、`/slamware_ros_sdk_server_node/odom`、
   `/joint_states`、`/team/object_estimates`。
-- **发布**：团队遥测 `/team/fsm_status`、`/team/final_action`，并通过唯一的
-  `OfficialCommandPublisher` 发布五组官方控制话题。
-- **调用**：当前实际调用 `fsm.py`、`action_mux.py`、`arm_execution.py` 的安全保持、
-  `arm_planning.py` 的官方 KDL 启动自检，以及 `navigation.py` 的区域分类；完整架构还应
+- **发布**：团队遥测 `/team/fsm_status`、`/team/final_action`、`/team/action_dispatch`；只有全局发布门开启时，
+  才通过唯一的 `OfficialCommandPublisher` 发布五组官方控制话题。默认不创建该实例。
+- **调用**：当前实际调用 `fsm.py`、`action_mux.py`，并保留 `arm_execution.py` 的显式
+  主动保持能力，以及 `navigation.py` 的区域分类；完整架构还应
   在这里按 FSM 阶段组织导航、抓放规划和执行。
 - **不负责**：YOLO、深度图处理、相机外参算法、KDL 实现或数据落盘。
-- **是否必需**：默认 launch 会启动，也是控制链必需节点；只有它可以经
-  `OfficialCommandPublisher` 发官方控制话题。
+- **是否必需**：默认 launch 会启动；默认只观察和发团队遥测。只有全局发布门明确开启
+  时，它才可以经`OfficialCommandPublisher`发官方控制话题。
 
 `team_client_node` 每个控制周期构造的 `SensorSnapshot` 只含任务、底盘状态、实际关节
 状态和三维目标，**不含 RGB、Depth 或 CameraInfo**。图像留在感知节点和 rosbag，避免
@@ -117,7 +163,8 @@ ROS 2 节点可以理解为一个独立运行、通过话题交换消息的程�
 
 ### `dataset_recorder_node`
 
-- **订阅**：`/team/final_action`、`/team/fsm_status`、`/material/instruction`，以及
+- **订阅**：`/team/final_action`、`/team/action_dispatch`、`/team/fsm_status`、
+  `/material/instruction`，以及
   `/referee/taskinfo`、`/referee/gameinfo`、`/referee/score`。配置中的原始传感器和
   `/team/object_estimates` 由它管理的外部 `ros2 bag record` 进程订阅。
 - **发布**：无控制话题；输出是 Episode 目录中的 `rosbag/`、JSONL 和 `metadata.json`。
@@ -138,9 +185,10 @@ Recorder 是旁路观察者。即使不启动它，控制链也应独立工作�
 | `perception_3d.py` | 深度反投影、官方相机外参适配、三维中心估计接口 | `Detection2D`、`DepthFrame`、`CameraIntrinsics`、Odom（`BaseState`）、`RobotJointState` | `ObjectEstimate3D` | 视觉2 |
 | `navigation.py` | 区域分类、站位生成、航点/精对准和速度控制接口 | `TaskSpec`、`ObjectEstimate3D`、`BaseState`、`NavGoal` | `NavGoal`、`BaseCommand`、导航状态 | 底盘 |
 | `arm_planning.py` | 官方 KDL 适配、抓放末端目标和关节轨迹规划接口 | 物体中心、任务、实际关节、末端目标 | `IKResult`、`JointTrajectory` 等 | 机械臂1 |
-| `arm_execution.py` | 轨迹插值、局部抓放状态、试抬和恢复接口 | `JointTrajectory`、`RobotJointState`、时间 | `ManipulationCommand`、执行状态 | 机械臂2 |
+| `arm_execution.py` | 纯轨迹插值、分组限速、反馈到位和局部阶段映射 | `JointTrajectory`、`RobotJointState`、时间 | `ManipulationCommand`、执行状态 | 机械臂2 |
 | `fsm.py` | 唯一任务解析、全局阶段转换和重试策略 | 原始任务 JSON、业务事件 | `TaskSpec`、`FSMStatus` | 系统/FSM |
 | `action_mux.py` | 候选动作仲裁、TTL、限幅和安全保持 | 底盘/机械臂建议、实际关节、FSM 状态 | 唯一 `FinalAction[19]` | 控制安全 |
+| `controller_manifest.py` | 版本化控制接口事实与配置一致性校验 | `ACTION_NAMES`、运行时实测范围、配置 | 不可变 `MMK2_CONTROLLER_MANIFEST_V1` | 架构/控制安全 |
 | `recorder.py` | Episode 元数据、团队遥测和 rosbag 命令辅助 | 任务、FSM、最终动作、裁判消息 | metadata、JSONL、rosbag 路径 | 数据 |
 | `ros_nodes.py` | 三节点 I/O、缓存、ROS 消息转换、模块组装和官方发布 | ROS 2 消息、`config.yaml` | ROS 2 消息和节点生命周期 | ROS 集成 |
 
@@ -191,6 +239,10 @@ RobotJointState（实际反馈，用于安全保持）
 OfficialCommandPublisher -> 五组官方控制话题
 ```
 
+`FinalAction`诊断生成与官方发布是两个不同边界。默认observe-only仍执行到ActionMux并
+发布团队遥测，但流程在OfficialCommandPublisher之前终止；External Candidate的开关
+不能替代该全局门。
+
 ### 数据记录流
 
 ```text
@@ -213,16 +265,20 @@ Referee taskinfo / gameinfo / score
 
 | 接口 | 最关键的含义 |
 |---|---|
-| `TaskSpec` | `InstructionParser` 输出的结构化任务；包含目标属性与放置约束。`place_world_xyz` 是目标物体中心，不是夹爪末端位姿。 |
+| `TaskSpec` | `InstructionParser` 输出的结构化任务；有效任务只接受官方 `shelf_point`、`table_point`、`shelf_prop_side`，放置 frame 严格为 `world`。`place_world_xyz` 是目标物体中心，不是夹爪末端位姿。 |
 | `BaseState` | 来自 Odom 的底盘实际位置、姿态和速度；无效或过期时不能作为到达依据。 |
 | `RobotJointState` | `/joint_states` 映射出的 17 维**实际反馈**；它不是规划目标，也不是 IK 解。 |
 | `SensorSnapshot` | `team_client_node` 一个周期的轻量快照：任务、底盘、实际关节、三维目标；不含图像。 |
-| `Detection2D` | 图像像素坐标中的类别框和置信度，不带三维位置。 |
-| `ObjectEstimate3D` | 目标**物体中心的估计位置**、frame、时间和置信度；不是末端位姿，当前中心补偿仍未实现。 |
+| `Detection2D` | 图像像素坐标中的类别框、置信度、RGB frame 与时间；稳定器输出还携带非负 `track_id`，不带三维位置。 |
+| `ObjectEstimate3D` | 纯感知事实：目标**物体中心估计**及可选 `object_id`、观测姿态、明确提供的物体局部 XYZ 尺寸；有效中心估计不要求三个可选事实存在，也不携带 `target_body`。当前三维估计器不生产尺寸。 |
+| `Pose3D` | 严格有效 Pose：向量项必须是非bool `numbers.Real`，三项位置有限、四元数归一化非零且 frame 非空；不接受数字字符串，不跨 frame 重命名。 |
 | `NavGoal` | 底盘在指定 frame 中的 XY、yaw 目标和容差；物体放置点不能直接当作停车点。 |
 | `BaseCommand` | 导航模块提交给 `ActionMux` 的短时有效速度**建议**，不是已经发送的动作。 |
 | `IKResult` | 官方 KDL 求得的 slide/左右臂**目标关节解**；不是 `RobotJointState` 的实际反馈。 |
-| `JointTrajectory` | 带相对时间的 17 维关节路点计划；它不证明轨迹已执行。 |
+| `RigidTransform3D` | 带 source/target frame、时间和失败语义的刚体变换快照；有效四元数会冻结为单位四元数，不自动交换 frame 求逆。 |
+| `GraspContext` | 计划的 object-to-gripper 关系、抓取时物体 world 姿态及执行确认。`confirmed` 只确认计划抓取成立，不把规划关系提升为真实测量标定。 |
+| `ArmPlanningConfig` | 允许未标定字段为 `None`，通过 `validate_for_grasp()` / `validate_for_place()` 分操作失败关闭；无笼统 `valid` 字段。 |
+| `JointTrajectory` | 绑定任务与严格 `GlobalPhase` 的17维计划；抓取必须完整按 PREGRASP→GRASP→LIFT→RETREAT，放置必须完整按 PREPLACE→LOWER→RELEASE→POST_RELEASE_RETREAT。无效轨迹为空且不伪造 `target_body`。 |
 | `ManipulationCommand` | 执行器在本周期提交的关节目标**建议**，`controlled_mask` 指明哪些关节可覆盖保持值。 |
 | `FSMStatus` | 当前全局/局部阶段、重试、成功和失败原因的遥测；只有 `DONE` 才表示 FSM 成功。 |
 | `FinalAction` | `ActionMux` 每周期生成的唯一 19 维最终动作对象；只有 `valid=True` 且经过 `OfficialCommandPublisher` 成功发布后，才能视为实际控制动作。 |
@@ -233,12 +289,69 @@ Referee taskinfo / gameinfo / score
 2. `ObjectEstimate3D` 与 `TaskSpec.place_world_xyz` 描述物体中心；夹爪末端位姿还需要结合
    抓取方向、双臂间距和物体—夹爪关系另行规划。
 3. `BaseCommand` 和 `ManipulationCommand` 都只是模块建议；`ActionMux` 先生成
-   `FinalAction`，只有其中 `valid=True` 且经过 `OfficialCommandPublisher` 成功发布的
-   动作，才是实际控制动作。
+   `FinalAction`；`ActionMuxDecision`记录请求与接受关系，`ActionDispatchRecord`记录
+   本地publisher调用事实。即使publisher正常返回，也不能称为Server已接受或机器人已执行。
+
+### 机械臂公共契约冻结（提交1）
+
+放置姿态采用“保持抓取时观测到的 world 姿态”这一唯一来源：感知提供合法物体姿态后，
+规划抓取生成 `GraspContext.object_orientation_world_xyzw_at_grasp`；执行器只能依据实际反馈
+确认或拒绝同一规划上下文。未来 `plan_place` 以 `TaskSpec.place_world_xyz` 为物体目标中心、
+以上下文姿态为物体目标方向，再由规划的 object-to-gripper 关系计算左右 release Pose。
+目标姿态缺失、上下文未确认/过期或 frame 不成立时必须失败关闭；不得补单位四元数、忽略
+yaw、根据颜色产生姿态，或把确认后的规划关系描述为真实测量。
+
+`class_id` 是感知类别，`object_id` 是可选稳定轨迹身份，`TaskSpec.target_body` 是官方任务
+中的物体 body 身份，三者不互相改名。未来 ROS 组装层必须依据当前任务与显式支持的类别
+关联选择唯一稳定目标，把完整 `TaskSpec` 与该目标一起传给 `plan_grasp`；零个候选、多个
+同等候选、身份不稳定或任务/类别不匹配均失败关闭。`perception_3d` 不读取当前任务语义。
+
+`ArmMotionPhase` 仅用于 `JointWaypoint` 的规划区段；`LocalPhase` 仍是执行器/FSM 的实时
+状态。ArmExecution在提交3A中按实际反馈把规划区段映射为局部执行状态，但不推进 FSM，
+也不生成 `FinalAction` 或发布控制命令。
+有效路点至少控制一个关节；全False mask不能表示等待、停止或阶段标签。等待由带实际
+目标的路点时间表达，停止仍由正常安全控制链处理。
+
+ArmExecution已实现轨迹运动学执行，但真实抓取验证和confirmed GraspContext仍未实现，
+等待提交3B/集成阶段的真实证据来源。抓取执行到LIFT稳定到位后停在 `VERIFY`，只报告
+`VERIFICATION_PENDING`并输出短TTL保持候选；没有验证入口就不能进入RETREAT，也不能
+提升为抓取成功。放置轨迹结束只报告
+`MOTION_COMPLETED_PLACE_VERIFICATION_PENDING`且 `success=False`，不能表示物体已经
+稳定、脱夹、位于目标范围或获得 `PLACE_VERIFIED`。执行配置无隐藏默认值，当前
+`config.arm_execution` 全部为 `null`，且ROS/FSM尚未接线。
+
+夹爪绝对位置范围是官方 `[0,1]` 控制量；`max_gripper_velocity_per_s` 的单位是控制量/秒，
+位置范围不能推出速度必须小于等于1，最终速度仍需官方仿真标定。ArmExecution生成的
+`ManipulationCommand`只是候选，不证明 `ActionMux` 已接受或官方控制器已经执行。提交4
+接线前必须保证：候选失去ActionMux控制权或被STOP覆盖时，组装层暂停或reset执行器，
+不得让未实际发布的内部候选历史继续推进。
+
+同一 `ArmMotionPhase` 允许多个连续路点；`HUG_OPEN`、`VERIFY`、
+`TRANSPORT_HOLD` 等phase终点状态只在该phase最后一个路点到位时产生。提交3A要求一条
+有效轨迹的所有路点使用完全相同的 `controlled_mask`，不允许用mask变化表示等待、阶段
+标记或临时释放控制。执行反馈必须携带严格等于团队 `JOINT_NAMES` 的17维名称顺序；左右
+夹爪实际反馈和受控路点目标都必须位于官方 `[0,1]`。没有轨迹时执行器保持
+`NO_TRAJECTORY`，不应用活动轨迹控制周期超时。这些检查只约束团队候选生成，仍不证明
+ActionMux接受候选或官方控制器执行动作。
+
+有效 `TaskSpec` 必须保留官方提供的 `instruction`、`target_kind`、`target_body` 和
+`target_color`，不得从 task ID 或颜色规则反向补造。`ros_nodes` 对 `arm_planning`
+配置执行严格字段读取：总门必须为 bool、未知/缺失键拒绝、显式 null 保持 `None`；读取
+不会构造 `ArmPlanner`，未来调用方仍须按操作分别验证配置。
+
+左右夹爪 `min/max=[0,1]` 来自新版官方离线 `mmk2_control.xml` actuator
+`ctrlrange="0. 1."`，属于已冻结的控制硬范围。`open/closed` 仍为未标定 `null`，
+`gripper_verified_in_official_environment=false`；确认硬范围不代表开闭值或夹持效果已验证，
+所以抓取和放置操作验证继续失败关闭。
 
 ## 8. 19 维动作
 
 固定顺序由 `interfaces.ACTION_NAMES` 统一定义：
+
+对应的单位、语义、官方话题、运行时 `ctrlrange`、Server订阅QoS和团队安全范围冻结在
+`controller_manifest.MMK2_CONTROLLER_MANIFEST_V1`；Manifest中的名称仍从
+`ACTION_NAMES`派生，不是第二套动作顺序。详细实测边界见
+[`docs/mmk2_controller_manifest_v1.md`](docs/mmk2_controller_manifest_v1.md)。
 
 | 索引 | 含义 |
 |---|---|
@@ -261,7 +374,10 @@ Server 内部的左右轮速数组**。轮子数量、方向和底盘解算属�
 同一个不可变 `FinalAction` 对象用于官方话题发布和 `/team/final_action` 遥测，避免因
 再次拼接、重新限幅或索引错位产生“记录值与实发值不同”。但对象由 `ActionMux` 生成
 不等于已经控制机器人：只有 `valid=True` 且经过 `OfficialCommandPublisher` 成功发布的
-动作，才能视为实际控制动作；`valid=False` 的对象只能用于诊断记录。
+动作，仍只能视为本地候选dispatch；`valid=False` 的对象只能用于诊断记录。逐维
+requested/commanded/clipped/safety override以及真正publisher payload由
+`/team/action_dispatch`的V1严格JSON表达，见
+[`docs/mmk2_action_dispatch_telemetry_v1.md`](docs/mmk2_action_dispatch_telemetry_v1.md)。
 
 ## 9. ActionMux 与安全设计
 
@@ -298,7 +414,10 @@ Episode 是一次连续采集片段。当前临时边界是 recorder 节点启�
 | Odom、JointState | rosbag | 保留原消息、时间和 frame |
 | `ObjectEstimate3D` | rosbag 中的 `/team/object_estimates` | 保存团队感知输出 |
 | global/local phase | `fsm_status.jsonl`，同时话题进入 rosbag | 来自 `FSMStatus` |
-| `FinalAction[19]` | `final_actions.jsonl`，同时话题进入 rosbag | 保存 `ActionMux` 的唯一最终输出；训练前还要核对 `valid` 和发布状态 |
+| `FinalAction[19]` | `final_actions.jsonl`，同时话题进入 rosbag | 保存 `ActionMux` 的唯一最终输出；格式保持兼容，训练前还要核对 `valid` 和发布状态 |
+| `ActionDispatchRecord` | `action_dispatches.jsonl` | 首条合法 dispatch 立即保存；本轮不把该话题加入 rosbag 列表 |
+| 严格动作配对 | `action_frames.jsonl` | 同 sequence、同 timestamp 的两条遥测结构化配对，不是执行确认 |
+| 配对异常 | `action_pairing_issues.jsonl` | 无效、重复、冲突、超时、容量淘汰与关闭孤儿 |
 | referee 信息 | `metadata.json`，同时进入 rosbag | 原样记录 taskinfo、gameinfo、score，能解析 JSON 时附解析值 |
 | success / score 等结果 | FSM JSONL、referee metadata | `FSMStatus.success` 和 score 已有记录链；官方 Episode 级 success/final result 的来源与接线待确认 |
 
@@ -306,7 +425,8 @@ Episode 是一次连续采集片段。当前临时边界是 recorder 节点启�
 
 - **rosbag** 是 ROS 2 原始消息包，保存 RGB、Depth 等高带宽话题，也保留原消息类型、
   时间戳和坐标系。
-- **JSONL** 是“一行一个 JSON 对象”，便于逐周期读取；这里只保存最终动作和 FSM 状态。
+- **JSONL** 是“一行一个 JSON 对象”，便于逐周期读取；保存 FSM、两条原始合法动作
+  遥测、严格配对 Frame 和配对 Issue。
 - **metadata** 是一个 Episode 的摘要，保存任务原文、`TaskSpec`、裁判消息、bag 状态、
   话题计数和可选最终结果。
 
@@ -317,6 +437,12 @@ Episode 是一次连续采集片段。当前临时边界是 recorder 节点启�
 未插值的路点也不是当时的实发动作，三者都不能替代训练标签。裁判 success/score 是
 Episode 级结果，不能复制成每一帧的真值标签。当前仓库只负责可靠记录，不负责 ACT/VLA
 的数据清洗、训练或在线推理。
+
+Recorder 的任意到达顺序、严格关联、重复/冲突、monotonic 超时、容量淘汰和 shutdown
+orphan 规则见
+[`docs/mmk2_recorder_action_pairing_v1.md`](docs/mmk2_recorder_action_pairing_v1.md)。
+`action_frames.jsonl` 仅证明 Recorder 收到一致的两条内部遥测，不证明 controller 接受
+或机器人执行，也不自动成为训练样本。
 
 ## 11. 配置与正式话题
 
@@ -333,6 +459,7 @@ Episode 级结果，不能复制成每一帧的真值标签。当前仓库只负
 | JointState | `/joint_states` |
 | 三维目标 | `/team/object_estimates` |
 | 最终动作遥测 | `/team/final_action` |
+| 动作决策与dispatch遥测 | `/team/action_dispatch` |
 | FSM 遥测 | `/team/fsm_status` |
 | 官方底盘控制 | `/cmd_vel` |
 | 官方 slide 控制 | `/spine_forward_position_controller/commands` |
@@ -347,14 +474,35 @@ Episode 级结果，不能复制成每一帧的真值标签。当前仓库只负
 | `timing.control_rate_hz` | `20.0` | 客户端控制周期频率 |
 | `timing.command_ttl_s` | `0.20` | 底盘/机械臂候选命令有效期 |
 | `timing.state_max_delta_s` | `0.15` | 图像或控制时刻可接受的邻近状态最大时间差 |
-| `perception.sync_slop_s` | `0.05` | RGB/Depth 近似同步容差 |
+| `control.observe_only` | `true` | 最高优先级观察模式；不创建或调用官方发布器 |
+| `control.enable_official_publish` | `false` | 全局官方发布授权，默认关闭 |
+| `control.simulation_only` | `true` | 当前只允许仿真；false时拒绝启动 |
+| `control.head_target_tracking.enabled` | `false` | fresh-reset专用head target shadow总门，默认关闭 |
+| `control.head_target_tracking.fresh_reset_confirmed` | `false` | 运行方对本节点与官方Server共同fresh reset的显式确认 |
+| `control.head_target_tracking.initial_{yaw,pitch}_target` | `0.0` | Stage 2A固定reset controller target，单位rad，不能用JointState代替 |
+| `control.head_target_tracking.require_exclusive_writer` | `true` | 每次head发布前要求ROS graph中只有本节点一个publisher |
+| `perception.sync_slop_s` | `0.05` | RGB/Depth 近似同步及 Detection/Depth/CameraInfo 三方最大绝对时间差 |
 | `perception.depth_unit_scale_m` | `0.001` | 深度原始值换算为米的乘数 |
+| `perception.stabilizer_2d.min_confirmed_hits` | `2` | 轨迹连续命中两帧后才输出稳定 `track_id` |
+| `perception.estimator_3d.ema_alpha` | `0.5` | 同一稳定 `track_id` 的三维中心 EMA 当前样本权重 |
+| `perception.estimator_3d.max_position_jump_m` | `1.0` | 单轨迹相邻三维中心最大允许跳变 |
+| `perception.estimator_3d.object_dimensions_m.*` | `[0.24, 0.16, 0.19]` | 启发式中心补偿使用的宽、高、沿相机视线近似深度；不是物体局部XYZ尺寸 |
 | `recorder.enabled` | `false` | 默认不启动记录 |
 | `recorder.record_rosbag` | `true` | 启动 Recorder 时同时管理 rosbag |
 | `recorder.root_dir` | `./team_sorting_dataset` | Episode 根目录 |
+| `recorder.action_pairing.enabled` | `true` | 订阅并严格配对 FinalAction/Dispatch 内部遥测 |
+| `recorder.action_pairing.max_pending_per_side` | `256` | 每侧等待表容量 |
+| `recorder.action_pairing.max_completed_sequences` | `1024` | 近期终态 digest LRU 容量；精确终态区间账本另行阻止旧 sequence 重开 |
+| `recorder.action_pairing.max_wait_ns` | `2000000000` | 本地 monotonic 最大等待时间 |
+| `recorder.action_pairing.prune_period_sec` | `0.5` | 独立清理定时器周期 |
 
 官方 `mono16` 深度图的原始数值单位按当前代码和测试约定为毫米，因此乘
 `depth_unit_scale_m=0.001` 转为米。例如原始值 `1200` 表示 `1.2 m`。
+三项初值来自正式 `material_sorting/mjcf/material_competition.xml` 中
+`movable_box size="0.12 0.08 0.095"` 的 MuJoCo 半尺寸，配置保存其两倍值；当前仅把
+第三项用于沿相机视线的启发式中心补偿。官方场景会随机改变箱体 yaw，因此这组值暂时
+不是经过 frame 语义确认的物体局部 XYZ 尺寸源，三维估计器输出 `size_xyz_m=None`。
+外部明确提供的合法局部尺寸仍可通过团队 ROS 适配往返；后续尺寸源需另行评审。
 
 `recorder.rosbag_topics` 当前逐项记录：
 
@@ -424,22 +572,26 @@ ros2 launch team_sorting team.launch.xml record_data:=true
 - `ActionMux` 的限幅、TTL、安全状态覆盖和实际关节保持骨架；
 - 三个 ROS 2 节点入口、消息转换、时间缓存和官方发布出口骨架；
 - YOLO、MMK2FK、KDL 薄适配器及缺失依赖的清晰报错；
+- YOLO 检测的 RGB frame 传递、二维稳定轨迹 ID 与 PerceptionNode 接线；
+- 三维深度中位数、反投影、配置尺寸中心补偿、稳定 ID EMA、跳变拒绝与三方时帧校验；
 - Episode metadata、FSM/动作 JSONL 和外部 rosbag 管理链；
 - 几何、任务解析、FSM、19 维动作、安全覆盖与 Recorder 的测试骨架。
 
 ### 尚未完成
 
-- 完整 YOLO 联调、检测多帧稳定；
-- 三维物体中心补偿、滤波和实际 frame 验证；
+- 正式 YOLO/相机环境中的检测与二维稳定器参数联调；
+- 正式 ROS/MMK2FK 环境中的三维坐标、时间同步和 planning frame 端到端验证；
 - 抓取/放置站位生成、航点导航、精对准和底盘控制；
 - 由物体中心生成抓取/放置末端位姿，以及完整 IK/轨迹规划；
-- 机械臂轨迹插值、限速和局部抓放状态机；
-- 试抬抓取验证、放置验证和失败恢复；
+- ArmExecution与ROS/FSM的运行时接线及官方环境参数标定；
+- 真实抓取验证、confirmed GraspContext、放置验证和失败恢复；
 - 业务结果驱动 FSM、底盘与机械臂协同的完整比赛闭环；
 - ACT/VLA 数据处理、训练和推理。
 
-当前 `team_client_node` 在控制周期中只创建零速 `BaseCommand` 和实际关节保持命令；
-“仓库骨架完成”绝不等于“比赛代码完成”。
+当前 `team_client_node` 在默认控制周期中只创建零速 `BaseCommand`，机械臂业务候选为
+`None`；ActionMux基于实际反馈生成诊断FinalAction。默认observe-only不创建官方发布器，
+因此“生成诊断FinalAction”不等于“发送位置保持命令”。`create_hold_command()`仍保留给
+未来明确授权的主动保持场景。“仓库骨架完成”绝不等于“比赛代码完成”。
 
 ### 待确认
 
@@ -464,7 +616,7 @@ ros2 launch team_sorting team.launch.xml record_data:=true
 | 机械臂1 | `arm_planning.py`、相关几何测试 | 物体中心、任务、实际关节、末端目标 | `IKResult`、`JointTrajectory` | 把 IK 当反馈、直接发布关节命令、执行状态机 |
 | 机械臂2 | `arm_execution.py` | 轨迹、实际关节、时间 | `ManipulationCommand`、执行/验证状态 | 重新做 IK、绕过 `ActionMux`、用全零冒充保持 |
 | 系统/FSM | `fsm.py`、`tests/test_fsm_mux_recording.py` 中 FSM 测试 | 原始任务、真实业务事件 | `TaskSpec`、`FSMStatus`、重试/失败路径 | 直接控制硬件、绕过唯一任务解析入口 |
-| 控制安全 | `action_mux.py`、动作/TTL 测试 | 两类候选命令、实际关节、FSM 状态 | 唯一 `FinalAction[19]` | 规划轨迹、发布 ROS 话题、定义第二套动作顺序 |
+| 控制安全 | `action_mux.py`、`controller_manifest.py`、动作/TTL/Manifest测试 | 两类候选命令、实际关节、FSM 状态、运行时控制事实 | 唯一 `FinalAction[19]`、版本化安全元数据 | 规划轨迹、发布 ROS 话题、定义第二套动作顺序 |
 | 数据 | `recorder.py`、记录测试 | 任务、FSM、最终动作、裁判消息 | metadata、JSONL、rosbag 命令 | 参与控制、逐帧复制图像、把裁判结果扩成帧标签 |
 | ROS 集成 | `ros_nodes.py`、`config/config.yaml`、`launch/team.launch.xml` | ROS 消息、配置、业务对象 | 三节点 I/O、缓存、转换、唯一官方发布 | 在适配层实现 YOLO/导航/IK/轨迹算法 |
 

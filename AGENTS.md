@@ -44,7 +44,8 @@
 或绕过现有控制链的新业务目录。
 未经全队评审，禁止修改：
 
-- 21 文件目录结构；
+- 23 文件目录结构（含经队长批准的 `team_sorting/external_candidate.py` 和
+  `team_sorting/controller_manifest.py`）；
 - `perception_node`、`team_client_node`、`dataset_recorder_node` 三个 ROS2 节点；
 - 十个业务文件的职责边界；
 - 公共接口集中在 `interfaces.py`；
@@ -70,7 +71,9 @@
 | `team_sorting/arm_execution.py` | 机械臂2 | 轨迹插值、局部状态、试抬、验证与恢复 | 重新实现 IK、全局任务选择、官方话题发布 |
 | `team_sorting/fsm.py` | 系统/FSM | 唯一任务解析、状态转换、重试与失败路径 | ROS 发布、导航或机械臂算法 |
 | `team_sorting/action_mux.py` | 控制安全 | 19 维仲裁、TTL、限幅、安全保持 | 轨迹规划、FSM 决策、ROS 发布 |
-| `team_sorting/recorder.py` | 数据 | Episode 元数据、团队遥测、裁判原文、rosbag 命令辅助 | 参与控制、训练模型、逐帧复制图像 |
+| `team_sorting/controller_manifest.py` | 架构/控制安全 | 从`ACTION_NAMES`派生的版本化控制元数据、运行时范围与配置一致性校验 | ROS发布、动作仲裁、执行确认、第二套动作顺序 |
+| `team_sorting/external_candidate.py` | 控制安全/ROS 集成 | 默认关闭的外部Candidate严格解码、身份/新鲜度/TTL/one-shot安全消费及现有`ManipulationCommand`转换 | 导入rclpy、发布ROS、生成FinalAction、修改FSM、绕过ActionMux、接收pi05原生8维动作 |
+| `team_sorting/recorder.py`、`team_sorting/recording_contracts.py` | 数据 | Episode 元数据、团队遥测、动作/dispatch严格配对、裁判原文、rosbag 命令辅助 | 参与控制、训练模型、逐帧复制图像 |
 | `team_sorting/ros_nodes.py` | ROS 集成 | 三节点 I/O、缓存、转换、组装、唯一官方发布 | YOLO、导航、IK、轨迹算法 |
 | `config/config.yaml` | ROS 集成 | 可部署参数、话题、限幅和记录配置 | 写入未确认规则或开发者绝对路径 |
 | `launch/team.launch.xml` | ROS 集成 | 三节点启动及现有启动参数 | 新增架构节点或业务算法 |
@@ -87,8 +90,38 @@
 - 新增公共字段必须注明单位、`frame_id`、时间戳和失败语义；不适用时也要明确说明。
 - `RobotJointState` 是实际反馈；`IKResult` 是目标关节解。禁止混用或使用含义模糊的变量名。
 - `ObjectEstimate3D` 是物体中心估计；`place_world_xyz` 是目标物体中心。两者都不是夹爪末端位姿。
+- `ObjectEstimate3D` 只保存感知或配置直接支持的事实，禁止加入 `target_body`；有效中心估计
+  不强制要求 `object_id`、姿态或尺寸。任务 body 绑定只能由 ROS 组装层结合当前
+  `TaskSpec` 和唯一稳定目标完成，多目标歧义必须失败关闭。
+- `perception.estimator_3d.object_dimensions_m` 当前第三轴是相机视线近似深度，只能服务
+  启发式中心补偿；随机 yaw 下不得交换或猜测局部轴，也不得由此生产
+  `ObjectEstimate3D.size_xyz_m`。局部 XYZ 尺寸需要独立且 frame 语义明确的来源。
+- 有效 `TaskSpec` 的 `place_type` 只允许 `shelf_point`、`table_point`、
+  `shelf_prop_side`，`place_frame_id` 必须为 `world`；无效对象只要求非空失败原因，
+  不得为表达解析失败而伪造完整放置字段。缺失 JSON frame 只能由 `InstructionParser`
+  显式写入 `world`，dataclass 不得隐藏补默认值。
+- `/team/object_estimates` 内部 ROS 适配以零四元数表示未知姿态、全零 bbox size 表示未知
+  尺寸，反序列化恢复 `None`；不得把零四元数归一化为单位姿态。该规则不是官方协议。
+- `ArmMotionPhase` 只属于 `JointWaypoint`/`JointTrajectory` 规划语义，禁止进入现有
+  `LocalPhase`、命令、状态或 JSON 协议，未经后续评审不得添加运行时映射。
+- 有效 `JointTrajectory` 必须使用严格 `GlobalPhase` 并包含所属操作的四个有序阶段；
+  同阶段可连续多路点但不得跨操作或倒退。无效轨迹必须为空，允许空目标身份但必须说明原因。
+- `Pose3D` 必须在 frozen dataclass 构造时冻结有限位置、归一化非零四元数和非空 frame；
+  零四元数未知哨兵只属于 ROS `ObjectEstimate3D` 适配，禁止进入 `Pose3D`。
+- 所有 `_strict_finite_vector` 公共空间/关节向量项必须是非bool `numbers.Real`；数字字符串、
+  bytes或仅能经 `float()` 转换的对象必须拒绝，正常整数统一冻结为float。
+- `RigidTransform3D` frame与`GraspContext`身份/frame只去除首尾空白，不删除前导斜杠、
+  不做frame别名转换；同frame检查必须使用规范化后的字符串。
+- 有效 `JointWaypoint.controlled_mask` 至少一项为True；全False不得作为等待、停止或阶段标记。
+- 官方离线`mmk2_control.xml`已确认左右夹爪actuator硬`ctrlrange=[0,1]`；规划配置的
+  min/max不得越界。open/closed仍需仿真标定，verified=false时抓放验证必须失败关闭。
+- `GraspContext.confirmed` 只表示执行器根据实际反馈确认计划抓取成立；其中两条
+  object-to-gripper 关系仍是规划关系，不是执行器重新测量的标定结果。
 - `BaseCommand` 和 `ManipulationCommand` 只是候选建议；`FinalAction` 是 `ActionMux` 的输出。
 - `FinalAction.values` 必须严格包含 19 项，禁止复制、重排或重新定义索引。
+- `ActionMuxDecision`只能由同一次ActionMux仲裁产生；禁止从`FinalAction`或failure_reason反推mask。
+- `ActionDispatchRecord`只能在官方publisher边界记录精确payload；本地调用成功不得提升为
+  controller accepted或execution confirmed，未发送维度必须为null而不是补零。
 
 19 维顺序只作边界提示，完整定义以 `interfaces.ACTION_NAMES` 为准：
 
@@ -104,12 +137,23 @@
 interfaces
   ↑
   ├─ perception_2d / perception_3d / navigation / arm_planning
-  └─ arm_execution / fsm / action_mux / recorder
+  └─ arm_execution / fsm / controller_manifest / action_mux / recording_contracts / recorder
 ros_nodes 组装上述模块并连接 ROS2
 ```
 
 - `perception_3d` 禁止依赖 `perception_2d` 的内部实现，只通过 `Detection2D` 连接。
 - `arm_execution` 禁止依赖 `arm_planning` 的内部实现，只通过 `JointTrajectory` 连接。
+- ArmExecution已实现轨迹运动学执行，但真实抓取验证和confirmed GraspContext仍未实现，
+  等待提交3B/集成阶段的真实证据来源。提交3A抓取必须停在 `VERIFY`，放置完成也只能等待
+  外部验证；二者都不得以 `success=True` 表示尚未取得的验证。执行器不得持有、修改或确认
+  `GraspContext`；ROS/FSM接线获批前保持关闭。
+- 夹爪位置范围是 `[0,1]`，速度单位是控制量/秒，最终速度仍须官方仿真标定。ArmExecution
+  输出只是候选，不证明ActionMux接受或官方控制器执行。提交4接线前，组装层必须在候选
+  失去ActionMux控制权或被STOP覆盖时暂停或reset执行器，禁止内部候选历史脱离实际发布推进。
+- 同一 `ArmMotionPhase` 可包含多个连续路点，phase终点状态只能在最后一个同phase路点
+  到位时产生。当前执行契约要求整条有效轨迹的 `controlled_mask` 完全一致；实际反馈必须
+  严格使用团队 `JOINT_NAMES` 顺序，左右夹爪反馈及受控目标必须位于 `[0,1]`。无轨迹的
+  `NO_TRAJECTORY` 空闲状态不应用活动控制周期超时。以上均不构成官方控制器执行证明。
 - `fsm` 禁止发布 ROS2 消息；`navigation` 禁止直接发布 `/cmd_vel`；机械臂模块禁止直接发布官方关节话题。
 - `recorder` 禁止影响 FSM、候选命令或 `FinalAction`。
 - `ros_nodes.py` 禁止实现 YOLO、导航、IK 或轨迹算法。
@@ -117,6 +161,19 @@ ros_nodes 组装上述模块并连接 ROS2
 
 ## 7. 安全与失败规则
 
+- `team_client_node` 默认必须处于全局 observe-only 模式：可以计算并发布团队诊断遥测，
+  但不得创建或调用 `OfficialCommandPublisher`。External Candidate 的门不能替代此门。
+- 只有 `observe_only=false`、`enable_official_publish=true`、`simulation_only=true` 同时
+  成立才允许创建唯一官方发布器；observe-only优先关闭，非仿真配置必须拒绝。
+- Stage 2A head controller-target shadow默认关闭，只限本节点与官方仿真Server共同启动并
+  明确确认fresh reset、初值严格为`[0.0, 0.0]`且head话题唯一写入者的受控场景。
+  `/joint_states`是物理反馈，禁止据此恢复未知controller target；节点单独重启、Server
+  未reset或出现其他head publisher时必须重新授权并fail closed。
+- 当前Stage 2A退出路径只能取消timer、清空External Candidate pending并销毁ROS实体；
+  禁止用JointState拼接全量hold，禁止自动发布cmd_vel或任何关节controller target。
+  emergency base stop接口仅供未来明确授权的底盘故障路径，不能由普通destroy调用。
+- “没有机械臂业务候选”必须表示为 `ManipulationCommand=None`，不能默认转换为17维
+  `controlled_mask=True`的主动位置保持。显式主动保持能力可以保留，但必须由授权场景调用。
 - 官方依赖、资源或消息字段缺失时必须清晰失败；未实现算法必须抛出明确的 `NotImplementedError`，或返回 `valid/success=False` 及原因。禁止伪造结果或静默降级。
 - 禁止用全零关节目标表示机械臂安全停止。
 - 底盘命令过期后必须归零；机械臂命令过期后必须用实际反馈安全保持。
@@ -131,6 +188,8 @@ ros_nodes 组装上述模块并连接 ROS2
 
 - `ActionMux` 每个控制周期只能生成一次 `FinalAction`。
 - 官方控制拆分和 `/team/final_action` 遥测必须使用同一对象。
+- 每个已生成`FinalAction`的控制周期还必须发布一条稳定关联的`/team/action_dispatch`；
+  observe-only也必须记录none模式，但该团队话题不得触发任何官方控制。
 - 禁止为 Recorder 重新拼接第二份 19 维动作。
 - `valid=False` 的 `FinalAction` 可以记录用于诊断，但禁止直接作为专家训练动作。
 - 只有 `valid=True` 且进入 `OfficialCommandPublisher` 发布链路的动作，才可视为候选专家动作。
@@ -141,6 +200,10 @@ ros_nodes 组装上述模块并连接 ROS2
 - Recorder 禁止为了落盘逐帧复制或重新编码完整图像。
 - `perception_node` 为推理和几何计算进行必要的图像转换不受上述限制。
 - Recorder 只负责采集，禁止在其中实现 ACT/VLA 训练或控制决策。
+- Recorder 配对只能按严格 sequence 和 timestamp 关联 FinalAction/ActionDispatch；不得
+  邻近猜测、补造缺失侧或把配对成功提升为 controller 接受/机器人执行确认。
+- Recorder 配对状态只能在对应 raw/Frame/Issue JSONL 追加成功后提交；写入失败必须保留
+  可重试上下文，终态 sequence 即使近期 digest 淘汰也不得在同一 Episode 重开。
 
 ## 9. 禁止硬编码
 

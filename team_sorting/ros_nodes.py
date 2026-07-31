@@ -82,23 +82,38 @@ _create_recorder_node()
 from __future__ import annotations
 
 from collections import deque
+from dataclasses import fields, replace
 import importlib
+import json
 import math
 import os
 from pathlib import Path
 import signal
 import subprocess
+import time
 from types import SimpleNamespace
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 from .action_mux import ActionMux, ActionMuxConfig
+from .controller_manifest import validate_controller_config
 from .arm_execution import ArmExecutionController
+from .external_candidate import (
+    ExternalCandidateConfig,
+    ExternalCandidateConsumer,
+    ExternalCandidateDecision,
+)
 from .fsm import FSMEvent, GlobalFSM, InstructionParser
 from .interfaces import (
+    ActionDispatchRecord,
+    ActionMuxDecision,
+    ArmPlanningConfig,
     BaseCommand,
     BaseState,
     CameraIntrinsics,
     DepthFrame,
+    DispatchGroupRecord,
+    DispatchMode,
+    Float64MultiArrayExactPayload,
     FSMStatus,
     FinalAction,
     ManipulationCommand,
@@ -108,15 +123,18 @@ from .interfaces import (
     SensorSnapshot,
     SlotType,
     TaskSpec,
+    TwistExactPayload,
+    action_dispatch_to_json,
     final_action_from_json,
     final_action_to_json,
     fsm_status_from_json,
     fsm_status_to_json,
 )
 from .navigation import Bounds3D, classify_slot_type
-from .perception_2d import OfficialYoloAdapter
+from .perception_2d import Detection2DStabilizer, OfficialYoloAdapter
 from .perception_3d import CameraTransformProvider, Perception3DEstimator
 from .recorder import EpisodeRecorder
+from .recording_contracts import ActionPairingConfig
 
 
 class TimestampedCache:
@@ -212,6 +230,30 @@ class JointStateMapper:
         )
 
 
+_DISPATCH_GROUP_LAYOUT = (
+    ("base", "cmd_vel", "geometry_msgs/msg/Twist", 0, 2),
+    ("spine", "slide", "std_msgs/msg/Float64MultiArray", 2, 3),
+    ("head", "head", "std_msgs/msg/Float64MultiArray", 3, 5),
+    ("left_arm", "left_arm", "std_msgs/msg/Float64MultiArray", 5, 12),
+    ("right_arm", "right_arm", "std_msgs/msg/Float64MultiArray", 12, 19),
+)
+
+
+def _empty_dispatch_group_records(topics: Mapping[str, str]) -> list[DispatchGroupRecord]:
+    return [
+        DispatchGroupRecord(group, topics[topic_key], message_type, False, None, None)
+        for group, topic_key, message_type, _start, _stop in _DISPATCH_GROUP_LAYOUT
+    ]
+
+
+class OfficialPublishError(RuntimeError):
+    """保留原 RuntimeError 传播语义，同时携带异常发生前的逐组调用事实。"""
+
+    def __init__(self, message: str, group_records: tuple[DispatchGroupRecord, ...]) -> None:
+        super().__init__(message)
+        self.group_records = group_records
+
+
 class OfficialCommandPublisher:
     """唯一允许发布五组官方机器人控制话题的适配器。
 
@@ -221,12 +263,51 @@ class OfficialCommandPublisher:
     ``RuntimeError``，本类不重建第二份动作或执行控制算法。
     """
 
-    def __init__(self, node: Any, topics: dict[str, str], ros: Optional[SimpleNamespace] = None) -> None:
+    def __init__(
+        self,
+        node: Any,
+        topics: dict[str, str],
+        ros: Optional[SimpleNamespace] = None,
+        head_target_tracking: Optional[dict[str, Any]] = None,
+    ) -> None:
         self._ros = ros or _load_ros_dependencies(require_vision=False, require_filters=False)
         required = ("cmd_vel", "slide", "head", "left_arm", "right_arm")
         missing = [name for name in required if not topics.get(name)]
         if missing:
             raise RuntimeError(f"官方控制话题配置缺失：{missing}")
+        self._node = node
+        self._topics = dict(topics)
+        self._head_topic = topics["head"]
+        tracking = head_target_tracking or {
+            "enabled": False,
+            "fresh_reset_confirmed": False,
+            "initial_yaw_target": 0.0,
+            "initial_pitch_target": 0.0,
+            "require_exclusive_writer": True,
+            "yaw_lower": -0.5,
+            "yaw_upper": 0.5,
+            "pitch_lower": -1.18,
+            "pitch_upper": 0.16,
+        }
+        self._head_tracking_enabled = bool(tracking["enabled"])
+        self._require_exclusive_head_writer = bool(
+            tracking["require_exclusive_writer"]
+        )
+        self._head_yaw_bounds = (
+            float(tracking["yaw_lower"]),
+            float(tracking["yaw_upper"]),
+        )
+        self._head_pitch_bounds = (
+            float(tracking["pitch_lower"]),
+            float(tracking["pitch_upper"]),
+        )
+        self.last_head_controller_target: Optional[list[float]] = None
+        if self._head_tracking_enabled and tracking["fresh_reset_confirmed"]:
+            self.last_head_controller_target = [
+                float(tracking["initial_yaw_target"]),
+                float(tracking["initial_pitch_target"]),
+            ]
+        self.last_head_publish_failure_reason = ""
         self._base = node.create_publisher(self._ros.Twist, topics["cmd_vel"], 10)
         self._slide = node.create_publisher(self._ros.Float64MultiArray, topics["slide"], 10)
         self._head = node.create_publisher(self._ros.Float64MultiArray, topics["head"], 10)
@@ -241,14 +322,23 @@ class OfficialCommandPublisher:
         ``RuntimeError``；调用方必须把同一对象用于 ``/team/final_action`` 遥测。
         """
 
+        self.publish_with_trace(action)
+
+    def _empty_group_records(self) -> list[DispatchGroupRecord]:
+        return _empty_dispatch_group_records(self._topics)
+
+    def publish_with_trace(self, action: FinalAction) -> tuple[DispatchGroupRecord, ...]:
+        """按原顺序 full 发布，并返回或随异常携带精确逐组 payload。"""
+
+        records = self._empty_group_records()
         if not action.valid:
-            raise RuntimeError(f"拒绝发布无效 FinalAction：{action.failure_reason}")
+            raise OfficialPublishError(
+                f"拒绝发布无效 FinalAction：{action.failure_reason}", tuple(records)
+            )
         values = action.values
         base = self._ros.Twist()
-        base.linear.x = values[0]
-        base.angular.z = values[1]
-
-        # 19 维动作只在此处拆分：2 个底盘量 + 1 slide + 2 head + 左右各 7 项。
+        base.linear.x, base.linear.y, base.linear.z = values[0], 0.0, 0.0
+        base.angular.x, base.angular.y, base.angular.z = 0.0, 0.0, values[1]
         slide = self._ros.Float64MultiArray()
         slide.data = list(values[2:3])
         head = self._ros.Float64MultiArray()
@@ -257,17 +347,123 @@ class OfficialCommandPublisher:
         left.data = list(values[5:12])
         right = self._ros.Float64MultiArray()
         right.data = list(values[12:19])
+        calls = (
+            (
+                0,
+                self._base,
+                base,
+                TwistExactPayload(
+                    (base.linear.x, base.linear.y, base.linear.z),
+                    (base.angular.x, base.angular.y, base.angular.z),
+                ),
+            ),
+            (1, self._slide, slide, Float64MultiArrayExactPayload(tuple(slide.data))),
+            (2, self._head, head, Float64MultiArrayExactPayload(tuple(head.data))),
+            (3, self._left, left, Float64MultiArrayExactPayload(tuple(left.data))),
+            (4, self._right, right, Float64MultiArrayExactPayload(tuple(right.data))),
+        )
+        for index, publisher, message, payload in calls:
+            record = records[index]
+            try:
+                publisher.publish(message)
+            except Exception as exc:  # noqa: BLE001 - 保留部分成功并停止后续调用
+                records[index] = replace(
+                    record,
+                    attempted=True,
+                    succeeded=False,
+                    exact_payload=payload,
+                    failure_reason=str(exc),
+                )
+                raise OfficialPublishError(
+                    f"发布官方控制话题失败：{exc}", tuple(records)
+                ) from exc
+            records[index] = replace(
+                record, attempted=True, succeeded=True, exact_payload=payload
+            )
+        return tuple(records)
+
+    def head_writer_is_exclusive(self) -> bool:
+        """只在ROS graph确认本节点是head话题唯一publisher时返回真。"""
+
         try:
-            self._base.publish(base)
-            self._slide.publish(slide)
+            count = self._node.count_publishers(self._head_topic)
+        except (AttributeError, RuntimeError):
+            return False
+        return type(count) is int and count == 1
+
+    def publish_head(self, action: FinalAction) -> None:
+        """以绝对controller target只发布head分组。
+
+        ``FinalAction[3]``仍是ActionMux验证后的绝对yaw关节目标；pitch不能取
+        ``FinalAction[4]``中的物理反馈保持值，而必须复用fresh-reset作用域内维护的
+        controller target shadow。发布成功后才更新yaw shadow，失败时保持原值。
+        """
+
+        self.publish_head_with_trace(action)
+
+    def publish_head_with_trace(
+        self, action: FinalAction
+    ) -> tuple[DispatchGroupRecord, ...]:
+        """只发布 head，并精确记录 yaw 与 controller-target shadow pitch。"""
+
+        records = self._empty_group_records()
+        if not action.valid:
+            raise OfficialPublishError(
+                f"拒绝发布无效 FinalAction：{action.failure_reason}", tuple(records)
+            )
+        if not self._head_tracking_enabled:
+            self.last_head_publish_failure_reason = "head_target_tracking_disabled"
+            raise OfficialPublishError(self.last_head_publish_failure_reason, tuple(records))
+        if self.last_head_controller_target is None:
+            self.last_head_publish_failure_reason = "fresh_reset_not_confirmed"
+            raise OfficialPublishError(self.last_head_publish_failure_reason, tuple(records))
+        if self._require_exclusive_head_writer and not self.head_writer_is_exclusive():
+            self.last_head_publish_failure_reason = "head_writer_not_exclusive"
+            raise OfficialPublishError(self.last_head_publish_failure_reason, tuple(records))
+        yaw_target = action.values[3]
+        if isinstance(yaw_target, bool) or not isinstance(yaw_target, (int, float)):
+            self.last_head_publish_failure_reason = "head_yaw_target_invalid"
+            raise OfficialPublishError(self.last_head_publish_failure_reason, tuple(records))
+        yaw_target = float(yaw_target)
+        if not math.isfinite(yaw_target) or not (
+            self._head_yaw_bounds[0] <= yaw_target <= self._head_yaw_bounds[1]
+        ):
+            self.last_head_publish_failure_reason = "head_yaw_target_out_of_range"
+            raise OfficialPublishError(self.last_head_publish_failure_reason, tuple(records))
+        pitch_target = self.last_head_controller_target[1]
+        if not math.isfinite(pitch_target) or not (
+            self._head_pitch_bounds[0]
+            <= pitch_target
+            <= self._head_pitch_bounds[1]
+        ):
+            self.last_head_publish_failure_reason = "head_pitch_shadow_invalid"
+            raise OfficialPublishError(self.last_head_publish_failure_reason, tuple(records))
+        head = self._ros.Float64MultiArray()
+        head.data = [yaw_target, pitch_target]
+        payload = Float64MultiArrayExactPayload(tuple(head.data))
+        try:
             self._head.publish(head)
-            self._left.publish(left)
-            self._right.publish(right)
         except Exception as exc:  # noqa: BLE001 - ROS 中间件异常统一说明
-            raise RuntimeError(f"发布官方控制话题失败：{exc}") from exc
+            self.last_head_publish_failure_reason = "head_publish_failed"
+            records[2] = replace(
+                records[2],
+                attempted=True,
+                succeeded=False,
+                exact_payload=payload,
+                failure_reason=str(exc),
+            )
+            raise OfficialPublishError(
+                f"发布官方head控制话题失败：{exc}", tuple(records)
+            ) from exc
+        records[2] = replace(
+            records[2], attempted=True, succeeded=True, exact_payload=payload
+        )
+        self.last_head_controller_target[0] = yaw_target
+        self.last_head_publish_failure_reason = ""
+        return tuple(records)
 
     def publish_emergency_base_stop(self) -> None:
-        """仅在状态失联或节点退出时尽力发布底盘零速度。
+        """仅在未来明确授权的底盘控制故障路径尽力发布零速度。
 
         正常控制仍必须经过 ActionMux 和完整 ``FinalAction``。当可靠 JointState 已经
         不可用时，不能伪造 17 维全零关节目标；这个窄接口只停止底盘，不发布机械臂
@@ -283,12 +479,69 @@ class OfficialCommandPublisher:
             raise RuntimeError(f"紧急发布底盘零速度失败：{exc}") from exc
 
 
+def _build_action_dispatch_record(
+    action: FinalAction,
+    decision: ActionMuxDecision,
+    *,
+    publish_enabled: bool,
+    publisher_created: bool,
+    dispatch_mode: DispatchMode,
+    group_records: tuple[DispatchGroupRecord, ...],
+    failure_reason: str = "",
+) -> ActionDispatchRecord:
+    """从 publisher 边界事实构造固定 19 维、未发送项为 null 的记录。"""
+
+    dispatched: list[Optional[float]] = [None] * 19
+    for record, (_group, _topic_key, _message_type, start, stop) in zip(
+        group_records, _DISPATCH_GROUP_LAYOUT
+    ):
+        if not record.attempted:
+            continue
+        if isinstance(record.exact_payload, TwistExactPayload):
+            dispatched[0] = record.exact_payload.linear_xyz[0]
+            dispatched[1] = record.exact_payload.angular_xyz[2]
+        elif isinstance(record.exact_payload, Float64MultiArrayExactPayload):
+            if len(record.exact_payload.data) != stop - start:
+                raise ValueError(f"{record.group} exact_payload 长度与官方分组不一致")
+            dispatched[start:stop] = record.exact_payload.data
+        else:
+            raise ValueError(f"{record.group} attempted 但缺少受支持的 exact_payload")
+    mask = tuple(value is not None for value in dispatched)
+    attempted = tuple(record.group for record in group_records if record.attempted)
+    successful = tuple(record.group for record in group_records if record.succeeded is True)
+    failed = tuple(record.group for record in group_records if record.succeeded is False)
+    return ActionDispatchRecord(
+        schema_name="MMK2ActionDispatchRecord",
+        schema_version=1,
+        sequence=action.sequence,
+        timestamp_ns=action.timestamp_ns,
+        final_action_sequence=action.sequence,
+        decision=decision,
+        calculated=True,
+        publish_enabled=publish_enabled,
+        publisher_created=publisher_created,
+        publish_attempted=bool(attempted),
+        publisher_call_succeeded=None if not attempted else not failed,
+        dispatch_mode=dispatch_mode,
+        dispatched_action=tuple(dispatched),
+        dispatched_mask=mask,
+        attempted_groups=attempted,
+        successful_groups=successful,
+        failed_groups=failed,
+        group_records=group_records,
+        controller_accepted=None,
+        execution_confirmed=None,
+        failure_reason=failure_reason,
+    )
+
+
 def main_team_client(args: Optional[list[str]] = None) -> None:
     """启动任务决策与控制客户端节点。
 
     参数：可选 ROS2 命令行参数；返回：正常关闭时无返回。节点处理消息各自的米/弧度和
     frame_id。失败：缺少 rclpy/vision_msgs/配置时抛出清晰 ``RuntimeError``；
-    完整业务算法未实现时只输出安全保持，不伪造任务完成。
+    完整业务算法未实现时默认仅计算和发布团队诊断遥测，不创建官方控制发布器，也不
+    伪造任务完成。只有显式通过全局发布门时才允许进入官方控制发布链。
     """
 
     ros = _load_ros_dependencies(require_vision=True, require_filters=False)
@@ -389,8 +642,12 @@ def _validate_vision_schema(ros: SimpleNamespace) -> None:
     result = ros.ObjectHypothesisWithPose()
     if not hasattr(array, "header") or not hasattr(array, "detections"):
         raise RuntimeError("Detection3DArray 缺少 header/detections")
-    if not hasattr(detection, "results"):
-        raise RuntimeError("Detection3D 缺少 results")
+    if not all(hasattr(detection, name) for name in ("results", "id", "bbox")):
+        raise RuntimeError("Detection3D 缺少 results/id/bbox")
+    if not hasattr(detection.bbox, "size") or not all(
+        hasattr(detection.bbox.size, axis) for axis in ("x", "y", "z")
+    ):
+        raise RuntimeError("Detection3D.bbox 缺少三轴 size")
     hypothesis = getattr(result, "hypothesis", result)
     if not (hasattr(hypothesis, "class_id") or hasattr(hypothesis, "id")):
         raise RuntimeError("ObjectHypothesisWithPose 缺少 class_id/id")
@@ -410,7 +667,42 @@ def _load_config() -> dict[str, Any]:
         raise RuntimeError(f"读取配置失败 {path}: {exc}") from exc
     if not isinstance(data, dict):
         raise RuntimeError(f"配置顶层必须是映射：{path}")
+    try:
+        validate_controller_config(data)
+    except ValueError as exc:
+        raise RuntimeError(f"配置与MMK2 Controller Manifest V1不一致 {path}: {exc}") from exc
+    try:
+        _arm_planning_config_from_config(data)
+    except ValueError as exc:
+        raise RuntimeError(f"机械臂规划配置无效 {path}: {exc}") from exc
+    _validated_action_dispatch_topic(data.get("topics"))
     return data
+
+
+def _arm_planning_config_from_config(
+    config: Mapping[str, Any],
+) -> tuple[bool, ArmPlanningConfig]:
+    """严格读取默认关闭的机械臂规划配置，但不构造规划器或官方依赖。"""
+
+    if not isinstance(config, Mapping):
+        raise ValueError("config 必须是 Mapping")
+    section = config.get("arm_planning")
+    if not isinstance(section, Mapping):
+        raise ValueError("config['arm_planning'] 必须是 Mapping")
+    enabled = section.get("enabled")
+    if type(enabled) is not bool:
+        raise ValueError("arm_planning.enabled 必须是严格 bool")
+
+    config_fields = tuple(field.name for field in fields(ArmPlanningConfig))
+    allowed = {"enabled", *config_fields}
+    unknown = tuple(sorted(str(key) for key in section.keys() if key not in allowed))
+    if unknown:
+        raise ValueError(f"arm_planning 包含未知字段：{unknown}")
+    missing = tuple(name for name in config_fields if name not in section)
+    if missing:
+        raise ValueError(f"arm_planning 缺少显式字段：{missing}")
+    values = {name: section[name] for name in config_fields}
+    return enabled, ArmPlanningConfig(**values)
 
 
 def _resolve_config_path() -> Path:
@@ -451,7 +743,10 @@ def _spin(
             if node is not None:
                 node.destroy_node()
         finally:
-            ros.rclpy.shutdown()
+            # SIGINT handler 可能已经关闭 context；重复 shutdown 会抛 RCLError。节点
+            # 必须先完成自身清理，而 context 仍有效时才由这里执行最终 shutdown。
+            if _rclpy_context_ok(ros, node):
+                ros.rclpy.shutdown()
 #_TeamClientNode：比赛控制主节点
 
 # 这是三个节点里最核心的一个。整个规则系统每个控制周期的数据组装与动作出口。
@@ -498,6 +793,7 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             self._ros = ros_deps
             self._config = config
             topics = config["topics"]
+            action_dispatch_topic = _validated_action_dispatch_topic(topics)
             timing = config["timing"]
             self._state_max_delta_ns = int(float(timing["state_max_delta_s"]) * 1e9)
             self._command_ttl_ns = int(float(timing["command_ttl_s"]) * 1e9)
@@ -510,6 +806,8 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             self._local_io_ready = False
             self._system_ready_submitted = False
             self._last_control_warning = ""
+            self._last_non_ros_warning = ""
+            self._destroy_failure_reason = ""
             self._input_issues: dict[str, str] = {}
             self._destroying = False
             self._control_timer: Optional[Any] = None
@@ -518,13 +816,60 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             self._mux = ActionMux(_action_mux_config(config))
             self._arm_execution = ArmExecutionController()
             self._mapper = JointStateMapper(config.get("joint_aliases", {}))
-
-            self._official_publisher = OfficialCommandPublisher(
-                self, topics["official_commands"], ros_deps
+            try:
+                self._external_candidate_config = ExternalCandidateConfig.from_mapping(
+                    config.get("external_candidate", {})
+                )
+            except ValueError as exc:
+                raise RuntimeError(f"external_candidate 配置无效：{exc}") from exc
+            self._external_candidate = ExternalCandidateConsumer(
+                self._external_candidate_config
             )
+            self._external_candidate_subscription: Optional[Any] = None
+            self._last_control_tick_ns: Optional[int] = None
+            control = _validated_control_config(config)
+            self._observe_only = control["observe_only"]
+            self._enable_official_publish = control["enable_official_publish"]
+            self._simulation_only = control["simulation_only"]
+            self._official_topics = dict(topics["official_commands"])
+            self._publish_enabled = _official_publish_enabled(control)
+            self._official_publisher: Optional[OfficialCommandPublisher] = None
+            if self._publish_enabled:
+                head_tracking = {
+                    **control["head_target_tracking"],
+                    "yaw_lower": self._mux.config.joint_lower[1],
+                    "yaw_upper": self._mux.config.joint_upper[1],
+                    "pitch_lower": self._mux.config.joint_lower[2],
+                    "pitch_upper": self._mux.config.joint_upper[2],
+                }
+                self._official_publisher = OfficialCommandPublisher(
+                    self,
+                    topics["official_commands"],
+                    ros_deps,
+                    head_tracking,
+                )
+            else:
+                reason = (
+                    "observe_only"
+                    if self._observe_only
+                    else "enable_official_publish=false"
+                )
+                self.get_logger().info(
+                    f"official_publish_disabled:{reason};仅发布团队诊断遥测"
+                )
             self._action_pub = self.create_publisher(ros.String, topics["final_action"], 10)
+            self._dispatch_pub = self.create_publisher(
+                ros.String, action_dispatch_topic, 10
+            )
             self._fsm_pub = self.create_publisher(ros.String, topics["fsm_status"], 10)
             self.create_subscription(ros.String, topics["instruction"], self._on_instruction, 10)
+            if _external_candidate_subscription_enabled(self._external_candidate_config):
+                self._external_candidate_subscription = self.create_subscription(
+                    ros.String,
+                    self._external_candidate_config.topic,
+                    self._on_external_candidate,
+                    10,
+                )
             self.create_subscription(ros.Odometry, topics["odom"], self._on_odom, 30)
             self.create_subscription(ros.JointState, topics["joint_states"], self._on_joints, 30)
             self.create_subscription(
@@ -545,6 +890,11 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 # 才能在正式规则发布后替换策略而不改 InstructionParser。
                 self._parsed_tasks = tasks
                 selected_task = self._select_task(tasks)
+                # 每次合法广播都刷新 consumer 自己的指令活性时间；下面的 FSM 语义去重
+                # 保持原样，不会重复提交相同任务。
+                self._external_candidate.update_instruction(
+                    message.data, selected_task.task_id, now_ns
+                )
                 selected_fingerprint = self._task_semantic_fingerprint(selected_task)
                 if (
                     self._fsm.task is not None
@@ -564,6 +914,19 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                     self._submit_pending_task(now_ns)
             except ValueError as exc:
                 self.get_logger().error(f"任务解析失败：{exc}")
+
+        def _on_external_candidate(self, message: Any) -> None:
+            """Validate and reserve one candidate; never creates or publishes an action."""
+
+            now_ns = self.get_clock().now().nanoseconds
+            try:
+                decision = self._external_candidate.receive(message.data, now_ns)
+            except Exception as exc:  # noqa: BLE001 - callback must fail closed
+                self.get_logger().error(
+                    f"External Candidate回调内部失败，已拒绝：{type(exc).__name__}: {exc}"
+                )
+                return
+            self._log_external_candidate_decision(decision)
 
         @staticmethod
         def _task_semantic_fingerprint(task: TaskSpec) -> tuple[Any, ...]:
@@ -679,6 +1042,9 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                         slot_type=classify_slot_type(item.position_xyz, table, shelf),
                         valid=item.valid,
                         failure_reason=item.failure_reason,
+                        object_id=item.object_id,
+                        orientation_xyzw=item.orientation_xyzw,
+                        size_xyz_m=item.size_xyz_m,
                     )
                     for item in estimates
                 )
@@ -714,7 +1080,11 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
         def _safe_hold_candidates(
             self, joints: RobotJointState, now_ns: int
         ) -> tuple[BaseCommand, ManipulationCommand]:
-            """生成短TTL零底盘和基于实际反馈的关节保持候选。"""
+            """为明确要求主动保持的受控场景生成短TTL候选。
+
+            本函数会把17项 ``controlled_mask`` 全部设为真，属于主动位置控制，不能作为
+            节点默认骨架行为；当前Stage 2A普通周期和节点退出都不调用本函数。
+            """
 
             base_command = BaseCommand(
                 0.0, 0.0, now_ns, now_ns + self._command_ttl_ns
@@ -732,15 +1102,18 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
         ) -> tuple[BaseCommand | None, ManipulationCommand | None]:
             """把同周期快照交给唯一业务组装入口，返回两类候选命令。
 
-            当前完整业务尚未接线，只产生零底盘和实际关节保持。候选命令仍需经过
-            ActionMux 才成为 FinalAction，ROS发布后也还要靠反馈确认实际执行。
+            当前完整业务尚未接线，只产生短TTL零底盘候选，不把“没有机械臂业务候选”
+            错误解释成17维主动位置保持。``ActionMux`` 仍基于实际反馈生成诊断
+            ``FinalAction``；是否允许发布由独立全局官方发布门决定。
             """
 
             # TODO：未来在这里调用 navigation 和 arm_execution 组装候选；业务模块
             # 只能返回候选，不能直接发布 ROS 话题，也不能在本函数实现算法。
             if snapshot.joints is None or not snapshot.joints.valid:
                 return None, None
-            return self._safe_hold_candidates(snapshot.joints, now_ns)
+            return BaseCommand(
+                0.0, 0.0, now_ns, now_ns + self._command_ttl_ns
+            ), None
 
         def _log_control_warning_on_change(self, reason: str) -> None:
             """只在控制降级原因变化时记录，避免定时器高频刷屏。"""
@@ -749,11 +1122,26 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 return
             self._last_control_warning = reason
             if reason:
-                self.get_logger().warning(reason)
+                if self._context_ok():
+                    self.get_logger().warning(reason)
+                else:
+                    # ROS context失效后rosout本身不可用；保留普通Python诊断字段，
+                    # 不再调用logger或任何publisher。
+                    self._last_non_ros_warning = reason
 
         def _publish_emergency_base_stop(self, reason: str) -> None:
             """状态不足以构造安全19维动作时，尽力只停止底盘。"""
 
+            if self._official_publisher is None:
+                self._log_control_warning_on_change(
+                    f"{reason}；official_publish_disabled；未创建或调用官方发布器"
+                )
+                return
+            if not self._context_ok():
+                self._log_control_warning_on_change(
+                    f"{reason}；ROS context已失效，禁止尝试官方紧急发布"
+                )
+                return
             try:
                 self._official_publisher.publish_emergency_base_stop()
                 message = reason
@@ -761,29 +1149,122 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 message = f"{reason}；{exc}"
             self._log_control_warning_on_change(message)
 
-        def _publish_final_action(self, action: FinalAction) -> bool:
-            """发布有效动作，并把同一个 FinalAction 作为诊断遥测发送。"""
+        def _publish_final_action(
+            self,
+            action: FinalAction,
+            *,
+            decision: ActionMuxDecision,
+            head_publish_authorized: bool = False,
+            safety_exit_authorized: bool = False,
+            diagnostic_only: bool = False,
+        ) -> bool:
+            """按本次调用授权发布有效动作，并始终发送诊断 FinalAction。
 
-            if not action.valid:
+            普通控制周期只有在同周期确实消费了head_yaw-only External Candidate时才传入
+            head授权，且只发布head分组。无候选、候选拒绝、非法mask和已消费旧候选形成
+            的FinalAction都只能作为团队遥测。emergency stop和明确安全退出使用各自
+            独立的安全路径。
+            """
+
+            group_records = tuple(
+                _empty_dispatch_group_records(self._official_topics)
+            )
+            dispatch_mode = DispatchMode.NONE
+            dispatch_failure_reason = ""
+            if diagnostic_only:
+                published = False
+                dispatch_failure_reason = "diagnostic_only"
+            elif self._official_publisher is None:
+                published = False
+                dispatch_failure_reason = (
+                    "observe_only"
+                    if self._observe_only
+                    else "enable_official_publish=false"
+                )
+            elif not self._context_ok():
+                self._log_control_warning_on_change(
+                    "ROS context已失效，禁止尝试官方控制发布"
+                )
+                published = False
+                dispatch_failure_reason = "ros_context_unavailable"
+            elif not action.valid:
                 self._publish_emergency_base_stop(
                     f"ActionMux 输出无效，禁止发布19维动作：{action.failure_reason}"
                 )
                 published = False
-            else:
+                dispatch_failure_reason = "invalid_final_action"
+            elif safety_exit_authorized:
+                dispatch_mode = DispatchMode.FULL
                 try:
-                    self._official_publisher.publish(action)
+                    group_records = self._official_publisher.publish_with_trace(action)
                     published = True
-                except RuntimeError as exc:
+                except OfficialPublishError as exc:
+                    group_records = exc.group_records
+                    dispatch_failure_reason = str(exc)
                     self._publish_emergency_base_stop(f"官方控制发布失败：{exc}")
+                    published = False
+            elif not head_publish_authorized:
+                published = False
+                dispatch_failure_reason = "current_cycle_not_authorized"
+            else:
+                dispatch_mode = DispatchMode.HEAD_ONLY
+                try:
+                    group_records = self._official_publisher.publish_head_with_trace(action)
+                    published = True
+                except OfficialPublishError as exc:
+                    group_records = exc.group_records
+                    dispatch_failure_reason = str(exc)
+                    # head Candidate失败不能顺带授权cmd_vel或其他四组官方话题。
+                    self._log_control_warning_on_change(
+                        f"官方head控制发布失败：{exc}"
+                    )
                     published = False
             # 遥测记录的是 ActionMux 的同一输出，不代表发布成功、Server接收或实际执行。
             action_message = self._ros.String()
             action_message.data = final_action_to_json(action)
             self._action_pub.publish(action_message)
+            dispatch = _build_action_dispatch_record(
+                action,
+                decision,
+                publish_enabled=self._publish_enabled,
+                publisher_created=self._official_publisher is not None,
+                dispatch_mode=dispatch_mode,
+                group_records=group_records,
+                failure_reason=dispatch_failure_reason,
+            )
+            dispatch_message = self._ros.String()
+            dispatch_message.data = action_dispatch_to_json(dispatch)
+            self._dispatch_pub.publish(dispatch_message)
             return published
+
+        def _context_ok(self) -> bool:
+            """Fail closed when this node's ROS context is absent or already shut down."""
+
+            context = getattr(self, "context", None)
+            ok = getattr(context, "ok", None)
+            if not callable(ok):
+                return False
+            try:
+                return bool(ok())
+            except Exception:  # noqa: BLE001 - context query failure disables publishing
+                return False
+
+        def _official_publish_available(self) -> bool:
+            """Return whether an existing publisher can safely be called now."""
+
+            return self._official_publisher is not None and self._context_ok()
 
         def _control_tick(self) -> None:
             now_ns = self.get_clock().now().nanoseconds
+            actual_dt_s = (
+                None
+                if self._last_control_tick_ns is None
+                else (now_ns - self._last_control_tick_ns) / 1e9
+            )
+            self._last_control_tick_ns = now_ns
+            watchdog_decision = self._external_candidate.watchdog(now_ns)
+            if watchdog_decision is not None:
+                self._log_external_candidate_decision(watchdog_decision)
             base = self._fresh_control_state(self._base_cache, now_ns)
             joints = self._fresh_control_state(self._joint_cache, now_ns)
             self._check_readiness(now_ns, base, joints)
@@ -821,45 +1302,127 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 )
                 return
 
+            external_decision = self._external_candidate.take(
+                now_ns=now_ns,
+                actual_joints=joints,
+                fsm_status=status,
+                actual_dt_s=actual_dt_s,
+                existing_command=manipulation_command,
+            )
+            if external_decision.accepted:
+                manipulation_command = external_decision.command
+            elif external_decision.failure_reason != "no_pending_candidate":
+                self._log_external_candidate_decision(external_decision)
+
             if snapshot.failure_reason:
-                # Odom陈旧时不继续普通策略，但可靠JointState仍允许经ActionMux发布零速保持。
+                # Odom陈旧时不继续普通策略；可靠JointState只用于生成诊断保持动作。
                 self._log_control_warning_on_change(
-                    f"机器人状态降级，发布零底盘和实际关节保持：{snapshot.failure_reason}"
+                    f"机器人状态降级，生成零底盘和实际关节保持诊断：{snapshot.failure_reason}"
                 )
             else:
                 self._log_control_warning_on_change("")
-            final_action = self._mux.compose(
-                base_command, manipulation_command, joints, status, now_ns
+            final_action, mux_decision = self._mux.compose_with_decision(
+                base_command,
+                manipulation_command,
+                joints,
+                status,
+                now_ns,
+                manipulation_source=(
+                    "external_candidate"
+                    if external_decision.accepted
+                    else "manipulation_command"
+                ),
             )
-            self._publish_final_action(final_action)
+            candidate_publish_authorized = (
+                external_decision.accepted
+                and external_decision.command is not None
+                and external_decision.command.controlled_mask
+                == (False, True, *([False] * 15))
+            )
+            if external_decision.accepted and not candidate_publish_authorized:
+                self._log_control_warning_on_change(
+                    "External Candidate不是严格head_yaw-only mask，禁止官方发布"
+                )
+            published = self._publish_final_action(
+                final_action,
+                decision=mux_decision,
+                head_publish_authorized=candidate_publish_authorized,
+                diagnostic_only=(
+                    external_decision.accepted and not candidate_publish_authorized
+                ),
+            )
+            if external_decision.accepted:
+                head_publish_failure_reason = ""
+                if (
+                    candidate_publish_authorized
+                    and not published
+                    and self._official_publisher is not None
+                ):
+                    head_publish_failure_reason = (
+                        self._official_publisher.last_head_publish_failure_reason
+                    )
+                self._log_external_candidate_decision(
+                    replace(
+                        external_decision,
+                        event="candidate_action_mux_result",
+                        failure_reason=(
+                            external_decision.failure_reason
+                            or head_publish_failure_reason
+                        ),
+                        final_action_sequence=final_action.sequence,
+                        official_publish_attempted=(
+                            candidate_publish_authorized
+                            and final_action.valid
+                            and self._official_publish_available()
+                        ),
+                        official_publish_success=published,
+                    )
+                )
+
+        def _log_external_candidate_decision(
+            self, decision: ExternalCandidateDecision
+        ) -> None:
+            """Emit versioned strict JSON diagnostics without file I/O or control effects."""
+
+            payload = json.dumps(
+                decision.audit_dict(),
+                ensure_ascii=False,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            if decision.accepted:
+                self.get_logger().info(f"external_candidate_audit:{payload}")
+            else:
+                self.get_logger().warning(f"external_candidate_audit:{payload}")
 
         def destroy_node(self) -> Any:
-            """停止定时控制，并在销毁ROS实体前尽力发送安全动作。
+            """取消控制周期、清空pending并销毁节点，不发送任何官方控制消息。
 
-            安全退出只能覆盖正常关闭和可处理异常，无法保证 kill -9、断电或整个容器
-            消失。是否需要重复零速以及 Server watchdog 行为仍待官方确认。
+            Stage 2A从未授权退出时的底盘或关节控制，因此不能把JointState反馈重新当作
+            controller target发布。head target shadow也必须原样保留。父级``_spin``在
+            ROS实体销毁后负责shutdown；context失效时本路径不调用logger或publisher。
             """
 
             if self._destroying:
                 return None
             self._destroying = True
+            context_valid = self._context_ok()
+            errors: list[str] = []
             try:
                 if self._control_timer is not None:
                     self._control_timer.cancel()
-                now_ns = self.get_clock().now().nanoseconds
-                joints = self._fresh_control_state(self._joint_cache, now_ns)
-                if joints is not None and joints.valid:
-                    base_command, hold = self._safe_hold_candidates(joints, now_ns)
-                    final_action = self._mux.compose(
-                        base_command, hold, joints, self._fsm.status(now_ns), now_ns
-                    )
-                    self._publish_final_action(final_action)
-                else:
-                    self._publish_emergency_base_stop(
-                        "节点退出时没有新鲜有效JointState，只能尽力发布底盘零速度"
-                    )
-            except Exception as exc:  # noqa: BLE001 - 必须记录，但绝不能阻止父节点销毁
-                self.get_logger().error(f"安全退出动作失败：{exc}")
+            except Exception as exc:  # noqa: BLE001 - 仍必须继续清空pending并销毁
+                errors.append(f"取消control timer失败：{exc}")
+            try:
+                # context失效后不再调用ROS clock；consumer只需一个诊断时间戳。
+                now_ns = self.get_clock().now().nanoseconds if context_valid else 0
+                self._external_candidate.shutdown(now_ns)
+            except Exception as exc:  # noqa: BLE001 - 记录后仍继续父节点销毁
+                errors.append(f"清空External Candidate失败：{exc}")
+            if errors:
+                self._destroy_failure_reason = "；".join(errors)
+                if self._context_ok():
+                    self.get_logger().error(self._destroy_failure_reason)
             return super().destroy_node()
 
     return _TeamClientNode
@@ -930,7 +1493,9 @@ def _create_perception_node(ros: SimpleNamespace) -> type:
             )
             self._yolo.self_check()
             self._transform.self_check()
-            self._estimator = Perception3DEstimator(self._transform)
+            self._stabilizer, self._estimator = _perception_pipeline_from_config(
+                config, self._transform
+            )
             self._publisher = self.create_publisher(
                 ros.Detection3DArray, topics["object_estimates"], 10
             )
@@ -1046,7 +1611,11 @@ def _create_perception_node(ros: SimpleNamespace) -> type:
                     frame_id=str(depth_message.header.frame_id),
                     timestamp_ns=_stamp_to_ns(depth_message.header.stamp),
                 )
-                detections = self._yolo.detect(rgb, depth, self._camera_info)
+                detections = self._stabilizer.update(
+                    self._yolo.detect(rgb, depth, self._camera_info),
+                    frame_timestamp_ns=rgb.timestamp_ns,
+                    frame_id=rgb.frame_id,
+                )
                 estimates = self._estimator.estimate(
                     detections, depth, self._camera_info, base, joints
                 )
@@ -1110,9 +1679,19 @@ def _create_recorder_node(ros: SimpleNamespace) -> type:
                 )
             topics = config["topics"]
             self._parser = InstructionParser()
-            self._recorder = EpisodeRecorder(recorder_config["root_dir"])
+            try:
+                pairing_config = ActionPairingConfig.from_mapping(
+                    recorder_config.get("action_pairing")
+                )
+            except ValueError as exc:
+                raise RuntimeError(f"Recorder action pairing配置无效：{exc}") from exc
+            self._recorder = EpisodeRecorder(
+                recorder_config["root_dir"], pairing_config
+            )
             self._rosbag_process: Optional[Any] = None
             self._rosbag_failure = ""
+            self._pairing_timer: Optional[Any] = None
+            self._destroyed = False
             now_ns = self.get_clock().now().nanoseconds
             episode_id = EpisodeRecorder.make_episode_id(recorder_config["episode_prefix"])
             self._recorder.start(
@@ -1134,6 +1713,17 @@ def _create_recorder_node(ros: SimpleNamespace) -> type:
                         raise RuntimeError(f"ros2 bag record 启动后立即退出，退出码={exit_code}")
                     self.create_timer(1.0, self._monitor_rosbag)
                 self.create_subscription(ros.String, topics["final_action"], self._on_action, 50)
+                if pairing_config.enabled:
+                    self.create_subscription(
+                        ros.String,
+                        topics["action_dispatch"],
+                        self._on_action_dispatch,
+                        50,
+                    )
+                    self._pairing_timer = self.create_timer(
+                        pairing_config.prune_period_sec,
+                        self._prune_action_pairs,
+                    )
                 self.create_subscription(ros.String, topics["fsm_status"], self._on_fsm, 50)
                 self.create_subscription(
                     ros.String, topics["instruction"], self._on_instruction, 10
@@ -1158,6 +1748,10 @@ def _create_recorder_node(ros: SimpleNamespace) -> type:
                 # 避免留下无人管理的录制进程或看似仍在进行的 Episode。
                 cleanup_errors: list[str] = []
                 try:
+                    self._stop_pairing_timer_and_close()
+                except Exception as cleanup_exc:  # noqa: BLE001 - 汇总到初始化错误
+                    cleanup_errors.append(f"关闭 action pairing 失败：{cleanup_exc}")
+                try:
                     self._stop_rosbag()
                 except Exception as cleanup_exc:  # noqa: BLE001 - 汇总到初始化错误
                     cleanup_errors.append(f"停止 rosbag 失败：{cleanup_exc}")
@@ -1171,9 +1765,56 @@ def _create_recorder_node(ros: SimpleNamespace) -> type:
 
         def _on_action(self, message: Any) -> None:
             try:
-                self._recorder.record_final_action(final_action_from_json(message.data))
+                if self._recorder.action_pairing_enabled:
+                    issue_types = self._recorder.ingest_final_action_payload(
+                        message.data,
+                        self.get_clock().now().nanoseconds,
+                        time.monotonic_ns(),
+                    )
+                    if issue_types:
+                        self.get_logger().warning(
+                            f"FinalAction pairing诊断：{','.join(issue_types)}"
+                        )
+                else:
+                    self._recorder.record_final_action(final_action_from_json(message.data))
             except (ValueError, RuntimeError) as exc:
                 self.get_logger().error(f"记录 FinalAction 失败：{exc}")
+
+        def _on_action_dispatch(self, message: Any) -> None:
+            try:
+                issue_types = self._recorder.ingest_action_dispatch_payload(
+                    message.data,
+                    self.get_clock().now().nanoseconds,
+                    time.monotonic_ns(),
+                )
+                if issue_types:
+                    self.get_logger().warning(
+                        f"ActionDispatch pairing诊断：{','.join(issue_types)}"
+                    )
+            except RuntimeError as exc:
+                self.get_logger().error(f"记录 ActionDispatch 失败：{exc}")
+
+        def _prune_action_pairs(self) -> None:
+            try:
+                issue_types = self._recorder.prune_action_pairs(
+                    self.get_clock().now().nanoseconds,
+                    time.monotonic_ns(),
+                )
+                if issue_types:
+                    self.get_logger().warning(
+                        f"Action pairing超时清理：{','.join(issue_types)}"
+                    )
+            except RuntimeError as exc:
+                self.get_logger().error(f"Action pairing定时清理失败：{exc}")
+
+        def _stop_pairing_timer_and_close(self) -> None:
+            if self._pairing_timer is not None:
+                self._pairing_timer.cancel()
+                self._pairing_timer = None
+            self._recorder.close_action_pairing(
+                self.get_clock().now().nanoseconds,
+                time.monotonic_ns(),
+            )
 
         def _on_fsm(self, message: Any) -> None:
             try:
@@ -1255,7 +1896,16 @@ def _create_recorder_node(ros: SimpleNamespace) -> type:
             ``RuntimeError``；正式 Episode 边界仍待赛事方确认。
             """
 
+            if self._destroyed and self._recorder.metadata is None:
+                return None
+            already_destroyed = self._destroyed
+            self._destroyed = True
             errors: list[str] = []
+            try:
+                # 必须先停止独立 prune timer，避免与 orphan/文件关闭路径并发。
+                self._stop_pairing_timer_and_close()
+            except Exception as exc:  # noqa: BLE001 - 仍需停止bag并销毁节点
+                errors.append(f"关闭 action pairing 失败：{exc}")
             try:
                 self._stop_rosbag()
             except Exception as exc:  # noqa: BLE001 - 仍需完成元数据并销毁节点
@@ -1265,7 +1915,7 @@ def _create_recorder_node(ros: SimpleNamespace) -> type:
                     self._recorder.finish(self.get_clock().now().nanoseconds)
             except Exception as exc:  # noqa: BLE001 - 销毁后仍要报告元数据错误
                 errors.append(f"结束 Episode 失败：{exc}")
-            result = super().destroy_node()
+            result = None if already_destroyed else super().destroy_node()
             if errors:
                 raise RuntimeError("；".join(errors))
             return result
@@ -1281,6 +1931,259 @@ def _action_mux_config(config: dict[str, Any]) -> ActionMuxConfig:
         joint_lower=tuple(float(value) for value in action["joint_lower"]),
         joint_upper=tuple(float(value) for value in action["joint_upper"]),
     )
+
+
+def _validated_action_dispatch_topic(value: object) -> str:
+    """冻结团队内部dispatch遥测入口，且在任何官方publisher创建前失败。"""
+
+    if not isinstance(value, Mapping):
+        raise RuntimeError("topics配置必须是映射")
+    topic = value.get("action_dispatch")
+    if topic != "/team/action_dispatch":
+        raise RuntimeError("topics.action_dispatch必须严格为/team/action_dispatch")
+    return topic
+
+
+def _validated_control_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Validate the fail-closed global official publish gate."""
+
+    control = config.get("control")
+    if not isinstance(control, dict):
+        raise RuntimeError("control 配置必须是映射且显式包含三道全局发布门")
+    required = ("observe_only", "enable_official_publish", "simulation_only")
+    missing = [name for name in required if name not in control]
+    if missing:
+        raise RuntimeError(f"control 配置缺少字段：{missing}")
+    invalid = [name for name in required if type(control[name]) is not bool]
+    if invalid:
+        raise RuntimeError(f"control 配置字段必须为严格 bool：{invalid}")
+    normalized: dict[str, Any] = {name: control[name] for name in required}
+    if not normalized["simulation_only"]:
+        raise RuntimeError("control.simulation_only=false 被安全策略拒绝")
+    normalized["head_target_tracking"] = _validated_head_target_tracking_config(
+        control.get("head_target_tracking")
+    )
+    return normalized
+
+
+def _validated_head_target_tracking_config(value: object) -> dict[str, Any]:
+    """严格验证fresh-reset专用的head controller-target shadow配置。"""
+
+    if not isinstance(value, dict):
+        raise RuntimeError("control.head_target_tracking必须是显式映射")
+    bool_fields = (
+        "enabled",
+        "require_fresh_reset",
+        "fresh_reset_confirmed",
+        "require_exclusive_writer",
+    )
+    numeric_fields = ("initial_yaw_target", "initial_pitch_target")
+    required = (*bool_fields, *numeric_fields)
+    missing = [name for name in required if name not in value]
+    if missing:
+        raise RuntimeError(f"control.head_target_tracking缺少字段：{missing}")
+    unknown = sorted(set(value) - set(required))
+    if unknown:
+        raise RuntimeError(f"control.head_target_tracking存在未知字段：{unknown}")
+    invalid_bool = [name for name in bool_fields if type(value[name]) is not bool]
+    if invalid_bool:
+        raise RuntimeError(f"head target tracking字段必须为严格bool：{invalid_bool}")
+    if not value["require_fresh_reset"]:
+        raise RuntimeError("head target tracking必须require_fresh_reset=true")
+    if not value["require_exclusive_writer"]:
+        raise RuntimeError("head target tracking必须require_exclusive_writer=true")
+    targets: dict[str, float] = {}
+    for name in numeric_fields:
+        raw = value[name]
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            raise RuntimeError(f"{name}必须是有限实数且不能是bool")
+        number = float(raw)
+        if not math.isfinite(number):
+            raise RuntimeError(f"{name}必须是有限实数")
+        targets[name] = number
+    if targets != {"initial_yaw_target": 0.0, "initial_pitch_target": 0.0}:
+        raise RuntimeError("Stage 2A初始head controller target必须严格为[0.0,0.0]")
+    return {
+        **{name: value[name] for name in bool_fields},
+        **targets,
+    }
+
+
+def _official_publish_enabled(control: dict[str, bool]) -> bool:
+    """Only the explicit simulation-only actuation combination opens the gate."""
+
+    return (
+        not control["observe_only"]
+        and control["enable_official_publish"]
+        and control["simulation_only"]
+    )
+
+
+def _rclpy_context_ok(ros: SimpleNamespace, node: Optional[Any]) -> bool:
+    """Query rclpy context without treating an exception as permission to publish/shutdown."""
+
+    context = getattr(node, "context", None) if node is not None else None
+    try:
+        return bool(ros.rclpy.ok(context=context))
+    except TypeError:
+        try:
+            return bool(ros.rclpy.ok())
+        except Exception:  # noqa: BLE001 - failed query is fail-closed
+            return False
+    except Exception:  # noqa: BLE001 - failed query is fail-closed
+        return False
+
+
+def _external_candidate_subscription_enabled(config: ExternalCandidateConfig) -> bool:
+    """Keep the ROS subscription absent unless the first gate is explicitly enabled."""
+
+    return config.enabled
+
+
+def _perception_stabilizer_from_config(
+    config: dict[str, Any],
+) -> Detection2DStabilizer:
+    """从真实节点配置构造二维稳定器，并拒绝缺失或未消费字段。"""
+
+    perception = _config_mapping(config.get("perception"), "perception")
+    values = _config_mapping(
+        perception.get("stabilizer_2d"), "perception.stabilizer_2d"
+    )
+    required = {
+        "iou_match_threshold",
+        "min_confirmed_hits",
+        "max_missed_frames",
+        "bbox_smoothing_alpha",
+        "confidence_smoothing_alpha",
+    }
+    _require_exact_config_keys(values, required, "perception.stabilizer_2d")
+    try:
+        return Detection2DStabilizer(
+            iou_match_threshold=values["iou_match_threshold"],
+            min_confirmed_hits=values["min_confirmed_hits"],
+            max_missed_frames=values["max_missed_frames"],
+            bbox_smoothing_alpha=values["bbox_smoothing_alpha"],
+            confidence_smoothing_alpha=values["confidence_smoothing_alpha"],
+        )
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"perception.stabilizer_2d 配置无效：{exc}") from exc
+
+
+def _perception_pipeline_from_config(
+    config: dict[str, Any],
+    transform: CameraTransformProvider,
+) -> tuple[Detection2DStabilizer, Perception3DEstimator]:
+    """构造 PerceptionNode 唯一使用的二维稳定与三维估计流水线。"""
+
+    return (
+        _perception_stabilizer_from_config(config),
+        _perception_3d_estimator_from_config(config, transform),
+    )
+
+
+def _perception_3d_estimator_from_config(
+    config: dict[str, Any],
+    transform: CameraTransformProvider,
+) -> Perception3DEstimator:
+    """从 PerceptionNode 的真实配置构造三维估计器。
+
+    物体尺寸按 ``[width_m, height_m, depth_extent_m]`` 解释；键必须严格覆盖官方
+    YOLO 的三类目标。Detection/Depth/CameraInfo 的最大时间差复用 RGB/Depth 同步
+    的非零 ``sync_slop_s``，避免节点接线中出现两个互相漂移的时间窗口。
+    """
+
+    perception = _config_mapping(config.get("perception"), "perception")
+    values = _config_mapping(
+        perception.get("estimator_3d"), "perception.estimator_3d"
+    )
+    required = {
+        "depth_radius_px",
+        "ema_alpha",
+        "converge_frames",
+        "max_track_age_s",
+        "max_position_jump_m",
+        "object_dimensions_m",
+    }
+    _require_exact_config_keys(values, required, "perception.estimator_3d")
+    dimensions = _config_mapping(
+        values["object_dimensions_m"],
+        "perception.estimator_3d.object_dimensions_m",
+    )
+    expected_classes = set(OfficialYoloAdapter.CLASS_NAMES)
+    _require_exact_config_keys(
+        dimensions,
+        expected_classes,
+        "perception.estimator_3d.object_dimensions_m",
+    )
+    normalized_dimensions: dict[str, tuple[float, float, float]] = {}
+    for class_id in OfficialYoloAdapter.CLASS_NAMES:
+        raw = dimensions[class_id]
+        if isinstance(raw, (str, bytes)) or not isinstance(raw, (list, tuple)):
+            raise RuntimeError(
+                "perception.estimator_3d.object_dimensions_m"
+                f"[{class_id!r}] 必须是三个正有限数"
+            )
+        if len(raw) != 3:
+            raise RuntimeError(
+                "perception.estimator_3d.object_dimensions_m"
+                f"[{class_id!r}] 必须恰好包含 [width_m,height_m,depth_extent_m]"
+            )
+        converted = tuple(
+            _positive_config_number(
+                item,
+                "perception.estimator_3d.object_dimensions_m"
+                f"[{class_id!r}][{index}]",
+            )
+            for index, item in enumerate(raw)
+        )
+        normalized_dimensions[class_id] = converted
+
+    max_input_skew_s = _positive_config_number(
+        perception.get("sync_slop_s"), "perception.sync_slop_s"
+    )
+    try:
+        return Perception3DEstimator(
+            transform,
+            depth_radius_px=values["depth_radius_px"],
+            ema_alpha=values["ema_alpha"],
+            converge_frames=values["converge_frames"],
+            max_track_age_s=values["max_track_age_s"],
+            max_input_skew_s=max_input_skew_s,
+            max_position_jump_m=values["max_position_jump_m"],
+            object_dimensions_m=normalized_dimensions,
+        )
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"perception.estimator_3d 配置无效：{exc}") from exc
+
+
+def _config_mapping(value: Any, name: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise RuntimeError(f"{name} 必须是映射")
+    return value
+
+
+def _require_exact_config_keys(
+    values: dict[str, Any],
+    expected: set[str],
+    name: str,
+) -> None:
+    actual = set(values)
+    if actual == expected:
+        return
+    missing = sorted(expected - actual)
+    unknown = sorted(actual - expected)
+    raise RuntimeError(
+        f"{name} 字段不完整：缺失={missing}，未知={unknown}"
+    )
+
+
+def _positive_config_number(value: Any, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise RuntimeError(f"{name} 必须是正有限数，不能使用 bool")
+    number = float(value)
+    if not math.isfinite(number) or number <= 0.0:
+        raise RuntimeError(f"{name} 必须是正有限数，实际={value!r}")
+    return number
 
 
 def _bounds_from_config(values: list[float]) -> Bounds3D:
@@ -1409,11 +2312,40 @@ def _estimates_to_vision(
         hypothesis.score = confidence
         pose = _vision_result_pose(result)
         pose.position.x, pose.position.y, pose.position.z = xyz
-        # 单位四元数只是满足 Pose 消息结构，不表示已估计出物体的真实朝向。
-        pose.orientation.x = 0.0
-        pose.orientation.y = 0.0
-        pose.orientation.z = 0.0
-        pose.orientation.w = 1.0
+        orientation = estimate.orientation_xyzw
+        if orientation is None:
+            # 团队内部 /team/object_estimates 契约：零四元数表示姿态不可用。
+            orientation = (0.0, 0.0, 0.0, 0.0)
+        else:
+            orientation = tuple(float(value) for value in orientation)
+            if len(orientation) != 4 or not all(
+                math.isfinite(value) for value in orientation
+            ):
+                raise ValueError("ObjectEstimate3D 姿态必须是四项有限数")
+            orientation_norm = math.sqrt(
+                sum(value * value for value in orientation)
+            )
+            if orientation_norm <= 1e-12:
+                raise ValueError("ObjectEstimate3D 已提供姿态的四元数范数接近零")
+            orientation = tuple(value / orientation_norm for value in orientation)
+        (
+            pose.orientation.x,
+            pose.orientation.y,
+            pose.orientation.z,
+            pose.orientation.w,
+        ) = orientation
+        if not hasattr(detection, "id") or not hasattr(detection, "bbox"):
+            raise RuntimeError("vision_msgs Detection3D 缺少 id/bbox 字段")
+        detection.id = estimate.object_id or ""
+        if estimate.size_xyz_m is None:
+            size = (0.0, 0.0, 0.0)
+        else:
+            size = tuple(float(value) for value in estimate.size_xyz_m)
+            if len(size) != 3 or not all(
+                math.isfinite(value) and value > 0.0 for value in size
+            ):
+                raise ValueError("ObjectEstimate3D 已提供尺寸必须三轴均为有限正数")
+        detection.bbox.size.x, detection.bbox.size.y, detection.bbox.size.z = size
         detection.results.append(result)
         message.detections.append(detection)
     return message
@@ -1437,6 +2369,34 @@ def _estimates_from_vision(message: Any) -> tuple[ObjectEstimate3D, ...]:
         if not all(math.isfinite(value) for value in xyz):
             raise ValueError("vision_msgs 三维位置包含 NaN/Inf")
         confidence = _validated_confidence(hypothesis.score, "vision_msgs 三维结果")
+        pose = _vision_result_pose(result)
+        orientation_values = (
+            float(pose.orientation.x),
+            float(pose.orientation.y),
+            float(pose.orientation.z),
+            float(pose.orientation.w),
+        )
+        if not all(math.isfinite(value) for value in orientation_values):
+            raise ValueError("vision_msgs 三维姿态包含 NaN/Inf")
+        orientation_norm = math.sqrt(
+            sum(value * value for value in orientation_values)
+        )
+        orientation = None if orientation_norm <= 1e-12 else orientation_values
+        if not hasattr(detection, "id") or not hasattr(detection, "bbox"):
+            raise RuntimeError("vision_msgs Detection3D 缺少 id/bbox 字段")
+        size_values = (
+            float(detection.bbox.size.x),
+            float(detection.bbox.size.y),
+            float(detection.bbox.size.z),
+        )
+        if not all(math.isfinite(value) for value in size_values):
+            raise ValueError("vision_msgs bbox.size 包含 NaN/Inf")
+        if all(value == 0.0 for value in size_values):
+            size = None
+        elif not all(value > 0.0 for value in size_values):
+            raise ValueError("vision_msgs bbox.size 必须全零或三轴均为正数")
+        else:
+            size = size_values
         try:
             timestamp_ns = _stamp_to_ns(header.stamp)
         except (AttributeError, TypeError, ValueError):
@@ -1451,6 +2411,9 @@ def _estimates_from_vision(message: Any) -> tuple[ObjectEstimate3D, ...]:
                 frame_id=str(getattr(header, "frame_id", "") or array_frame_id),
                 timestamp_ns=timestamp_ns,
                 slot_type=SlotType.UNKNOWN,
+                object_id=str(detection.id).strip() or None,
+                orientation_xyzw=orientation,
+                size_xyz_m=size,
             )
         )
     return tuple(converted)
