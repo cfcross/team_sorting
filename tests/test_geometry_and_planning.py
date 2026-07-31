@@ -40,6 +40,7 @@ from team_sorting.interfaces import (
     CameraIntrinsics,
     Detection2D,
     DepthFrame,
+    IKResult,
     NavGoal,
     ObjectEstimate3D,
     Pose3D,
@@ -2994,3 +2995,568 @@ def test_arm_planner_methods_remain_explicitly_unimplemented() -> None:
 def test_arm_planner_rejects_dependency_without_solve_ik() -> None:
     with pytest.raises(TypeError, match="solve_ik"):
         ArmPlanner(object())  # type: ignore[arg-type]
+
+# ---------------------------------------------------------------------------
+# ArmPlanner 规划行为测试（机械臂1新增）
+# ---------------------------------------------------------------------------
+class _FakeIKAdapter:
+    """可配置返回值的 fake IK 适配器，供 ArmPlanner 单元测试使用。"""
+
+    def __init__(self, *, solutions: list | None = None) -> None:
+        """solutions: 按顺序返回的 IKResult 列表；耗尽后返回失败。"""
+        self._solutions = solutions or []
+        self._call_count = 0
+        self.calls: list[dict] = []
+
+    def solve_ik(self, actual_joints, *, left_target=None, right_target=None,
+                 target_slide=None):
+        self.calls.append({
+            "left_target": left_target,
+            "right_target": right_target,
+            "target_slide": target_slide,
+        })
+        if self._call_count < len(self._solutions):
+            result = self._solutions[self._call_count]
+            self._call_count += 1
+            return result
+        # 默认返回失败
+        from team_sorting.interfaces import IKResult
+        return IKResult(0.1, None, None, False, "fake IK 耗尽")
+
+
+def _make_fake_ik_success(slide: float = 0.1,
+                          left: tuple = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6),
+                          right: tuple = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6)) -> IKResult:
+    """构造成功 IKResult。"""
+    return IKResult(slide, left, right, True)
+
+
+def _make_fake_ik_failure(reason: str = "fake failure") -> IKResult:
+    """构造失败 IKResult。"""
+    return IKResult(0.1, None, None, False, reason)
+
+
+def test_plan_grasp_success() -> None:
+    """验证有效输入时 plan_grasp 返回正确的 5 路点轨迹。"""
+    # 所有阶段 IK 均成功
+    fake = _FakeIKAdapter(solutions=[
+        _make_fake_ik_success(0.1),  # pre-grasp
+        _make_fake_ik_success(0.1),  # grasp
+        _make_fake_ik_success(0.1),  # lift
+        _make_fake_ik_success(0.1),  # retreat
+    ])
+    planner = ArmPlanner(fake)  # type: ignore[arg-type]
+    target = ObjectEstimate3D("pink", (0.0, 0.8, 0.3), 0.9, "footprint", 100)
+    joints = _planning_joints()
+
+    gt, jt = planner.plan_grasp(target, joints)
+
+    assert gt.valid
+    assert gt.confidence == 1.0
+    assert jt.valid
+    assert len(jt.waypoints) == 5  # pre, grasp, close_wait, lift, retreat
+
+    # 路点时间递增
+    times = [wp.time_from_start_s for wp in jt.waypoints]
+    for i in range(1, len(times)):
+        assert times[i] > times[i - 1], f"路点 {i} 时间未递增"
+
+    # 夹爪状态：阶段0（预抓取）张开，阶段1-4闭合
+    assert jt.waypoints[0].joint_position[9] == pytest.approx(0.5)   # left_gripper OPEN
+    assert jt.waypoints[0].joint_position[16] == pytest.approx(0.5)  # right_gripper OPEN
+    for i in range(1, 5):
+        assert jt.waypoints[i].joint_position[9] == pytest.approx(0.0)
+        assert jt.waypoints[i].joint_position[16] == pytest.approx(0.0)
+
+    # 验证 grasp_context 已设置
+    assert planner._grasp_context is not None
+    assert "left_offset" in planner._grasp_context
+    assert "right_offset" in planner._grasp_context
+
+
+def test_plan_grasp_ik_failure() -> None:
+    """验证 IK 失败时返回 invalid 结果，不抛异常。"""
+    fake = _FakeIKAdapter(solutions=[
+        _make_fake_ik_failure("预抓取无解"),
+    ])
+    planner = ArmPlanner(fake)  # type: ignore[arg-type]
+    target = ObjectEstimate3D("pink", (0.0, 0.8, 0.3), 0.9, "footprint", 100)
+    joints = _planning_joints()
+
+    gt, jt = planner.plan_grasp(target, joints)
+    assert not gt.valid
+    assert "预抓取IK失败" in gt.failure_reason
+    assert not jt.valid
+
+
+def test_plan_grasp_joint_jump() -> None:
+    """验证关节跳变超过阈值时返回 invalid。"""
+    # 第一次返回小关节值，第二次返回大幅跳变
+    fake = _FakeIKAdapter(solutions=[
+        _make_fake_ik_success(0.1, left=(0.1, 0.2, 0.3, 0.4, 0.5, 0.6),
+                              right=(0.1, 0.2, 0.3, 0.4, 0.5, 0.6)),
+        _make_fake_ik_success(0.1, left=(2.0, 0.2, 0.3, 0.4, 0.5, 0.6),  # 关节0跳变 >0.5
+                              right=(0.1, 0.2, 0.3, 0.4, 0.5, 0.6)),
+    ])
+    planner = ArmPlanner(fake)  # type: ignore[arg-type]
+    target = ObjectEstimate3D("pink", (0.0, 0.8, 0.3), 0.9, "footprint", 100)
+    joints = _planning_joints()
+
+    gt, jt = planner.plan_grasp(target, joints)
+    assert not gt.valid
+    assert "跳变" in gt.failure_reason
+
+
+def test_plan_place_without_context() -> None:
+    """验证未执行抓取直接调用 plan_place 返回 invalid。"""
+    fake = _FakeIKAdapter()
+    planner = ArmPlanner(fake)  # type: ignore[arg-type]
+    task = TaskSpec(
+        task_id=1, instruction="move pink box",
+        target_kind="box", target_body="box_body", target_color="pink",
+        place_type="point", place_world_xyz=(2.0, 3.0, 0.5), place_radius=0.1,
+    )
+    joints = _planning_joints()
+
+    pt, jt = planner.plan_place(task, joints)
+    assert not pt.valid
+    assert "未执行抓取" in pt.failure_reason
+
+
+def test_plan_place_success() -> None:
+    """验证先抓取后放置成功生成有效轨迹且上下文被清除。"""
+    fake = _FakeIKAdapter(solutions=[
+        # plan_grasp: 4 stages
+        _make_fake_ik_success(0.1),
+        _make_fake_ik_success(0.1),
+        _make_fake_ik_success(0.1),
+        _make_fake_ik_success(0.1),
+        # plan_place: 3 stages
+        _make_fake_ik_success(0.1),
+        _make_fake_ik_success(0.1),
+        _make_fake_ik_success(0.1),
+    ])
+    planner = ArmPlanner(fake)  # type: ignore[arg-type]
+    target = ObjectEstimate3D("pink", (0.0, 0.8, 0.3), 0.9, "footprint", 100)
+    joints = _planning_joints()
+
+    # 先抓取
+    gt, _ = planner.plan_grasp(target, joints)
+    assert gt.valid
+    assert planner._grasp_context is not None
+
+    # 再放置
+    task = TaskSpec(
+        task_id=1, instruction="move pink box",
+        target_kind="box", target_body="box_body", target_color="pink",
+        place_type="point", place_world_xyz=(0.0, 1.8, 0.3), place_radius=0.1,
+    )
+    pt, jt_place = planner.plan_place(task, joints)
+    assert pt.valid
+    assert len(jt_place.waypoints) == 3
+    # 上下文应被清除
+    assert planner._grasp_context is None
+
+
+def test_plan_grasp_frame_conversion() -> None:
+    """验证 odom 坐标系的临时转换生效。"""
+    fake = _FakeIKAdapter(solutions=[
+        _make_fake_ik_success(0.1),
+        _make_fake_ik_success(0.1),
+        _make_fake_ik_success(0.1),
+        _make_fake_ik_success(0.1),
+    ])
+    planner = ArmPlanner(fake)  # type: ignore[arg-type]
+    # odom 坐标 (0.0, 1.35, 0.3) -> footprint _FOOTPRINT_ROBOT_XY robot base
+    # 转换后: (0.0 - (-0.70), 1.35 - 0.55, 0.3) ≈ (0.70, 0.80, 0.3)
+    target = ObjectEstimate3D("pink", (0.0, 1.35, 0.3), 0.9, "odom", 100)
+    joints = _planning_joints()
+
+    gt, jt = planner.plan_grasp(target, joints)
+    assert gt.valid
+    # 验证 IK 调用使用了 footprint 坐标系的 Pose3D
+    assert len(fake.calls) >= 1
+    first_call = fake.calls[0]
+    assert first_call["left_target"].frame_id == "footprint"
+    # 验证转换后的位置近似在 robot 局部坐标下
+    # odom(0.0, 1.35) - _FOOTPRINT_ROBOT_XY = footprint(0.70, 0.80)
+    # 预抓取位置：target_xy - 0.15 * dir, Z + 0.20
+    left_pos = first_call["left_target"].position_xyz
+    # 预期：odom(0.0,1.35,0.3) - _FOOTPRINT_ROBOT_XY = footprint(0.70,0.80,0.3)
+    # 预抓取在目标上方 0.20m，沿抓取方向后退 0.15m，再加垂直偏移
+    assert 0.5 < left_pos[0] < 0.8
+    assert 0.7 < left_pos[1] < 0.9
+    assert 0.45 < left_pos[2] < 0.55
+
+def test_box_size_compensation() -> None:
+    """验证抓取位姿的左右夹爪按箱体半宽 + 安全间隙偏移。"""
+    # robot_xy=_FOOTPRINT_ROBOT_XY, target在footprint系(0.0, 0.8, 0.3)
+    # 抓取方向: dx=0.70, dy=0.25, dist≈0.7433
+    # perp 方向: (-0.3363, 0.9417), grasp_offset=0.10
+    # 左夹爪 X ≈ 0.0 + (-0.3363)*0.10 = -0.0336
+    # 右夹爪 X ≈ 0.0 - (-0.3363)*0.10 = +0.0336
+    fake = _FakeIKAdapter(solutions=[
+        _make_fake_ik_success(0.1), _make_fake_ik_success(0.1),
+        _make_fake_ik_success(0.1), _make_fake_ik_success(0.1),
+    ])
+    planner = ArmPlanner(fake)  # type: ignore[arg-type]
+    target = ObjectEstimate3D("pink", (0.0, 0.8, 0.3), 0.9, "footprint", 100)
+    joints = _planning_joints()
+
+    gt, jt = planner.plan_grasp(target, joints)
+    assert gt.valid
+
+    # 抓取阶段左右夹爪沿垂直方向各偏移 grasp_offset，方向相反
+    # 验证左右偏移符号相反、绝对值相等
+    left_x = gt.left_grasp.position_xyz[0]
+    right_x = gt.right_grasp.position_xyz[0]
+    # 左/右夹爪在 X 轴上符号相反（perp_x 为负时左负右正）
+    assert abs(left_x) == pytest.approx(abs(right_x), abs=0.001)
+    assert left_x <= 0 <= right_x  # 左负右正（perp_x<0 时）
+    # 偏移量约为 0.10（half_width+0.02）乘以 perp 的 X 分量绝对值
+    assert abs(left_x) == pytest.approx(0.0336, abs=0.005)
+
+    # 抓取阶段 Z 应与目标 Z 一致
+    assert gt.left_grasp.position_xyz[2] == pytest.approx(0.3)
+    assert gt.right_grasp.position_xyz[2] == pytest.approx(0.3)
+
+    # 验证 box 半宽 + 安全间隙 = 0.10 已应用：任意一对阶段位姿中，
+    # 左右夹爪在垂直于抓取方向上的分离距离 ≈ 2 * 0.10 = 0.20
+    import math
+    sep = math.hypot(
+        gt.left_grasp.position_xyz[0] - gt.right_grasp.position_xyz[0],
+        gt.left_grasp.position_xyz[1] - gt.right_grasp.position_xyz[1],
+    )
+    assert sep == pytest.approx(0.20, abs=0.01)
+
+
+def test_place_height_compensation() -> None:
+    """验证放置时 release 高度使用箱体半高补偿，不会悬空。"""
+    fake = _FakeIKAdapter(solutions=[
+        _make_fake_ik_success(0.1), _make_fake_ik_success(0.1),
+        _make_fake_ik_success(0.1), _make_fake_ik_success(0.1),
+        # plan_place: 3 stages
+        _make_fake_ik_success(0.1), _make_fake_ik_success(0.1),
+        _make_fake_ik_success(0.1),
+    ])
+    planner = ArmPlanner(fake)  # type: ignore[arg-type]
+    target = ObjectEstimate3D("pink", (0.0, 0.8, 0.3), 0.9, "footprint", 100)
+    joints = _planning_joints()
+
+    gt, _ = planner.plan_grasp(target, joints)
+    assert gt.valid
+    # 验证上下文 Z 偏移使用箱体半高补偿，非原始 lift delta
+    ctx = planner._grasp_context
+    from team_sorting.arm_planning import _BOX_HALF_HEIGHT, _PLACE_SURFACE_OFFSET, _LIFT_DELTA
+    expected_z = _BOX_HALF_HEIGHT + _PLACE_SURFACE_OFFSET
+    assert ctx["left_offset"][2] == pytest.approx(expected_z)
+    assert ctx["right_offset"][2] == pytest.approx(expected_z)
+    # 确认不再是原始的 _LIFT_DELTA
+    assert ctx["left_offset"][2] != pytest.approx(_LIFT_DELTA)
+
+    # 执行放置，验证 release 位姿的 Z 使用了箱体补偿
+    task = TaskSpec(
+        task_id=1, instruction="move pink box",
+        target_kind="box", target_body="box_body", target_color="pink",
+        place_type="point", place_world_xyz=(0.0, 1.8, 0.3), place_radius=0.1,
+    )
+    pt, jt_place = planner.plan_place(task, joints)
+    assert pt.valid
+    # release Z = place_center_z + box_half_height + surface_offset = 0.3 + 0.095 + 0.02 = 0.415
+    assert pt.left_release.position_xyz[2] == pytest.approx(0.3 + expected_z)
+    assert pt.right_release.position_xyz[2] == pytest.approx(0.3 + expected_z)
+
+
+def test_grasp_target_too_far() -> None:
+    """验证目标超出 _MAX_GRASP_DIST 时返回 invalid。"""
+    fake = _FakeIKAdapter()
+    planner = ArmPlanner(fake)  # type: ignore[arg-type]
+    # 目标在 footprint 系中距离 robot 中心约 3.0m，远超 _MAX_GRASP_DIST=1.5m
+    target = ObjectEstimate3D("pink", (3.0, 3.0, 0.3), 0.9, "footprint", 100)
+    joints = _planning_joints()
+
+    gt, jt = planner.plan_grasp(target, joints)
+    assert not gt.valid
+    assert "超出最大抓取距离" in gt.failure_reason
+
+
+def test_reset_context() -> None:
+    """验证 reset_context 能清空抓取上下文。"""
+    fake = _FakeIKAdapter(solutions=[
+        _make_fake_ik_success(0.1), _make_fake_ik_success(0.1),
+        _make_fake_ik_success(0.1), _make_fake_ik_success(0.1),
+    ])
+    planner = ArmPlanner(fake)  # type: ignore[arg-type]
+    target = ObjectEstimate3D("pink", (0.0, 0.8, 0.3), 0.9, "footprint", 100)
+    joints = _planning_joints()
+
+    gt, _ = planner.plan_grasp(target, joints)
+    assert gt.valid
+    assert planner._grasp_context is not None
+
+    planner.reset_context()
+    assert planner._grasp_context is None
+
+
+
+
+def test_grasp_stages_include_close_wait() -> None:
+    """验证抓取轨迹包含5个阶段且 close_wait 夹爪保持闭合。"""
+    fake = _FakeIKAdapter(solutions=[
+        _make_fake_ik_success(0.1),  # pre-grasp
+        _make_fake_ik_success(0.1),  # grasp
+        _make_fake_ik_success(0.1),  # lift
+        _make_fake_ik_success(0.1),  # retreat
+    ])
+    planner = ArmPlanner(fake)  # type: ignore[arg-type]
+    target = ObjectEstimate3D('pink', (0.0, 0.8, 0.3), 0.9, 'footprint', 100)
+    joints = _planning_joints()
+
+    gt, jt = planner.plan_grasp(target, joints)
+
+    assert gt.valid
+    assert len(jt.waypoints) == 5
+
+    # 阶段顺序: pre(张开) -> grasp(闭合) -> close_wait(闭合) -> lift(闭合) -> retreat(闭合)
+    wp_pre = jt.waypoints[0]
+    wp_grasp = jt.waypoints[1]
+    wp_close = jt.waypoints[2]
+    wp_lift = jt.waypoints[3]
+    wp_retreat = jt.waypoints[4]
+
+    # 夹爪状态
+    assert wp_pre.joint_position[9] == pytest.approx(0.5)   # 预抓取：张开
+    assert wp_pre.joint_position[16] == pytest.approx(0.5)
+    assert wp_grasp.joint_position[9] == pytest.approx(0.0)  # 抓取：闭合
+    assert wp_grasp.joint_position[16] == pytest.approx(0.0)
+    assert wp_close.joint_position[9] == pytest.approx(0.0)  # close_wait：保持闭合
+    assert wp_close.joint_position[16] == pytest.approx(0.0)
+    assert wp_lift.joint_position[9] == pytest.approx(0.0)   # 抬升：保持闭合
+    assert wp_lift.joint_position[16] == pytest.approx(0.0)
+    assert wp_retreat.joint_position[9] == pytest.approx(0.0)  # 撤离：保持闭合
+    assert wp_retreat.joint_position[16] == pytest.approx(0.0)
+
+    # close_wait 关节位置与 grasp 相同（保持）
+    assert wp_close.joint_position[0:9] == wp_grasp.joint_position[0:9]
+    assert wp_close.joint_position[10:16] == wp_grasp.joint_position[10:16]
+
+    # close_wait 时间比 grasp 多 _CLOSE_WAIT_TIME
+    from team_sorting.arm_planning import _CLOSE_WAIT_TIME
+    assert wp_close.time_from_start_s == pytest.approx(wp_grasp.time_from_start_s + _CLOSE_WAIT_TIME)
+
+    # 时间严格递增
+    times = [wp.time_from_start_s for wp in jt.waypoints]
+    for i in range(1, len(times)):
+        assert times[i] > times[i - 1], f'路点 {i} 时间未递增'
+
+
+def test_grasp_close_wait_no_extra_ik_call() -> None:
+    """验证 close_wait 阶段不额外调用 IK（复用 grasp IK 结果）。"""
+    fake = _FakeIKAdapter(solutions=[
+        _make_fake_ik_success(0.1),
+        _make_fake_ik_success(0.1),
+        _make_fake_ik_success(0.1),
+        _make_fake_ik_success(0.1),
+    ])
+    planner = ArmPlanner(fake)  # type: ignore[arg-type]
+    target = ObjectEstimate3D('pink', (0.0, 0.8, 0.3), 0.9, 'footprint', 100)
+    joints = _planning_joints()
+
+    planner.plan_grasp(target, joints)
+
+    # 5个阶段只有4次IK调用（close_wait复用grasp的IK）
+    assert len(fake.calls) == 4
+    assert fake._call_count == 4
+
+
+def test_place_release_height_compensation() -> None:
+    """验证放置释放高度使用箱体补偿（_BOX_HALF_HEIGHT + _PLACE_SURFACE_OFFSET）
+    而非原始 _LIFT_DELTA。"""
+    from team_sorting.arm_planning import _BOX_HALF_HEIGHT, _PLACE_SURFACE_OFFSET, _LIFT_DELTA
+
+    fake = _FakeIKAdapter(solutions=[
+        _make_fake_ik_success(0.1),  # plan_grasp: pre
+        _make_fake_ik_success(0.1),  # plan_grasp: grasp
+        _make_fake_ik_success(0.1),  # plan_grasp: lift
+        _make_fake_ik_success(0.1),  # plan_grasp: retreat
+        _make_fake_ik_success(0.1),  # plan_place: preplace
+        _make_fake_ik_success(0.1),  # plan_place: release
+        _make_fake_ik_success(0.1),  # plan_place: retreat
+    ])
+    planner = ArmPlanner(fake)  # type: ignore[arg-type]
+    target = ObjectEstimate3D('pink', (0.0, 0.8, 0.3), 0.9, 'footprint', 100)
+    joints = _planning_joints()
+
+    # 先抓取
+    gt, _ = planner.plan_grasp(target, joints)
+    assert gt.valid
+
+    # 再放置
+    place_z = 0.3
+    task = TaskSpec(
+        task_id=1, instruction='move pink box',
+        target_kind='box', target_body='box_body', target_color='pink',
+        place_type='point', place_world_xyz=(0.0, 1.8, place_z), place_radius=0.1,
+    )
+    pt, jt = planner.plan_place(task, joints)
+    assert pt.valid
+
+    # 验证释放位姿Z = place_world_xyz.z + _BOX_HALF_HEIGHT + _PLACE_SURFACE_OFFSET
+    expected_release_z = place_z + _BOX_HALF_HEIGHT + _PLACE_SURFACE_OFFSET
+    wrong_release_z = place_z + _LIFT_DELTA
+
+    assert pt.left_release.position_xyz[2] == pytest.approx(expected_release_z)
+    assert pt.left_release.position_xyz[2] != pytest.approx(wrong_release_z)
+
+
+def test_box_size_compensation_in_grasp() -> None:
+    """验证抓取位置使用箱体半宽进行侧向偏移补偿。"""
+    from team_sorting.arm_planning import _BOX_HALF_WIDTH
+
+    fake = _FakeIKAdapter(solutions=[
+        _make_fake_ik_success(0.1),
+        _make_fake_ik_success(0.1),
+        _make_fake_ik_success(0.1),
+        _make_fake_ik_success(0.1),
+    ])
+    planner = ArmPlanner(fake)  # type: ignore[arg-type]
+
+    target = ObjectEstimate3D('pink', (0.0, 0.8, 0.3), 0.9, 'footprint', 100)
+    joints = _planning_joints()
+
+    gt, jt = planner.plan_grasp(target, joints)
+    assert gt.valid
+
+    # grasp_offset = _BOX_HALF_WIDTH + 0.02 = 0.10
+    expected_offset = _BOX_HALF_WIDTH + 0.02
+    # 验证左右夹爪相对目标中心的侧向偏移距离为 expected_offset
+    # robot_xy = _FOOTPRINT_ROBOT_XY 是临时固定值，因此抓取方向非纯沿轴
+    tx, ty, tz = target.position_xyz
+    import math
+    left_dx = gt.left_grasp.position_xyz[0] - tx
+    left_dy = gt.left_grasp.position_xyz[1] - ty
+    right_dx = gt.right_grasp.position_xyz[0] - tx
+    right_dy = gt.right_grasp.position_xyz[1] - ty
+    # 左右夹爪到目标中心的水平距离应等于 expected_offset
+    assert math.hypot(left_dx, left_dy) == pytest.approx(expected_offset, rel=1e-6)
+    assert math.hypot(right_dx, right_dy) == pytest.approx(expected_offset, rel=1e-6)
+    # 左右夹爪对称分布在目标两侧
+    assert left_dx == pytest.approx(-right_dx)
+    assert left_dy == pytest.approx(-right_dy)
+
+    # 夹爪Z坐标等于目标中心Z
+    assert gt.left_grasp.position_xyz[2] == pytest.approx(tz)
+    assert gt.right_grasp.position_xyz[2] == pytest.approx(tz)
+
+    # 预抓取在抓取位置基础上后退0.15m并抬高0.20m
+    assert gt.left_pregrasp.position_xyz[2] == pytest.approx(0.3 + 0.20)
+
+
+def test_plan_place_ik_failure() -> None:
+    """验证放置IK失败时返回 invalid 并清除上下文。"""
+    fake = _FakeIKAdapter(solutions=[
+        _make_fake_ik_success(0.1),  # plan_grasp: pre
+        _make_fake_ik_success(0.1),  # plan_grasp: grasp
+        _make_fake_ik_success(0.1),  # plan_grasp: lift
+        _make_fake_ik_success(0.1),  # plan_grasp: retreat
+        _make_fake_ik_failure('放置IK无解'),  # plan_place: preplace 失败
+    ])
+    planner = ArmPlanner(fake)  # type: ignore[arg-type]
+    target = ObjectEstimate3D('pink', (0.0, 0.8, 0.3), 0.9, 'footprint', 100)
+    joints = _planning_joints()
+
+    gt, _ = planner.plan_grasp(target, joints)
+    assert gt.valid
+    assert planner._grasp_context is not None
+
+    task = TaskSpec(
+        task_id=1, instruction='move pink box',
+        target_kind='box', target_body='box_body', target_color='pink',
+        place_type='point', place_world_xyz=(0.0, 1.8, 0.3), place_radius=0.1,
+    )
+    pt, jt = planner.plan_place(task, joints)
+    assert not pt.valid
+    assert '放置IK无解' in pt.failure_reason
+    # IK失败后上下文应清除
+    assert planner._grasp_context is None
+
+
+def test_plan_place_joint_jump() -> None:
+    """验证放置时关节跳变超限返回 invalid 并清除上下文。"""
+    fake = _FakeIKAdapter(solutions=[
+        _make_fake_ik_success(0.1),  # plan_grasp: pre
+        _make_fake_ik_success(0.1),  # plan_grasp: grasp
+        _make_fake_ik_success(0.1),  # plan_grasp: lift
+        _make_fake_ik_success(0.1),  # plan_grasp: retreat
+        _make_fake_ik_success(0.1),  # plan_place: preplace
+        _make_fake_ik_success(0.2, left=(2.0, 0.2, 0.3, 0.4, 0.5, 0.6),
+                              right=(0.1, 0.2, 0.3, 0.4, 0.5, 0.6)),  # release 关节跳变
+    ])
+    planner = ArmPlanner(fake)  # type: ignore[arg-type]
+    target = ObjectEstimate3D('pink', (0.0, 0.8, 0.3), 0.9, 'footprint', 100)
+    joints = _planning_joints()
+
+    gt, _ = planner.plan_grasp(target, joints)
+    assert gt.valid
+
+    task = TaskSpec(
+        task_id=1, instruction='move pink box',
+        target_kind='box', target_body='box_body', target_color='pink',
+        place_type='point', place_world_xyz=(0.0, 1.8, 0.3), place_radius=0.1,
+    )
+    pt, jt = planner.plan_place(task, joints)
+    assert not pt.valid
+    assert '跳变' in pt.failure_reason
+    assert planner._grasp_context is None
+
+
+def test_place_time_monotonic() -> None:
+    """验证放置轨迹时间严格递增。"""
+    fake = _FakeIKAdapter(solutions=[
+        _make_fake_ik_success(0.1), _make_fake_ik_success(0.1),
+        _make_fake_ik_success(0.1), _make_fake_ik_success(0.1),
+        _make_fake_ik_success(0.1), _make_fake_ik_success(0.1),
+        _make_fake_ik_success(0.1),
+    ])
+    planner = ArmPlanner(fake)  # type: ignore[arg-type]
+    target = ObjectEstimate3D('pink', (0.0, 0.8, 0.3), 0.9, 'footprint', 100)
+    joints = _planning_joints()
+
+    gt, _ = planner.plan_grasp(target, joints)
+    assert gt.valid
+
+    task = TaskSpec(
+        task_id=1, instruction='move pink box',
+        target_kind='box', target_body='box_body', target_color='pink',
+        place_type='point', place_world_xyz=(0.0, 1.8, 0.3), place_radius=0.1,
+    )
+    pt, jt = planner.plan_place(task, joints)
+    assert pt.valid
+    assert len(jt.waypoints) >= 2
+
+    times = [wp.time_from_start_s for wp in jt.waypoints]
+    for i in range(1, len(times)):
+        assert times[i] > times[i - 1], f'放置路点 {i} 时间未递增'
+
+
+def test_grasp_lift_is_above_object_center() -> None:
+    """验证抬升阶段高度正确：物体中心 + LIFT_DELTA。"""
+    from team_sorting.arm_planning import _LIFT_DELTA
+
+    fake = _FakeIKAdapter(solutions=[
+        _make_fake_ik_success(0.1),
+        _make_fake_ik_success(0.1),
+        _make_fake_ik_success(0.1),
+        _make_fake_ik_success(0.1),
+    ])
+    planner = ArmPlanner(fake)  # type: ignore[arg-type]
+    target = ObjectEstimate3D('pink', (0.0, 0.8, 0.3), 0.9, 'footprint', 100)
+    joints = _planning_joints()
+
+    gt, jt = planner.plan_grasp(target, joints)
+    assert gt.valid
+    assert gt.lift_delta_m == pytest.approx(_LIFT_DELTA)
+
+    # 第4个IK调用是lift，验证其Z坐标
+    lift_call = fake.calls[2]  # IK calls: pre(0), grasp(1), lift(2), retreat(3)
+    assert lift_call['left_target'].position_xyz[2] == pytest.approx(0.3 + _LIFT_DELTA)
