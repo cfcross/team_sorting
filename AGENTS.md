@@ -143,6 +143,17 @@ ros_nodes 组装上述模块并连接 ROS2
 
 - `perception_3d` 禁止依赖 `perception_2d` 的内部实现，只通过 `Detection2D` 连接。
 - `arm_execution` 禁止依赖 `arm_planning` 的内部实现，只通过 `JointTrajectory` 连接。
+- ArmExecution已实现轨迹运动学执行，但真实抓取验证和confirmed GraspContext仍未实现，
+  等待提交3B/集成阶段的真实证据来源。提交3A抓取必须停在 `VERIFY`，放置完成也只能等待
+  外部验证；二者都不得以 `success=True` 表示尚未取得的验证。执行器不得持有、修改或确认
+  `GraspContext`；ROS/FSM接线获批前保持关闭。
+- 夹爪位置范围是 `[0,1]`，速度单位是控制量/秒，最终速度仍须官方仿真标定。ArmExecution
+  输出只是候选，不证明ActionMux接受或官方控制器执行。提交4接线前，组装层必须在候选
+  失去ActionMux控制权或被STOP覆盖时暂停或reset执行器，禁止内部候选历史脱离实际发布推进。
+- 同一 `ArmMotionPhase` 可包含多个连续路点，phase终点状态只能在最后一个同phase路点
+  到位时产生。当前执行契约要求整条有效轨迹的 `controlled_mask` 完全一致；实际反馈必须
+  严格使用团队 `JOINT_NAMES` 顺序，左右夹爪反馈及受控目标必须位于 `[0,1]`。无轨迹的
+  `NO_TRAJECTORY` 空闲状态不应用活动控制周期超时。以上均不构成官方控制器执行证明。
 - `fsm` 禁止发布 ROS2 消息；`navigation` 禁止直接发布 `/cmd_vel`；机械臂模块禁止直接发布官方关节话题。
 - `recorder` 禁止影响 FSM、候选命令或 `FinalAction`。
 - `ros_nodes.py` 禁止实现 YOLO、导航、IK 或轨迹算法。

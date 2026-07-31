@@ -151,6 +151,28 @@ arm_planning:
   right_gripper_closed: null
   gripper_verified_in_official_environment: false
 
+# 提交3A只冻结并实现纯Python轨迹执行；本节全部为显式未标定值，因此运行配置默认关闭。
+# 未来ROS组装层获准接线前必须逐项填写并构造ArmExecutionConfig，执行器不得补默认值。
+# 夹爪位置范围是[0,1]；max_gripper_velocity_per_s单位为控制量/秒，不受位置上限1约束，
+# 但具体速度仍须在官方仿真中标定。
+arm_execution:
+  feedback_max_age_ns: null
+  trajectory_max_age_ns: null
+  command_ttl_ns: null
+  max_control_period_ns: null
+  waypoint_timeout_margin_ns: null
+  total_timeout_margin_ns: null
+  max_slide_velocity_m_s: null
+  max_arm_velocity_rad_s: null
+  max_gripper_velocity_per_s: null
+  slide_tolerance_m: null
+  arm_tolerance_rad: null
+  gripper_tolerance: null
+  settle_cycles: null
+  initial_slide_error_limit_m: null
+  initial_arm_error_limit_rad: null
+  initial_gripper_error_limit: null
+
 fsm:
   # 客户端在抓取失败后重新进入REFINE_TARGET的次数，不等于裁判允许的总尝试规则。
   max_pick_retries: 1

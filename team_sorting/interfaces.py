@@ -1366,6 +1366,10 @@ class JointWaypoint:
         if not any(self.controlled_mask):
             raise ValueError("有效 JointWaypoint.controlled_mask 至少一项必须为 True")
         object.__setattr__(self, "controlled_mask", tuple(self.controlled_mask))
+        if self.controlled_mask[9] and not 0.0 <= self.joint_position[9] <= 1.0:
+            raise ValueError("受控左夹爪路点目标必须位于 [0, 1]")
+        if self.controlled_mask[16] and not 0.0 <= self.joint_position[16] <= 1.0:
+            raise ValueError("受控右夹爪路点目标必须位于 [0, 1]")
 
 
 @dataclass(frozen=True)
@@ -1387,8 +1391,9 @@ class JointTrajectory:
     ``ManipulationCommand`` 像本周期走到哪一步；轨迹存在不代表已经开始或完成执行。
 
     ``timestamp_ns`` 为规划生成时间；轨迹只描述目标，不表示机械臂已经执行成功。
-    有效抓取/放置轨迹分别要求各自四个完整有序阶段，同阶段可含多个路点；无效轨迹
-    必须为空且带失败原因，可以不伪造 ``trajectory_id`` 或 ``target_body``。
+    有效抓取/放置轨迹分别要求各自四个完整有序阶段，同阶段可含多个路点；整条有效
+    轨迹的 ``controlled_mask`` 必须完全一致，动态mask需要另行设计真实segment起点。
+    无效轨迹必须为空且带失败原因，可以不伪造 ``trajectory_id`` 或 ``target_body``。
     """
 
     trajectory_id: str
@@ -1454,9 +1459,14 @@ class JointTrajectory:
         previous_time: Optional[float] = None
         previous_phase_index = 0
         observed_phases: set[ArmMotionPhase] = set()
+        trajectory_mask: Optional[tuple[bool, ...]] = None
         for waypoint in waypoints:
             if not isinstance(waypoint, JointWaypoint):
                 raise ValueError("JointTrajectory.waypoints 每项必须是 JointWaypoint")
+            if trajectory_mask is None:
+                trajectory_mask = waypoint.controlled_mask
+            elif waypoint.controlled_mask != trajectory_mask:
+                raise ValueError("有效 JointTrajectory 所有路点的 controlled_mask 必须完全一致")
             if not isinstance(waypoint.phase, ArmMotionPhase):
                 raise ValueError("JointTrajectory.waypoint.phase 必须严格使用 ArmMotionPhase")
             if previous_time is not None and waypoint.time_from_start_s <= previous_time:
@@ -1477,6 +1487,68 @@ class JointTrajectory:
 
 
 # 机械臂执行与验证接口
+
+@dataclass(frozen=True)
+class ArmExecutionConfig:
+    """机械臂纯轨迹执行的显式安全参数；本类型不提供任何隐藏默认值。
+
+    slide速度单位m/s，arm速度单位rad/s，夹爪速度单位为控制量/秒。夹爪位置范围
+    ``[0, 1]`` 不构成速度上限；速度最终值仍须在官方仿真中标定。
+    """
+
+    feedback_max_age_ns: int
+    trajectory_max_age_ns: int
+    command_ttl_ns: int
+    max_control_period_ns: int
+    waypoint_timeout_margin_ns: int
+    total_timeout_margin_ns: int
+    max_slide_velocity_m_s: float
+    max_arm_velocity_rad_s: float
+    max_gripper_velocity_per_s: float
+    slide_tolerance_m: float
+    arm_tolerance_rad: float
+    gripper_tolerance: float
+    settle_cycles: int
+    initial_slide_error_limit_m: float
+    initial_arm_error_limit_rad: float
+    initial_gripper_error_limit: float
+
+    def __post_init__(self) -> None:
+        for name in (
+            "feedback_max_age_ns",
+            "trajectory_max_age_ns",
+            "command_ttl_ns",
+            "max_control_period_ns",
+            "waypoint_timeout_margin_ns",
+            "total_timeout_margin_ns",
+        ):
+            value = getattr(self, name)
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"ArmExecutionConfig.{name} 必须是真正正整数纳秒")
+        if type(self.settle_cycles) is not int or self.settle_cycles <= 0:
+            raise ValueError("ArmExecutionConfig.settle_cycles 必须是真正正整数")
+        for name in (
+            "max_slide_velocity_m_s",
+            "max_arm_velocity_rad_s",
+            "max_gripper_velocity_per_s",
+            "slide_tolerance_m",
+            "arm_tolerance_rad",
+            "gripper_tolerance",
+            "initial_slide_error_limit_m",
+            "initial_arm_error_limit_rad",
+            "initial_gripper_error_limit",
+        ):
+            value = _strict_optional_finite(
+                getattr(self, name), f"ArmExecutionConfig.{name}", positive=True
+            )
+            assert value is not None
+            object.__setattr__(self, name, value)
+        for name in (
+            "gripper_tolerance",
+            "initial_gripper_error_limit",
+        ):
+            if getattr(self, name) > 1.0:
+                raise ValueError(f"ArmExecutionConfig.{name} 必须位于 (0, 1]")
 
 @dataclass(frozen=True)
 class ManipulationCommand:
@@ -1531,10 +1603,10 @@ class ManipulationStatus:
     典型生产者是结合实际 ``RobotJointState`` 判断误差和进度的执行器，典型消费者是
     FSM。它是基于反馈的执行评估，不能由目标轨迹或候选命令直接充当。
 
-    ``max_joint_error`` 单位为对应关节单位，``progress`` 建议范围 0～1。只有实际反馈
-    达标并完成验证后才能 ``success=True``；未实现、超时和轨迹错误都需说明原因。
-
-    当前骨架状态：该接口已预留，机械臂执行闭环尚未完成。
+    ``max_joint_error`` 单位为对应关节单位，``progress`` 建议范围 0～1。``success=True``
+    不得表示尚未验证的抓取或放置：提交3A的抓取停在 ``VERIFY`` 等待真实证据，放置只
+    报告运动学完成并等待外部验证。``ManipulationCommand`` 只是候选，不能证明
+    ``ActionMux`` 已接受或官方控制器已经执行；未验证、超时和轨迹错误都需说明原因。
     """
 
     local_phase: LocalPhase

@@ -39,10 +39,12 @@ from team_sorting.arm_execution import ArmExecutionController
 from team_sorting.fsm import FSMEvent, GlobalFSM, InstructionParser
 from team_sorting.interfaces import (
     ACTION_NAMES,
+    ArmExecutionConfig,
     ArmMotionPhase,
     BaseCommand,
     FSMStatus,
     GlobalPhase,
+    JOINT_NAMES,
     JointTrajectory,
     JointWaypoint,
     LocalPhase,
@@ -79,6 +81,51 @@ def _joints() -> RobotJointState:
         effort=(0.0,) * 17,
         timestamp_ns=1_000,
     )
+
+
+def _actual_joints(
+    position: tuple[float, ...] | None = None,
+    timestamp_ns: int = 1_000,
+    *,
+    valid: bool = True,
+    failure_reason: str = "",
+) -> RobotJointState:
+    base = _joints()
+    return RobotJointState(
+        position=base.position if position is None else position,
+        velocity=base.velocity,
+        effort=base.effort,
+        timestamp_ns=timestamp_ns,
+        valid=valid,
+        failure_reason=failure_reason,
+    )
+
+
+def _execution_config(**overrides: object) -> ArmExecutionConfig:
+    values: dict[str, object] = {
+        "feedback_max_age_ns": 1_000_000_000,
+        "trajectory_max_age_ns": 1_000_000_000,
+        "command_ttl_ns": 100_000_000,
+        "max_control_period_ns": 200_000_000,
+        "waypoint_timeout_margin_ns": 1_000_000_000,
+        "total_timeout_margin_ns": 2_000_000_000,
+        "max_slide_velocity_m_s": 0.2,
+        "max_arm_velocity_rad_s": 1.0,
+        "max_gripper_velocity_per_s": 0.5,
+        "slide_tolerance_m": 0.005,
+        "arm_tolerance_rad": 0.01,
+        "gripper_tolerance": 0.02,
+        "settle_cycles": 2,
+        "initial_slide_error_limit_m": 0.05,
+        "initial_arm_error_limit_rad": 0.2,
+        "initial_gripper_error_limit": 0.2,
+    }
+    values.update(overrides)
+    return ArmExecutionConfig(**values)  # type: ignore[arg-type]
+
+
+def _execution_controller(**overrides: object) -> ArmExecutionController:
+    return ArmExecutionController(_execution_config(**overrides))
 
 
 def _status(
@@ -140,15 +187,44 @@ def _advance(fsm: GlobalFSM, *events: FSMEvent, start_ns: int = 1_000) -> None:
 
 def _execution_waypoint(
     time_from_start_s: float = 0.0,
-    controlled_mask: tuple[bool, ...] = (True,) * 17,
+    controlled_mask: tuple[bool, ...] = (
+        True, False, False, True, True, True, True, True, True, True,
+        True, True, True, True, True, True, True,
+    ),
     phase: ArmMotionPhase = ArmMotionPhase.PREGRASP,
+    joint_position: tuple[float, ...] | None = None,
 ) -> JointWaypoint:
     return JointWaypoint(
         phase,
         time_from_start_s,
-        _joints().position,
+        _joints().position if joint_position is None else joint_position,
         controlled_mask,
     )
+
+
+def _damaged_execution_waypoint(
+    *,
+    phase: object = ArmMotionPhase.PREGRASP,
+    time_from_start_s: object = 0.0,
+    joint_position: object | None = None,
+    controlled_mask: object | None = None,
+) -> JointWaypoint:
+    waypoint = object.__new__(JointWaypoint)
+    object.__setattr__(waypoint, "phase", phase)
+    object.__setattr__(waypoint, "time_from_start_s", time_from_start_s)
+    object.__setattr__(
+        waypoint,
+        "joint_position",
+        _joints().position if joint_position is None else joint_position,
+    )
+    object.__setattr__(
+        waypoint,
+        "controlled_mask",
+        (True, False, False) + (True,) * 14
+        if controlled_mask is None
+        else controlled_mask,
+    )
+    return waypoint
 
 
 def _execution_trajectory(
@@ -2215,7 +2291,7 @@ def test_arm_execution_hold_rejects_invalid_ttl(valid_for_ns: object) -> None:
 
 
 def test_arm_execution_rejects_empty_or_explicitly_invalid_trajectory() -> None:
-    controller = ArmExecutionController()
+    controller = _execution_controller()
 
     empty = controller.start_trajectory(_execution_trajectory(waypoints=()))
     invalid = controller.start_trajectory(
@@ -2256,6 +2332,16 @@ def test_joint_waypoint_rejects_all_false_controlled_mask() -> None:
         JointWaypoint(
             ArmMotionPhase.PREGRASP, 0.0, _joints().position, (False,) * 17
         )
+
+
+@pytest.mark.parametrize(("index", "value"), [(9, -0.01), (16, 1.01)])
+def test_joint_waypoint_rejects_controlled_gripper_target_outside_official_range(
+    index: int, value: float,
+) -> None:
+    target = list(_joints().position)
+    target[index] = value
+    with pytest.raises(ValueError, match="夹爪路点目标必须位于"):
+        _execution_waypoint(joint_position=tuple(target))
 
 
 def _waypoints_for_phases(
@@ -2355,6 +2441,52 @@ def test_joint_trajectory_allows_multiple_waypoints_per_phase() -> None:
     assert len(trajectory.waypoints) == 8
 
 
+def test_joint_trajectory_requires_one_controlled_mask_for_all_waypoints() -> None:
+    default_mask = _execution_waypoint().controlled_mask
+    changed_mask = (False,) + default_mask[1:]
+    with pytest.raises(ValueError, match="完全一致"):
+        JointTrajectory(
+            "pick-mask-change", 1, "box", GlobalPhase.EXECUTE_PICK,
+            (
+                _execution_waypoint(0.0, default_mask, ArmMotionPhase.PREGRASP),
+                _execution_waypoint(1.0, changed_mask, ArmMotionPhase.GRASP),
+                _execution_waypoint(2.0, default_mask, ArmMotionPhase.LIFT),
+                _execution_waypoint(3.0, default_mask, ArmMotionPhase.RETREAT),
+            ),
+            2_000,
+        )
+
+
+def test_arm_execution_rejects_mask_changed_after_trajectory_construction() -> None:
+    trajectory = _execution_trajectory()
+    changed_mask = (False,) + trajectory.waypoints[1].controlled_mask[1:]
+    object.__setattr__(trajectory.waypoints[1], "controlled_mask", changed_mask)
+    status = _execution_controller().start_trajectory(trajectory)
+    assert status.state == "REJECTED"
+    assert "完全一致" in status.failure_reason
+
+
+def test_pick_and_place_trajectories_with_uniform_masks_remain_valid() -> None:
+    pick = JointTrajectory(
+        "uniform-pick", 1, "box", GlobalPhase.EXECUTE_PICK,
+        _waypoints_for_phases((
+            ArmMotionPhase.PREGRASP, ArmMotionPhase.GRASP,
+            ArmMotionPhase.LIFT, ArmMotionPhase.RETREAT,
+        )),
+        2_000,
+    )
+    place = JointTrajectory(
+        "uniform-place", 1, "box", GlobalPhase.EXECUTE_PLACE,
+        _waypoints_for_phases((
+            ArmMotionPhase.PREPLACE, ArmMotionPhase.LOWER,
+            ArmMotionPhase.RELEASE, ArmMotionPhase.POST_RELEASE_RETREAT,
+        )),
+        2_000,
+    )
+    assert _execution_controller().start_trajectory(pick).state == "LOADED"
+    assert _execution_controller().start_trajectory(place).state == "LOADED"
+
+
 def test_arm_execution_loads_complete_pick_and_place_trajectories() -> None:
     pick = _execution_trajectory()
     place = _execution_trajectory(
@@ -2368,8 +2500,8 @@ def test_arm_execution_loads_complete_pick_and_place_trajectories() -> None:
             )
         ),
     )
-    assert ArmExecutionController().start_trajectory(pick).state == "LOADED"
-    assert ArmExecutionController().start_trajectory(place).state == "LOADED"
+    assert _execution_controller().start_trajectory(pick).state == "LOADED"
+    assert _execution_controller().start_trajectory(place).state == "LOADED"
 
 
 def test_arm_execution_rejects_damaged_phase_contract() -> None:
@@ -2400,10 +2532,10 @@ def test_arm_execution_rejects_damaged_phase_contract() -> None:
             (ArmMotionPhase.PREGRASP, ArmMotionPhase.GRASP, ArmMotionPhase.LIFT)
         )
     )
-    assert "GlobalPhase" in ArmExecutionController().start_trajectory(string_phase).failure_reason
-    assert "RELEASE" in ArmExecutionController().start_trajectory(mixed).failure_reason
-    assert "不得倒退" in ArmExecutionController().start_trajectory(backtracking).failure_reason
-    assert "缺少必要阶段" in ArmExecutionController().start_trajectory(missing).failure_reason
+    assert "GlobalPhase" in _execution_controller().start_trajectory(string_phase).failure_reason
+    assert "RELEASE" in _execution_controller().start_trajectory(mixed).failure_reason
+    assert "不得倒退" in _execution_controller().start_trajectory(backtracking).failure_reason
+    assert "缺少必要阶段" in _execution_controller().start_trajectory(missing).failure_reason
 
 
 def test_arm_execution_rejects_damaged_all_false_waypoint() -> None:
@@ -2414,7 +2546,7 @@ def test_arm_execution_rejects_damaged_all_false_waypoint() -> None:
         ArmMotionPhase.RETREAT,
     )
     waypoints = tuple(
-        SimpleNamespace(
+        _damaged_execution_waypoint(
             phase=phase,
             time_from_start_s=float(index),
             joint_position=_joints().position,
@@ -2422,11 +2554,42 @@ def test_arm_execution_rejects_damaged_all_false_waypoint() -> None:
         )
         for index, phase in enumerate(phases)
     )
-    status = ArmExecutionController().start_trajectory(
+    status = _execution_controller().start_trajectory(
         _execution_trajectory(waypoints=waypoints)
     )
     assert status.state == "REJECTED"
     assert "至少一项必须为True" in status.failure_reason
+
+
+def test_arm_execution_rejects_duck_typed_waypoint_with_legal_fields() -> None:
+    real_waypoints = _execution_trajectory().waypoints
+    duck_waypoints = tuple(
+        SimpleNamespace(
+            phase=waypoint.phase,
+            time_from_start_s=waypoint.time_from_start_s,
+            joint_position=waypoint.joint_position,
+            controlled_mask=waypoint.controlled_mask,
+        )
+        for waypoint in real_waypoints
+    )
+    status = _execution_controller().start_trajectory(
+        _execution_trajectory(waypoints=duck_waypoints)
+    )
+    assert status.state == "REJECTED"
+    assert "JointWaypoint实例" in status.failure_reason
+
+
+def test_arm_execution_accepts_real_waypoints_and_rejects_damaged_real_waypoint() -> None:
+    controller = _execution_controller()
+    assert controller.start_trajectory(_execution_trajectory()).state == "LOADED"
+
+    damaged = _execution_waypoint()
+    object.__setattr__(damaged, "joint_position", (0.0,) * 16 + (float("nan"),))
+    status = controller.start_trajectory(
+        _execution_trajectory(waypoints=(damaged,) + _execution_trajectory().waypoints[1:])
+    )
+    assert status.state == "REJECTED"
+    assert "joint_position" in status.failure_reason
 
 
 @pytest.mark.parametrize("bad_valid", ["yes", 0])
@@ -2436,7 +2599,7 @@ def test_arm_execution_rejects_non_bool_valid_without_exception(
     damaged = object.__new__(JointTrajectory)
     object.__setattr__(damaged, "valid", bad_valid)
     object.__setattr__(damaged, "timestamp_ns", 9_000)
-    status = ArmExecutionController().start_trajectory(damaged)
+    status = _execution_controller().start_trajectory(damaged)
     assert status.state == "REJECTED"
     assert "valid必须是严格bool" in status.failure_reason
     assert status.timestamp_ns == 9_000
@@ -2446,7 +2609,7 @@ def test_arm_execution_uses_zero_timestamp_for_damaged_timestamp() -> None:
     damaged = object.__new__(JointTrajectory)
     object.__setattr__(damaged, "valid", True)
     object.__setattr__(damaged, "timestamp_ns", "100")
-    status = ArmExecutionController().start_trajectory(damaged)
+    status = _execution_controller().start_trajectory(damaged)
     assert status.state == "REJECTED"
     assert "timestamp_ns" in status.failure_reason
     assert status.timestamp_ns == 0
@@ -2456,14 +2619,14 @@ def test_arm_execution_rejects_missing_trajectory_attributes_without_exception()
     damaged = object.__new__(JointTrajectory)
     object.__setattr__(damaged, "valid", True)
     object.__setattr__(damaged, "timestamp_ns", 10)
-    status = ArmExecutionController().start_trajectory(damaged)
+    status = _execution_controller().start_trajectory(damaged)
     assert status.state == "REJECTED"
     assert "task_id" in status.failure_reason
     assert status.timestamp_ns == 10
 
 
 def test_arm_execution_rejects_non_trajectory_instance_without_exception() -> None:
-    status = ArmExecutionController().start_trajectory(SimpleNamespace())  # type: ignore[arg-type]
+    status = _execution_controller().start_trajectory(SimpleNamespace())  # type: ignore[arg-type]
     assert status.state == "REJECTED"
     assert "JointTrajectory实例" in status.failure_reason
     assert status.timestamp_ns == 0
@@ -2499,13 +2662,13 @@ def test_invalid_joint_trajectory_does_not_require_fake_target_identity() -> Non
     object.__setattr__(damaged, "timestamp_ns", 2_000)
     object.__setattr__(damaged, "task_id", 1)
     object.__setattr__(damaged, "execution_phase", GlobalPhase.EXECUTE_PICK)
-    status = ArmExecutionController().start_trajectory(damaged)
+    status = _execution_controller().start_trajectory(damaged)
     assert status.state == "REJECTED"
     assert status.failure_reason == "上游任务无效"
 
 
 def test_arm_execution_rejects_empty_trajectory_id() -> None:
-    status = ArmExecutionController().start_trajectory(_execution_trajectory("  "))
+    status = _execution_controller().start_trajectory(_execution_trajectory("  "))
 
     assert status.state == "REJECTED"
     assert "trajectory_id" in status.failure_reason
@@ -2513,14 +2676,13 @@ def test_arm_execution_rejects_empty_trajectory_id() -> None:
 
 @pytest.mark.parametrize("time_s", [-0.1, True, float("nan"), float("inf")])
 def test_arm_execution_rejects_invalid_waypoint_time(time_s: object) -> None:
-    waypoint = SimpleNamespace(
+    waypoint = _damaged_execution_waypoint(
         phase=ArmMotionPhase.PREGRASP,
         time_from_start_s=time_s,
         joint_position=_joints().position,
-        controlled_mask=(True,) * 17,
     )
 
-    status = ArmExecutionController().start_trajectory(
+    status = _execution_controller().start_trajectory(
         _execution_trajectory(waypoints=(waypoint,))
     )
 
@@ -2539,7 +2701,7 @@ def test_arm_execution_requires_strictly_increasing_waypoint_times(
         waypoints=tuple(_execution_waypoint(time_s) for time_s in times)
     )
 
-    status = ArmExecutionController().start_trajectory(trajectory)
+    status = _execution_controller().start_trajectory(trajectory)
 
     assert status.state == "REJECTED"
     assert "严格递增" in status.failure_reason
@@ -2558,14 +2720,13 @@ def test_arm_execution_requires_strictly_increasing_waypoint_times(
 def test_arm_execution_rechecks_waypoint_joint_positions(
     joint_position: tuple[object, ...],
 ) -> None:
-    waypoint = SimpleNamespace(
+    waypoint = _damaged_execution_waypoint(
         phase=ArmMotionPhase.PREGRASP,
         time_from_start_s=0.0,
         joint_position=joint_position,
-        controlled_mask=(True,) * 17,
     )
 
-    status = ArmExecutionController().start_trajectory(
+    status = _execution_controller().start_trajectory(
         _execution_trajectory(waypoints=(waypoint,))
     )
 
@@ -2580,14 +2741,14 @@ def test_arm_execution_rechecks_waypoint_joint_positions(
 def test_arm_execution_requires_exact_boolean_controlled_mask(
     mask: tuple[object, ...],
 ) -> None:
-    waypoint = SimpleNamespace(
+    waypoint = _damaged_execution_waypoint(
         phase=ArmMotionPhase.PREGRASP,
         time_from_start_s=0.0,
         joint_position=_joints().position,
         controlled_mask=mask,
     )
 
-    status = ArmExecutionController().start_trajectory(
+    status = _execution_controller().start_trajectory(
         _execution_trajectory(waypoints=(waypoint,))
     )
 
@@ -2596,7 +2757,7 @@ def test_arm_execution_requires_exact_boolean_controlled_mask(
 
 
 def test_arm_execution_valid_load_is_neutral_and_not_started() -> None:
-    controller = ArmExecutionController()
+    controller = _execution_controller()
     trajectory = _execution_trajectory()
 
     status = controller.start_trajectory(trajectory)
@@ -2610,7 +2771,7 @@ def test_arm_execution_valid_load_is_neutral_and_not_started() -> None:
 
 
 def test_arm_execution_rejection_atomically_clears_old_runtime_state() -> None:
-    controller = ArmExecutionController()
+    controller = _execution_controller()
     assert controller.start_trajectory(_execution_trajectory()).state == "LOADED"
     controller._waypoint_index = 3
     controller._trajectory_started_ns = 9_000
@@ -2629,7 +2790,7 @@ def test_arm_execution_rejection_atomically_clears_old_runtime_state() -> None:
 
 
 def test_arm_execution_valid_load_clears_previous_runtime_state() -> None:
-    controller = ArmExecutionController()
+    controller = _execution_controller()
     controller.local_phase = LocalPhase.RETREAT
     controller._waypoint_index = 2
     controller._trajectory_started_ns = 5_000
@@ -2649,7 +2810,7 @@ def test_arm_execution_valid_load_clears_previous_runtime_state() -> None:
 
 
 def test_arm_execution_reset_only_clears_memory_state() -> None:
-    controller = ArmExecutionController()
+    controller = _execution_controller()
     controller.start_trajectory(_execution_trajectory())
     controller._waypoint_index = 1
     controller._trajectory_started_ns = 3_000
@@ -2663,11 +2824,673 @@ def test_arm_execution_reset_only_clears_memory_state() -> None:
     assert controller._trajectory_started_ns is None
 
 
-# 当前临时测试防止尚未实现的step返回空值、零值或伪成功。生产方法真正实现时，必须在
-# 同一提交中把它替换为时间插值、controlled_mask、逐关节限速、实际误差、稳定周期、
-# 超时、reset和失败恢复测试；生产方法仍未实现时不得删除，完成后也不得继续要求异常。
-def test_arm_execution_step_remains_explicitly_unimplemented() -> None:
-    controller = ArmExecutionController()
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("feedback_max_age_ns", True),
+        ("trajectory_max_age_ns", 0),
+        ("command_ttl_ns", 1.5),
+        ("settle_cycles", False),
+        ("max_slide_velocity_m_s", float("nan")),
+        ("max_arm_velocity_rad_s", 0.0),
+        ("max_gripper_velocity_per_s", 0.0),
+        ("gripper_tolerance", 1.01),
+        ("initial_gripper_error_limit", 1.01),
+    ],
+)
+def test_arm_execution_config_rejects_missing_or_invalid_values(
+    field: str, value: object,
+) -> None:
+    with pytest.raises((TypeError, ValueError), match=field):
+        _execution_config(**{field: value})
 
-    with pytest.raises(NotImplementedError, match="机械臂轨迹插值"):
-        controller.step(_joints(), 1_000)
+
+def test_arm_execution_config_has_no_hidden_defaults() -> None:
+    with pytest.raises(TypeError):
+        ArmExecutionConfig()  # type: ignore[call-arg]
+    status = ArmExecutionController().start_trajectory(_execution_trajectory())
+    assert status.state == "REJECTED"
+    assert "Config未注入" in status.failure_reason
+
+
+@pytest.mark.parametrize(
+    "value", [0.0, -1.0, float("nan"), float("inf")],
+)
+def test_arm_execution_gripper_velocity_rejects_only_nonpositive_or_nonfinite(
+    value: float,
+) -> None:
+    with pytest.raises(ValueError, match="max_gripper_velocity_per_s"):
+        _execution_config(max_gripper_velocity_per_s=value)
+
+
+def test_arm_execution_gripper_velocity_above_one_is_allowed() -> None:
+    config = _execution_config(max_gripper_velocity_per_s=2.0)
+    assert config.max_gripper_velocity_per_s == 2.0
+
+
+def test_arm_execution_yaml_is_explicitly_unconfigured_and_disabled() -> None:
+    data = yaml.safe_load(Path("config/config.yaml").read_text(encoding="utf-8"))
+    expected_fields = set(ArmExecutionConfig.__dataclass_fields__)
+    assert set(data["arm_execution"]) == expected_fields
+    assert all(data["arm_execution"][field] is None for field in expected_fields)
+
+
+def test_arm_execution_no_trajectory_returns_invalid_feedback_hold() -> None:
+    controller = _execution_controller()
+    joints = _actual_joints(timestamp_ns=2_000)
+    command, status = controller.step(joints, 2_000)
+    assert command.valid is False
+    assert command.controlled_mask == (False,) * 17
+    assert command.joint_target == joints.position
+    assert status.state == "NO_TRAJECTORY"
+
+
+def test_arm_execution_idle_long_gap_does_not_apply_active_control_period() -> None:
+    controller = _execution_controller(max_control_period_ns=10)
+    first_command, first = controller.step(
+        _actual_joints(timestamp_ns=2_000), 2_000
+    )
+    second_command, second = controller.step(
+        _actual_joints(timestamp_ns=1_000_002_000), 1_000_002_000
+    )
+    assert first.state == second.state == "NO_TRAJECTORY"
+    assert first_command.valid is second_command.valid is False
+    assert second_command.controlled_mask == (False,) * 17
+
+
+def test_arm_execution_idle_history_does_not_pollute_new_trajectory_period() -> None:
+    controller = _execution_controller(max_control_period_ns=10)
+    controller.step(_actual_joints(timestamp_ns=100_000_000), 100_000_000)
+    trajectory = _execution_trajectory()
+    assert controller.start_trajectory(trajectory).state == "LOADED"
+    _, status = controller.step(
+        _actual_joints(timestamp_ns=100_000_001), 100_000_001
+    )
+    assert status.state == "RUNNING"
+
+
+def test_arm_execution_first_step_uses_actual_start_and_configured_ttl() -> None:
+    start = _joints().position
+    goal = list(start)
+    goal[3] += 0.1
+    trajectory = _execution_trajectory(
+        waypoints=(
+            _execution_waypoint(1.0, joint_position=tuple(goal)),
+            _execution_waypoint(2.0, phase=ArmMotionPhase.GRASP, joint_position=tuple(goal)),
+            _execution_waypoint(3.0, phase=ArmMotionPhase.LIFT, joint_position=tuple(goal)),
+            _execution_waypoint(4.0, phase=ArmMotionPhase.RETREAT, joint_position=tuple(goal)),
+        )
+    )
+    controller = _execution_controller(command_ttl_ns=123_456_789)
+    assert controller.start_trajectory(trajectory).state == "LOADED"
+    command, status = controller.step(_actual_joints(start, 2_000), 2_000)
+    assert command.joint_target == start
+    assert command.valid_until_ns == 123_458_789
+    assert status.state == "RUNNING"
+    assert controller._trajectory_started_ns == 2_000
+
+
+def test_arm_execution_nonzero_first_waypoint_interpolates_over_its_own_time() -> None:
+    start = _joints().position
+    goal = list(start)
+    goal[3] += 0.1
+    waypoints = (
+        _execution_waypoint(1.0, joint_position=tuple(goal)),
+        _execution_waypoint(2.0, phase=ArmMotionPhase.GRASP, joint_position=tuple(goal)),
+        _execution_waypoint(3.0, phase=ArmMotionPhase.LIFT, joint_position=tuple(goal)),
+        _execution_waypoint(4.0, phase=ArmMotionPhase.RETREAT, joint_position=tuple(goal)),
+    )
+    controller = _execution_controller(max_control_period_ns=1_000_000_000)
+    controller.start_trajectory(_execution_trajectory(waypoints=waypoints))
+    controller.step(_actual_joints(start, 2_000), 2_000)
+    command, _ = controller.step(_actual_joints(start, 500_002_000), 500_002_000)
+    assert command.joint_target[3] == pytest.approx(start[3] + 0.05)
+
+
+def test_arm_execution_zero_time_far_first_waypoint_is_rejected_without_jump() -> None:
+    goal = list(_joints().position)
+    goal[3] += 0.5
+    waypoints = (
+        _execution_waypoint(0.0, joint_position=tuple(goal)),
+        _execution_waypoint(1.0, phase=ArmMotionPhase.GRASP, joint_position=tuple(goal)),
+        _execution_waypoint(2.0, phase=ArmMotionPhase.LIFT, joint_position=tuple(goal)),
+        _execution_waypoint(3.0, phase=ArmMotionPhase.RETREAT, joint_position=tuple(goal)),
+    )
+    controller = _execution_controller(initial_arm_error_limit_rad=0.1)
+    controller.start_trajectory(_execution_trajectory(waypoints=waypoints))
+    command, status = controller.step(_actual_joints(timestamp_ns=2_000), 2_000)
+    assert command.valid is False and command.joint_target == _joints().position
+    assert status.state == "FAILED"
+    assert "initial_arm_error_limit_rad" in status.failure_reason
+
+
+def test_arm_execution_mask_false_uses_latest_actual_and_head_is_never_controlled() -> None:
+    mask = (True, False, False) + (False,) * 14
+    start = _joints().position
+    goal = list(start)
+    goal[0] += 0.02
+    waypoints = (
+        _execution_waypoint(1.0, mask, joint_position=tuple(goal)),
+        _execution_waypoint(2.0, mask, ArmMotionPhase.GRASP, tuple(goal)),
+        _execution_waypoint(3.0, mask, ArmMotionPhase.LIFT, tuple(goal)),
+        _execution_waypoint(4.0, mask, ArmMotionPhase.RETREAT, tuple(goal)),
+    )
+    controller = _execution_controller(max_control_period_ns=1_000_000_000)
+    controller.start_trajectory(_execution_trajectory(waypoints=waypoints))
+    controller.step(_actual_joints(start, 2_000), 2_000)
+    changed = list(start)
+    changed[1] = 0.2
+    changed[3] = 0.3
+    command, _ = controller.step(_actual_joints(tuple(changed), 500_002_000), 500_002_000)
+    assert command.controlled_mask[1:3] == (False, False)
+    assert command.joint_target[1] == 0.2
+    assert command.joint_target[3] == 0.3
+
+
+def test_arm_execution_applies_separate_slide_arm_and_gripper_velocity_limits() -> None:
+    start = _joints().position
+    goal = list(start)
+    goal[0] += 0.1
+    goal[3] += 0.1
+    goal[9] += 0.1
+    waypoints = (
+        _execution_waypoint(1.0, joint_position=tuple(goal)),
+        _execution_waypoint(2.0, phase=ArmMotionPhase.GRASP, joint_position=tuple(goal)),
+        _execution_waypoint(3.0, phase=ArmMotionPhase.LIFT, joint_position=tuple(goal)),
+        _execution_waypoint(4.0, phase=ArmMotionPhase.RETREAT, joint_position=tuple(goal)),
+    )
+    controller = _execution_controller(
+        max_control_period_ns=1_000_000_000,
+        max_slide_velocity_m_s=0.01,
+        max_arm_velocity_rad_s=0.02,
+        max_gripper_velocity_per_s=0.03,
+    )
+    controller.start_trajectory(_execution_trajectory(waypoints=waypoints))
+    controller.step(_actual_joints(start, 2_000), 2_000)
+    command, _ = controller.step(_actual_joints(start, 500_002_000), 500_002_000)
+    assert command.joint_target[0] == pytest.approx(start[0] + 0.005)
+    assert command.joint_target[3] == pytest.approx(start[3] + 0.01)
+    assert command.joint_target[9] == pytest.approx(start[9] + 0.015)
+
+
+def test_arm_execution_valid_candidates_keep_grippers_inside_official_range() -> None:
+    start = _joints().position
+    goal = list(start)
+    goal[9] = 0.0
+    goal[16] = 1.0
+    waypoints = tuple(
+        _execution_waypoint(float(index + 1), phase=phase, joint_position=tuple(goal))
+        for index, phase in enumerate((
+            ArmMotionPhase.PREGRASP, ArmMotionPhase.GRASP,
+            ArmMotionPhase.LIFT, ArmMotionPhase.RETREAT,
+        ))
+    )
+    controller = _execution_controller(
+        max_control_period_ns=1_000_000_000,
+        max_gripper_velocity_per_s=2.0,
+    )
+    controller.start_trajectory(_execution_trajectory(waypoints=waypoints))
+    controller.step(_actual_joints(start, 2_000), 2_000)
+    command, _ = controller.step(
+        _actual_joints(start, 500_002_000), 500_002_000
+    )
+    assert command.valid is True
+    assert 0.0 <= command.joint_target[9] <= 1.0
+    assert 0.0 <= command.joint_target[16] <= 1.0
+
+
+@pytest.mark.parametrize("bad_time", [True, -1, 1.0, "2000"])
+def test_arm_execution_step_rejects_bad_call_time_without_exception(bad_time: object) -> None:
+    command, status = _execution_controller().step(_joints(), bad_time)  # type: ignore[arg-type]
+    assert command.valid is False and status.state == "FAILED"
+
+
+def test_arm_execution_rejects_future_stale_invalid_and_damaged_feedback() -> None:
+    cases: tuple[object, ...] = (
+        _actual_joints(timestamp_ns=3_000),
+        _actual_joints(timestamp_ns=0),
+        _actual_joints(timestamp_ns=2_000, valid=False, failure_reason="bad"),
+        SimpleNamespace(valid=True, position=(0.0,) * 17, timestamp_ns="2"),
+    )
+    for actual in cases:
+        controller = _execution_controller(feedback_max_age_ns=100)
+        _, status = controller.step(actual, 2_000)  # type: ignore[arg-type]
+        assert status.state == "FAILED"
+
+
+def test_arm_execution_rejects_damaged_joint_name_identity_before_execution() -> None:
+    reversed_names = _actual_joints(timestamp_ns=2_000)
+    object.__setattr__(reversed_names, "joint_names", tuple(reversed(JOINT_NAMES)))
+    controller = _execution_controller()
+    controller.start_trajectory(_execution_trajectory())
+    command, status = controller.step(reversed_names, 2_000)
+    assert command.valid is False
+    assert status.state == "FAILED"
+    assert "JOINT_NAMES" in status.failure_reason
+
+    missing_names = _actual_joints(timestamp_ns=2_000)
+    object.__delattr__(missing_names, "joint_names")
+    controller = _execution_controller()
+    controller.start_trajectory(_execution_trajectory())
+    _, missing_status = controller.step(missing_names, 2_000)
+    assert missing_status.state == "FAILED"
+    assert "JOINT_NAMES" in missing_status.failure_reason
+
+
+def test_arm_execution_accepts_exact_joint_names_and_gripper_boundaries() -> None:
+    position = list(_joints().position)
+    position[9] = 0.0
+    position[16] = 1.0
+    controller = _execution_controller()
+    command, status = controller.step(
+        _actual_joints(tuple(position), timestamp_ns=2_000), 2_000
+    )
+    assert status.state == "NO_TRAJECTORY"
+    assert command.valid is False
+    assert tuple(JOINT_NAMES) == _actual_joints().joint_names
+
+
+@pytest.mark.parametrize(("index", "value"), [(9, -0.01), (16, 1.01)])
+def test_arm_execution_rejects_actual_gripper_outside_official_range(
+    index: int, value: float,
+) -> None:
+    position = list(_joints().position)
+    position[index] = value
+    controller = _execution_controller(
+        max_gripper_velocity_per_s=100.0,
+        initial_gripper_error_limit=1.0,
+    )
+    controller.start_trajectory(_execution_trajectory())
+    command, status = controller.step(
+        _actual_joints(tuple(position), timestamp_ns=2_000), 2_000
+    )
+    assert command.valid is False
+    assert status.state == "FAILED"
+    assert "夹爪反馈必须位于[0,1]" in status.failure_reason
+
+
+def test_arm_execution_hold_rejects_joint_identity_and_gripper_range() -> None:
+    bad_names = _actual_joints()
+    object.__setattr__(bad_names, "joint_names", tuple(reversed(JOINT_NAMES)))
+    bad_name_command = _execution_controller().create_hold_command(bad_names, 1_000, 100)
+    assert bad_name_command.valid is False
+    assert bad_name_command.controlled_mask == (False,) * 17
+
+    position = list(_joints().position)
+    position[9] = -2.0
+    bad_gripper_command = _execution_controller().create_hold_command(
+        _actual_joints(tuple(position)), 1_000, 100
+    )
+    assert bad_gripper_command.valid is False
+    assert bad_gripper_command.controlled_mask == (False,) * 17
+
+
+def test_arm_execution_rejects_damaged_waypoint_gripper_target_at_entry() -> None:
+    trajectory = _execution_trajectory()
+    damaged_position = list(trajectory.waypoints[1].joint_position)
+    damaged_position[16] = 3.0
+    object.__setattr__(trajectory.waypoints[1], "joint_position", tuple(damaged_position))
+    status = _execution_controller().start_trajectory(trajectory)
+    assert status.state == "REJECTED"
+    assert "右夹爪目标必须位于[0,1]" in status.failure_reason
+
+
+def test_arm_execution_rejects_trajectory_damaged_after_loading_without_exception() -> None:
+    controller = _execution_controller()
+    trajectory = _execution_trajectory()
+    controller.start_trajectory(trajectory)
+    object.__setattr__(trajectory, "waypoints", None)
+    command, status = controller.step(_actual_joints(timestamp_ns=2_000), 2_000)
+    assert command.valid is False
+    assert status.state == "FAILED"
+    assert "运行期校验失败" in status.failure_reason
+
+
+def test_arm_execution_rejects_time_reversal_and_excessive_control_period() -> None:
+    idle = _execution_controller(max_control_period_ns=200_000_000)
+    idle.step(_actual_joints(timestamp_ns=2_000), 2_000)
+    _, rollback = idle.step(_actual_joints(timestamp_ns=1_999), 1_999)
+    assert rollback.state == "FAILED"
+    assert "倒退" in rollback.failure_reason
+
+    active = _execution_controller(max_control_period_ns=200_000_000)
+    active.start_trajectory(_execution_trajectory())
+    active.step(_actual_joints(timestamp_ns=2_000), 2_000)
+    _, timeout = active.step(
+        _actual_joints(timestamp_ns=202_001_000), 202_001_000
+    )
+    assert timeout.state == "FAILED"
+    assert "控制周期" in timeout.failure_reason
+
+
+def test_arm_execution_checks_trajectory_freshness_only_before_start() -> None:
+    stale = _execution_controller(trajectory_max_age_ns=10)
+    stale.start_trajectory(_execution_trajectory())
+    _, stale_status = stale.step(_actual_joints(timestamp_ns=2_011), 2_011)
+    assert stale_status.state == "FAILED" and "过期" in stale_status.failure_reason
+
+    running = _execution_controller(
+        trajectory_max_age_ns=10,
+        feedback_max_age_ns=10_000_000_000,
+        max_control_period_ns=10_000_000_000,
+    )
+    running.start_trajectory(_execution_trajectory())
+    running.step(_actual_joints(timestamp_ns=2_005), 2_005)
+    _, status = running.step(_actual_joints(timestamp_ns=3_000_002_005), 3_000_002_005)
+    assert "轨迹在首次执行前已过期" not in status.failure_reason
+
+
+def test_arm_execution_does_not_advance_on_time_without_feedback_arrival() -> None:
+    start = _joints().position
+    goal = list(start)
+    goal[3] += 0.1
+    waypoints = (
+        _execution_waypoint(0.5, joint_position=tuple(goal)),
+        _execution_waypoint(1.0, phase=ArmMotionPhase.GRASP, joint_position=tuple(goal)),
+        _execution_waypoint(1.5, phase=ArmMotionPhase.LIFT, joint_position=tuple(goal)),
+        _execution_waypoint(2.0, phase=ArmMotionPhase.RETREAT, joint_position=tuple(goal)),
+    )
+    controller = _execution_controller(max_control_period_ns=1_000_000_000)
+    controller.start_trajectory(_execution_trajectory(waypoints=waypoints))
+    controller.step(_actual_joints(start, 2_000), 2_000)
+    controller.step(_actual_joints(start, 600_002_000), 600_002_000)
+    assert controller._waypoint_index == 0
+
+
+def test_arm_execution_requires_consecutive_settle_cycles_and_group_tolerances() -> None:
+    controller = _execution_controller(settle_cycles=2)
+    controller.start_trajectory(_execution_trajectory())
+    joints = _actual_joints(timestamp_ns=2_000)
+    controller.step(joints, 2_000)
+    assert controller._waypoint_index == 0
+    controller.step(_actual_joints(timestamp_ns=3_000), 3_000)
+    assert controller._waypoint_index == 1
+
+
+def test_arm_execution_duplicate_feedback_cannot_fake_settle_cycles() -> None:
+    controller = _execution_controller(settle_cycles=2)
+    controller.start_trajectory(_execution_trajectory())
+    controller.step(_actual_joints(timestamp_ns=2_000), 2_000)
+    controller.step(_actual_joints(timestamp_ns=2_000), 3_000)
+    assert controller._stable_cycle_count == 1
+    assert controller._waypoint_index == 0
+
+    controller.step(_actual_joints(timestamp_ns=3_000), 4_000)
+    assert controller._waypoint_index == 1
+
+
+def test_arm_execution_feedback_timestamp_rollback_fails_closed() -> None:
+    controller = _execution_controller()
+    controller.start_trajectory(_execution_trajectory())
+    controller.step(_actual_joints(timestamp_ns=2_000), 2_000)
+    command, status = controller.step(_actual_joints(timestamp_ns=1_999), 3_000)
+    assert command.valid is False
+    assert status.state == "FAILED"
+    assert status.failure_reason == "actual_joints反馈时间倒退"
+
+
+def test_arm_execution_reset_allows_lower_feedback_timestamp_in_new_episode() -> None:
+    controller = _execution_controller()
+    controller.start_trajectory(_execution_trajectory())
+    controller.step(_actual_joints(timestamp_ns=5_000), 5_000)
+    controller.reset()
+    command, status = controller.step(_actual_joints(timestamp_ns=1_000), 1_000)
+    assert status.state == "NO_TRAJECTORY"
+    assert command.joint_target == _joints().position
+    assert controller._last_feedback_timestamp_ns == 1_000
+
+
+def test_arm_execution_new_trajectory_does_not_reuse_feedback_identity() -> None:
+    controller = _execution_controller()
+    controller.start_trajectory(_execution_trajectory())
+    controller.step(_actual_joints(timestamp_ns=5_000), 5_000)
+    replacement = _execution_trajectory("replacement")
+    assert controller.start_trajectory(replacement).state == "LOADED"
+    _, status = controller.step(_actual_joints(timestamp_ns=2_500), 2_500)
+    assert status.state == "RUNNING"
+    assert controller._last_feedback_timestamp_ns == 2_500
+
+
+def test_arm_execution_waypoint_and_total_timeouts_fail_closed() -> None:
+    waypoint = _execution_controller(
+        max_control_period_ns=2_000_000_000,
+        waypoint_timeout_margin_ns=100_000_000,
+    )
+    waypoint.start_trajectory(_execution_trajectory())
+    waypoint.step(_actual_joints(timestamp_ns=2_000), 2_000)
+    _, status = waypoint.step(_actual_joints(timestamp_ns=1_100_002_001), 1_100_002_001)
+    assert status.state == "FAILED" and "waypoint" in status.failure_reason
+
+    total = _execution_controller(
+        max_control_period_ns=5_000_000_000,
+        waypoint_timeout_margin_ns=10_000_000_000,
+        total_timeout_margin_ns=100_000_000,
+    )
+    total.start_trajectory(_execution_trajectory())
+    total.step(_actual_joints(timestamp_ns=2_000), 2_000)
+    _, status = total.step(_actual_joints(timestamp_ns=3_100_002_001), 3_100_002_001)
+    assert status.state == "FAILED" and "total" in status.failure_reason
+
+
+def test_arm_execution_pick_stops_at_verify_with_valid_hold_candidate() -> None:
+    controller = _execution_controller(settle_cycles=1, max_control_period_ns=2_000_000_000)
+    trajectory = _execution_trajectory()
+    controller.start_trajectory(trajectory)
+    expected = (
+        LocalPhase.HUG_OPEN,
+        LocalPhase.HUG_CLOSE,
+        LocalPhase.VERIFY,
+        LocalPhase.VERIFY,
+    )
+    for index, phase in enumerate(expected):
+        now = index * 1_000_000_000 + 2_000
+        command, status = controller.step(_actual_joints(timestamp_ns=now), now)
+        assert status.local_phase is phase
+    lift_index = 2
+    lift = trajectory.waypoints[lift_index]
+    assert controller._waypoint_index == lift_index
+    assert command.valid is True
+    assert command.valid_until_ns == now + controller._config.command_ttl_ns
+    assert command.controlled_mask == lift.controlled_mask
+    assert command.joint_target[9] == lift.joint_position[9]
+    assert command.joint_target[16] == lift.joint_position[16]
+    assert status.state == "VERIFICATION_PENDING"
+    assert status.success is False
+    assert controller._cached_verification is None
+
+
+def test_arm_execution_multiple_pregrasp_waypoints_delay_hug_open_until_last() -> None:
+    phases = (
+        ArmMotionPhase.PREGRASP, ArmMotionPhase.PREGRASP,
+        ArmMotionPhase.GRASP, ArmMotionPhase.LIFT, ArmMotionPhase.RETREAT,
+    )
+    controller = _execution_controller(settle_cycles=1, max_control_period_ns=2_000_000_000)
+    controller.start_trajectory(
+        _execution_trajectory(waypoints=_waypoints_for_phases(phases))
+    )
+    _, first = controller.step(_actual_joints(timestamp_ns=2_000), 2_000)
+    assert first.local_phase is LocalPhase.MOVE_PREGRASP
+    assert controller._waypoint_index == 1
+    _, second = controller.step(
+        _actual_joints(timestamp_ns=1_000_002_000), 1_000_002_000
+    )
+    assert second.local_phase is LocalPhase.HUG_OPEN
+    assert controller._waypoint_index == 2
+
+
+def test_arm_execution_multiple_lift_waypoints_verify_only_after_last() -> None:
+    phases = (
+        ArmMotionPhase.PREGRASP, ArmMotionPhase.GRASP,
+        ArmMotionPhase.LIFT, ArmMotionPhase.LIFT, ArmMotionPhase.RETREAT,
+    )
+    controller = _execution_controller(settle_cycles=1, max_control_period_ns=2_000_000_000)
+    controller.start_trajectory(
+        _execution_trajectory(waypoints=_waypoints_for_phases(phases))
+    )
+    statuses = []
+    for index in range(4):
+        now = index * 1_000_000_000 + 2_000
+        _, status = controller.step(_actual_joints(timestamp_ns=now), now)
+        statuses.append(status)
+    assert statuses[2].local_phase is LocalPhase.TEST_LIFT
+    assert statuses[2].state == "RUNNING"
+    assert statuses[3].local_phase is LocalPhase.VERIFY
+    assert statuses[3].state == "VERIFICATION_PENDING"
+    assert controller._waypoint_index == 3
+
+
+def test_arm_execution_multiple_retreat_phase_mapping_marks_only_last_as_transport() -> None:
+    phases = (
+        ArmMotionPhase.PREGRASP, ArmMotionPhase.GRASP, ArmMotionPhase.LIFT,
+        ArmMotionPhase.RETREAT, ArmMotionPhase.RETREAT,
+    )
+    controller = _execution_controller()
+    controller.start_trajectory(
+        _execution_trajectory(waypoints=_waypoints_for_phases(phases))
+    )
+    controller._waypoint_index = 3
+    assert controller._phase_for_current(True) is LocalPhase.RETREAT
+    controller._waypoint_index = 4
+    assert controller._phase_for_current(True) is LocalPhase.TRANSPORT_HOLD
+
+
+def test_arm_execution_same_phase_waypoints_still_require_settle_cycles() -> None:
+    phases = (
+        ArmMotionPhase.PREGRASP, ArmMotionPhase.PREGRASP,
+        ArmMotionPhase.GRASP, ArmMotionPhase.LIFT, ArmMotionPhase.RETREAT,
+    )
+    controller = _execution_controller(settle_cycles=2)
+    controller.start_trajectory(
+        _execution_trajectory(waypoints=_waypoints_for_phases(phases))
+    )
+    controller.step(_actual_joints(timestamp_ns=2_000), 2_000)
+    assert controller._waypoint_index == 0
+    _, reached = controller.step(_actual_joints(timestamp_ns=3_000), 3_000)
+    assert reached.local_phase is LocalPhase.MOVE_PREGRASP
+    assert controller._waypoint_index == 1
+
+
+def test_arm_execution_verify_wait_never_enters_retreat_and_times_out() -> None:
+    controller = _execution_controller(
+        settle_cycles=1,
+        max_control_period_ns=2_000_000_000,
+        total_timeout_margin_ns=100_000_000,
+    )
+    controller.start_trajectory(_execution_trajectory())
+    for index in range(3):
+        now = index * 1_000_000_000 + 2_000
+        controller.step(_actual_joints(timestamp_ns=now), now)
+    assert controller.local_phase is LocalPhase.VERIFY
+    assert controller._waypoint_index == 2
+
+    command, status = controller.step(
+        _actual_joints(timestamp_ns=3_100_002_001), 3_100_002_001
+    )
+    assert command.valid is False
+    assert status.state == "FAILED"
+    assert "total_timeout_margin_ns" in status.failure_reason
+    assert controller._cached_verification is None
+
+
+def test_arm_execution_two_grasp_waypoints_map_approach_then_hug_close() -> None:
+    phases = (
+        ArmMotionPhase.PREGRASP, ArmMotionPhase.GRASP, ArmMotionPhase.GRASP,
+        ArmMotionPhase.LIFT, ArmMotionPhase.RETREAT,
+    )
+    controller = _execution_controller(settle_cycles=1, max_control_period_ns=2_000_000_000)
+    controller.start_trajectory(_execution_trajectory(waypoints=_waypoints_for_phases(phases)))
+    observed = []
+    for index in range(3):
+        now = index * 1_000_000_000 + 2_000
+        _, status = controller.step(_actual_joints(timestamp_ns=now), now)
+        observed.append(status.local_phase)
+    assert observed[1:] == [LocalPhase.APPROACH, LocalPhase.HUG_CLOSE]
+
+
+def test_arm_execution_place_phase_mapping_and_completion() -> None:
+    phases = (
+        ArmMotionPhase.PREPLACE, ArmMotionPhase.LOWER,
+        ArmMotionPhase.RELEASE, ArmMotionPhase.POST_RELEASE_RETREAT,
+    )
+    controller = _execution_controller(settle_cycles=1, max_control_period_ns=2_000_000_000)
+    controller.start_trajectory(_execution_trajectory(
+        execution_phase=GlobalPhase.EXECUTE_PLACE,
+        waypoints=_waypoints_for_phases(phases),
+    ))
+    observed = []
+    for index in range(4):
+        now = index * 1_000_000_000 + 2_000
+        command, status = controller.step(_actual_joints(timestamp_ns=now), now)
+        observed.append(status.local_phase)
+    assert observed[:3] == [LocalPhase.MOVE_PREPLACE, LocalPhase.LOWER_OBJECT, LocalPhase.RELEASE]
+    assert observed[-1] is LocalPhase.IDLE
+    assert status.state == "MOTION_COMPLETED_PLACE_VERIFICATION_PENDING"
+    assert status.success is False
+    assert "物体位置与裁判语义仍待外部验证" in status.failure_reason
+    assert command.valid is False
+
+
+def test_arm_execution_completed_terminal_survives_long_gap_and_bad_feedback() -> None:
+    phases = (
+        ArmMotionPhase.PREPLACE, ArmMotionPhase.LOWER,
+        ArmMotionPhase.RELEASE, ArmMotionPhase.POST_RELEASE_RETREAT,
+    )
+    controller = _execution_controller(settle_cycles=1, max_control_period_ns=2_000_000_000)
+    controller.start_trajectory(_execution_trajectory(
+        execution_phase=GlobalPhase.EXECUTE_PLACE,
+        waypoints=_waypoints_for_phases(phases),
+    ))
+    for index in range(4):
+        now = index * 1_000_000_000 + 2_000
+        _, terminal = controller.step(_actual_joints(timestamp_ns=now), now)
+    original_timestamp = terminal.timestamp_ns
+    original_error = terminal.max_joint_error
+
+    command, repeated = controller.step(
+        SimpleNamespace(valid=True), 100_000_000_000  # type: ignore[arg-type]
+    )
+    assert command.valid is False and command.controlled_mask == (False,) * 17
+    assert repeated is terminal
+    assert repeated.timestamp_ns == original_timestamp
+    assert repeated.max_joint_error == original_error
+    assert repeated.state == "MOTION_COMPLETED_PLACE_VERIFICATION_PENDING"
+    assert repeated.success is False
+
+    invalid_time_command, same_terminal = controller.step(
+        SimpleNamespace(), "bad"  # type: ignore[arg-type]
+    )
+    assert invalid_time_command.valid is False
+    assert same_terminal is terminal
+
+    rollback_command, rollback_terminal = controller.step(
+        SimpleNamespace(), 50_000_000_000  # type: ignore[arg-type]
+    )
+    assert rollback_command.valid is False
+    assert rollback_terminal is terminal
+
+
+def test_arm_execution_failed_terminal_preserves_original_evidence() -> None:
+    controller = _execution_controller()
+    controller.start_trajectory(_execution_trajectory())
+    _, terminal = controller.step(
+        _actual_joints(timestamp_ns=2_000, valid=False, failure_reason="原始反馈故障"),
+        2_000,
+    )
+    assert terminal.state == "FAILED"
+    command, repeated = controller.step(SimpleNamespace(), 99_000_000_000)  # type: ignore[arg-type]
+    assert command.valid is False
+    assert repeated is terminal
+    assert repeated.failure_reason == terminal.failure_reason
+    assert repeated.timestamp_ns == 2_000
+
+
+def test_arm_execution_reset_clears_new_runtime_fields() -> None:
+    controller = _execution_controller()
+    controller.start_trajectory(_execution_trajectory())
+    controller.step(_actual_joints(timestamp_ns=2_000), 2_000)
+    controller.reset()
+    assert controller._last_command is None
+    assert controller._last_step_ns is None
+    assert controller._last_feedback_timestamp_ns is None
+    assert controller._initial_position is None
+    assert controller._terminal_status is None

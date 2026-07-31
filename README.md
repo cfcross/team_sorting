@@ -185,7 +185,7 @@ Recorder 是旁路观察者。即使不启动它，控制链也应独立工作�
 | `perception_3d.py` | 深度反投影、官方相机外参适配、三维中心估计接口 | `Detection2D`、`DepthFrame`、`CameraIntrinsics`、Odom（`BaseState`）、`RobotJointState` | `ObjectEstimate3D` | 视觉2 |
 | `navigation.py` | 区域分类、站位生成、航点/精对准和速度控制接口 | `TaskSpec`、`ObjectEstimate3D`、`BaseState`、`NavGoal` | `NavGoal`、`BaseCommand`、导航状态 | 底盘 |
 | `arm_planning.py` | 官方 KDL 适配、抓放末端目标和关节轨迹规划接口 | 物体中心、任务、实际关节、末端目标 | `IKResult`、`JointTrajectory` 等 | 机械臂1 |
-| `arm_execution.py` | 轨迹插值、局部抓放状态、试抬和恢复接口 | `JointTrajectory`、`RobotJointState`、时间 | `ManipulationCommand`、执行状态 | 机械臂2 |
+| `arm_execution.py` | 纯轨迹插值、分组限速、反馈到位和局部阶段映射 | `JointTrajectory`、`RobotJointState`、时间 | `ManipulationCommand`、执行状态 | 机械臂2 |
 | `fsm.py` | 唯一任务解析、全局阶段转换和重试策略 | 原始任务 JSON、业务事件 | `TaskSpec`、`FSMStatus` | 系统/FSM |
 | `action_mux.py` | 候选动作仲裁、TTL、限幅和安全保持 | 底盘/机械臂建议、实际关节、FSM 状态 | 唯一 `FinalAction[19]` | 控制安全 |
 | `controller_manifest.py` | 版本化控制接口事实与配置一致性校验 | `ACTION_NAMES`、运行时实测范围、配置 | 不可变 `MMK2_CONTROLLER_MANIFEST_V1` | 架构/控制安全 |
@@ -307,9 +307,32 @@ yaw、根据颜色产生姿态，或把确认后的规划关系描述为真实�
 同等候选、身份不稳定或任务/类别不匹配均失败关闭。`perception_3d` 不读取当前任务语义。
 
 `ArmMotionPhase` 仅用于 `JointWaypoint` 的规划区段；`LocalPhase` 仍是执行器/FSM 的实时
-状态。提交1没有二者的运行时映射，没有推进 FSM，也没有生成或发布控制命令。
+状态。ArmExecution在提交3A中按实际反馈把规划区段映射为局部执行状态，但不推进 FSM，
+也不生成 `FinalAction` 或发布控制命令。
 有效路点至少控制一个关节；全False mask不能表示等待、停止或阶段标签。等待由带实际
 目标的路点时间表达，停止仍由正常安全控制链处理。
+
+ArmExecution已实现轨迹运动学执行，但真实抓取验证和confirmed GraspContext仍未实现，
+等待提交3B/集成阶段的真实证据来源。抓取执行到LIFT稳定到位后停在 `VERIFY`，只报告
+`VERIFICATION_PENDING`并输出短TTL保持候选；没有验证入口就不能进入RETREAT，也不能
+提升为抓取成功。放置轨迹结束只报告
+`MOTION_COMPLETED_PLACE_VERIFICATION_PENDING`且 `success=False`，不能表示物体已经
+稳定、脱夹、位于目标范围或获得 `PLACE_VERIFIED`。执行配置无隐藏默认值，当前
+`config.arm_execution` 全部为 `null`，且ROS/FSM尚未接线。
+
+夹爪绝对位置范围是官方 `[0,1]` 控制量；`max_gripper_velocity_per_s` 的单位是控制量/秒，
+位置范围不能推出速度必须小于等于1，最终速度仍需官方仿真标定。ArmExecution生成的
+`ManipulationCommand`只是候选，不证明 `ActionMux` 已接受或官方控制器已经执行。提交4
+接线前必须保证：候选失去ActionMux控制权或被STOP覆盖时，组装层暂停或reset执行器，
+不得让未实际发布的内部候选历史继续推进。
+
+同一 `ArmMotionPhase` 允许多个连续路点；`HUG_OPEN`、`VERIFY`、
+`TRANSPORT_HOLD` 等phase终点状态只在该phase最后一个路点到位时产生。提交3A要求一条
+有效轨迹的所有路点使用完全相同的 `controlled_mask`，不允许用mask变化表示等待、阶段
+标记或临时释放控制。执行反馈必须携带严格等于团队 `JOINT_NAMES` 的17维名称顺序；左右
+夹爪实际反馈和受控路点目标都必须位于官方 `[0,1]`。没有轨迹时执行器保持
+`NO_TRAJECTORY`，不应用活动轨迹控制周期超时。这些检查只约束团队候选生成，仍不证明
+ActionMux接受候选或官方控制器执行动作。
 
 有效 `TaskSpec` 必须保留官方提供的 `instruction`、`target_kind`、`target_body` 和
 `target_color`，不得从 task ID 或颜色规则反向补造。`ros_nodes` 对 `arm_planning`
@@ -560,8 +583,8 @@ ros2 launch team_sorting team.launch.xml record_data:=true
 - 正式 ROS/MMK2FK 环境中的三维坐标、时间同步和 planning frame 端到端验证；
 - 抓取/放置站位生成、航点导航、精对准和底盘控制；
 - 由物体中心生成抓取/放置末端位姿，以及完整 IK/轨迹规划；
-- 机械臂轨迹插值、限速和局部抓放状态机；
-- 试抬抓取验证、放置验证和失败恢复；
+- ArmExecution与ROS/FSM的运行时接线及官方环境参数标定；
+- 真实抓取验证、confirmed GraspContext、放置验证和失败恢复；
 - 业务结果驱动 FSM、底盘与机械臂协同的完整比赛闭环；
 - ACT/VLA 数据处理、训练和推理。
 

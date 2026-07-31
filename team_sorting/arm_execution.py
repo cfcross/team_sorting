@@ -1,21 +1,8 @@
-"""机械臂轨迹执行和局部抓放状态机骨架。
+"""机械臂纯关节轨迹执行与局部状态映射。
 
-本文件位于“轨迹计划”和“最终控制仲裁”之间，完整数据流是：
-
-``JointTrajectory``
-→ ``ArmExecutionController.start_trajectory`` 装载并校验
-→ ``step``（待机械臂2实现）按实际 ``RobotJointState`` 插值和判断进度
-→ ``ManipulationCommand`` 候选关节目标 + ``ManipulationStatus`` 执行状态
-→ ``ActionMux`` 结合实际反馈、TTL和FSM安全阶段生成 ``FinalAction[19]``
-→ ``OfficialCommandPublisher`` 拆分并发布官方关节话题。
-
-``ManipulationCommand`` 只是本周期候选建议，不是已经发布或已经执行的动作；到位、试抬
-和抓放验证必须依据实际反馈，不能只看目标命令或等待时间。本文件不负责IK、抓取位姿
-规划、ROS2发布、全局FSM推进或视觉算法，也不能绕过 ``ActionMux``。
-
-当前骨架只实现轨迹入口校验和基于实际反馈的安全保持。完整插值、限速、局部抓放阶段、
-试抬验证与恢复仍由机械臂2负责人实现；未实现部分继续明确抛出
-``NotImplementedError``，不会返回伪成功。
+本模块只消费 ``JointTrajectory`` 和实际 ``RobotJointState``，生成短 TTL 的
+``ManipulationCommand`` 及反馈驱动的 ``ManipulationStatus``。它不做 IK、不查询 TF、
+不推进全局 FSM、不调用 ``ActionMux``、不发布 ROS，也不生成或确认 ``GraspContext``。
 """
 
 from __future__ import annotations
@@ -24,9 +11,12 @@ import math
 from numbers import Real
 
 from .interfaces import (
+    ArmExecutionConfig,
     ArmMotionPhase,
     GlobalPhase,
+    JOINT_NAMES,
     JointTrajectory,
+    JointWaypoint,
     LocalPhase,
     ManipulationCommand,
     ManipulationStatus,
@@ -34,10 +24,13 @@ from .interfaces import (
 )
 
 
-def _require_integer_ns(value: object, name: str, *, positive: bool) -> int:
-    """严格读取纳秒整数，避免 ``int()`` 把浮点数、字符串或bool悄悄改成时间。"""
+_HEAD_INDICES = (1, 2)
+_ARM_INDICES = tuple(range(3, 9)) + tuple(range(10, 16))
+_GRIPPER_INDICES = (9, 16)
 
-    if isinstance(value, bool) or not isinstance(value, int):
+
+def _require_integer_ns(value: object, name: str, *, positive: bool) -> int:
+    if type(value) is not int:
         raise ValueError(f"{name}必须是真正整数，不能使用bool、浮点数或字符串")
     if positive and value <= 0:
         raise ValueError(f"{name}必须大于0")
@@ -47,8 +40,6 @@ def _require_integer_ns(value: object, name: str, *, positive: bool) -> int:
 
 
 def _finite_vector_error(values: object, expected_length: int, name: str) -> str:
-    """返回定长真实有限数向量的错误原因；空字符串表示校验通过。"""
-
     if isinstance(values, (str, bytes)):
         return f"{name}必须恰好包含{expected_length}项真实有限数"
     try:
@@ -66,7 +57,7 @@ def _finite_vector_error(values: object, expected_length: int, name: str) -> str
 
 
 def _trajectory_error(trajectory: object) -> str:
-    """防御性检查公共轨迹，防止损坏对象进入未来的控制循环。"""
+    """防御性检查公共轨迹，阻止损坏的反序列化对象进入控制循环。"""
 
     if not isinstance(trajectory, JointTrajectory):
         return "trajectory必须是JointTrajectory实例"
@@ -82,10 +73,7 @@ def _trajectory_error(trajectory: object) -> str:
     execution_phase = getattr(trajectory, "execution_phase", None)
     if not isinstance(execution_phase, GlobalPhase):
         return "execution_phase必须严格使用GlobalPhase"
-    if execution_phase not in {
-        GlobalPhase.EXECUTE_PICK,
-        GlobalPhase.EXECUTE_PLACE,
-    }:
+    if execution_phase not in {GlobalPhase.EXECUTE_PICK, GlobalPhase.EXECUTE_PLACE}:
         return "execution_phase只能是EXECUTE_PICK或EXECUTE_PLACE"
     failure_reason = getattr(trajectory, "failure_reason", None)
     if not valid:
@@ -109,26 +97,20 @@ def _trajectory_error(trajectory: object) -> str:
         return "轨迹不能为空"
 
     required_phases = (
-        (
-            ArmMotionPhase.PREGRASP,
-            ArmMotionPhase.GRASP,
-            ArmMotionPhase.LIFT,
-            ArmMotionPhase.RETREAT,
-        )
+        (ArmMotionPhase.PREGRASP, ArmMotionPhase.GRASP,
+         ArmMotionPhase.LIFT, ArmMotionPhase.RETREAT)
         if execution_phase is GlobalPhase.EXECUTE_PICK
-        else (
-            ArmMotionPhase.PREPLACE,
-            ArmMotionPhase.LOWER,
-            ArmMotionPhase.RELEASE,
-            ArmMotionPhase.POST_RELEASE_RETREAT,
-        )
+        else (ArmMotionPhase.PREPLACE, ArmMotionPhase.LOWER,
+              ArmMotionPhase.RELEASE, ArmMotionPhase.POST_RELEASE_RETREAT)
     )
     phase_indices = {phase: index for index, phase in enumerate(required_phases)}
-
     previous_time: float | None = None
     previous_phase_index = 0
     observed_phases: set[ArmMotionPhase] = set()
+    trajectory_mask: tuple[bool, ...] | None = None
     for waypoint_index, waypoint in enumerate(waypoints):
+        if not isinstance(waypoint, JointWaypoint):
+            return f"waypoints[{waypoint_index}]必须是JointWaypoint实例"
         phase = getattr(waypoint, "phase", None)
         if not isinstance(phase, ArmMotionPhase):
             return f"waypoints[{waypoint_index}].phase必须是ArmMotionPhase"
@@ -150,15 +132,12 @@ def _trajectory_error(trajectory: object) -> str:
         if previous_time is not None and time_s <= previous_time:
             return "waypoints时间必须严格递增，不能重复或倒退"
         previous_time = time_s
-
         position_error = _finite_vector_error(
-            getattr(waypoint, "joint_position", None),
-            17,
+            getattr(waypoint, "joint_position", None), 17,
             f"waypoints[{waypoint_index}].joint_position",
         )
         if position_error:
             return position_error
-
         mask = getattr(waypoint, "controlled_mask", None)
         try:
             if len(mask) != 17:  # type: ignore[arg-type]
@@ -170,6 +149,16 @@ def _trajectory_error(trajectory: object) -> str:
             return f"waypoints[{waypoint_index}].controlled_mask每项都必须是真正bool"
         if not any(mask_items):
             return f"waypoints[{waypoint_index}].controlled_mask至少一项必须为True"
+        if mask_items[1] or mask_items[2]:
+            return f"waypoints[{waypoint_index}]不得控制head关节"
+        if mask_items[9] and not 0.0 <= float(waypoint.joint_position[9]) <= 1.0:
+            return f"waypoints[{waypoint_index}]受控左夹爪目标必须位于[0,1]"
+        if mask_items[16] and not 0.0 <= float(waypoint.joint_position[16]) <= 1.0:
+            return f"waypoints[{waypoint_index}]受控右夹爪目标必须位于[0,1]"
+        if trajectory_mask is None:
+            trajectory_mask = mask_items
+        elif mask_items != trajectory_mask:
+            return "有效轨迹所有waypoint的controlled_mask必须完全一致"
     missing = tuple(phase.value for phase in required_phases if phase not in observed_phases)
     if missing:
         return f"轨迹缺少必要阶段：{missing}"
@@ -182,148 +171,433 @@ def _safe_trajectory_timestamp(trajectory: object) -> int:
 
 
 class ArmExecutionController:
-    """双臂轨迹执行器和局部状态机骨架。
+    """反馈驱动的双臂纯轨迹执行器。
 
-    输入为17维实际关节、目标轨迹和纳秒时间，输出17维候选命令及执行状态。slide单位
-    米、旋转关节弧度、夹爪为官方0～1控制量。``local_phase`` 是执行器内部当前阶段：
-    ``MOVE_PREGRASP`` 到预抓姿态，``HUG_OPEN`` 张开双夹爪，``APPROACH`` 靠近目标，
-    ``HUG_CLOSE`` 合拢夹持，``TEST_LIFT`` 小幅试抬，``VERIFY`` 等待验证，
-    ``RETREAT`` 撤离，``TRANSPORT_HOLD`` 运输保持，``MOVE_PREPLACE`` 到预放姿态，
-    ``LOWER_OBJECT`` 下放，``RELEASE`` 释放，``STOW`` 收回，``FAILED`` 表示局部执行失败。
-
-    这些枚举值存在不等于流程已经实现。``JointTrajectory.execution_phase`` 与路点的
-    ``ArmMotionPhase`` 只描述规划目标，不表示执行器已经进入对应 ``LocalPhase``；本次
-    仅校验字段，装载后保持中性的 ``IDLE``，且不新增两种阶段的运行时映射。完整阶段
-    推进仍由 ``step`` 的后续实现负责。
-
+    正式执行必须显式注入 ``ArmExecutionConfig``。暂时允许无参构造，仅用于尚未获准修改
+    的 ROS 骨架兼容；该实例不能装载或执行轨迹，并始终失败关闭，不含任何默认参数。
     """
 
-    def __init__(self) -> None:
-        """创建处于 IDLE 的局部执行器。
-
-        参数和返回值均无；构造不依赖 ROS2 或官方 KDL。内部尚未装载任何轨迹。
-        """
-
+    def __init__(self, config: ArmExecutionConfig | None = None) -> None:
+        if config is not None and not isinstance(config, ArmExecutionConfig):
+            raise TypeError("config必须是ArmExecutionConfig")
+        self._config = config
         self.local_phase = LocalPhase.IDLE
         self._trajectory: JointTrajectory | None = None
-        # 这些字段为未来step实现预留统一清理点，拒绝新轨迹时不能沿用上一条的进度。
         self._waypoint_index = 0
         self._trajectory_started_ns: int | None = None
         self._stable_cycle_count = 0
+        self._last_step_ns: int | None = None
+        self._last_feedback_timestamp_ns: int | None = None
+        self._last_command: tuple[float, ...] | None = None
+        self._initial_position: tuple[float, ...] | None = None
+        self._terminal_status: ManipulationStatus | None = None
         self._cached_verification = None
 
     def create_hold_command(
         self, actual_joints: RobotJointState, timestamp_ns: int, valid_for_ns: int
     ) -> ManipulationCommand:
-        """用实际反馈创建全关节安全保持命令。
-
-        参数：17维实际关节、非负整数 ``timestamp_ns`` 和正整数 ``valid_for_ns``；二者
-        单位都是纳秒。TTL像候选命令的保质期，过期后由 ``ActionMux`` 不再采用。
-
-        实际反馈有效时，返回“目标严格等于当前实际位置、17项均受控”的保持候选；这表示
-        主动维持当前姿态，不是回到全零。实际反馈无效时返回 ``valid=False`` 且不伪造
-        关节目标。时间参数不合法时抛出 ``ValueError``。
-        """
+        """显式创建主动保持候选；此辅助方法不由轨迹失败路径自动调用。"""
 
         timestamp_ns = _require_integer_ns(timestamp_ns, "timestamp_ns", positive=False)
         valid_for_ns = _require_integer_ns(valid_for_ns, "valid_for_ns", positive=True)
-        if not actual_joints.valid:
+        structure_error = self._joint_state_structure_error(actual_joints)
+        if structure_error:
             return ManipulationCommand(
-                joint_target=actual_joints.position,
-                controlled_mask=(False,) * 17,
-                local_phase=self.local_phase,
-                timestamp_ns=timestamp_ns,
-                valid_until_ns=timestamp_ns,
-                valid=False,
-                failure_reason=(
-                    "实际关节状态无效，不能生成安全保持"
-                    + (f"：{actual_joints.failure_reason}" if actual_joints.failure_reason else "")
-                ),
+                self._fallback_position(actual_joints), (False,) * 17, self.local_phase,
+                timestamp_ns, timestamp_ns, False,
+                f"实际关节状态不能生成安全保持：{structure_error}",
             )
         return ManipulationCommand(
-            joint_target=actual_joints.position,
-            controlled_mask=(True,) * 17,
-            local_phase=self.local_phase,
-            timestamp_ns=timestamp_ns,
-            valid_until_ns=timestamp_ns + valid_for_ns,
-            valid=True,
+            actual_joints.position, (True,) * 17, self.local_phase,
+            timestamp_ns, timestamp_ns + valid_for_ns,
         )
 
     def start_trajectory(self, trajectory: JointTrajectory) -> ManipulationStatus:
-        """装载一条待执行关节轨迹。
-
-        参数是17维关节路点轨迹，路点时间单位秒；返回 ``ManipulationStatus``。该入口
-        会再次检查ID、时间严格递增、17维有限目标和17项布尔mask，因为公共dataclass
-        可能来自反序列化、旧代码或损坏测试对象，不能假定 ``valid=True`` 就一定安全。
-
-        装载采用原子语义：先清除旧轨迹的索引、开始时间、稳定计数和验证缓存，再保存
-        通过检查的新轨迹。拒绝新轨迹时同样清除旧执行上下文，避免下一周期误执行旧动作。
-        ``LOADED`` 只表示轨迹已经保存，尚未开始插值，更不表示机器人到位。
-        损坏对象的时间字段不合法或缺失时，拒绝状态使用安全诊断时间0。
-        """
+        """原子装载轨迹；轨迹时钟只在第一次合法 ``step`` 启动。"""
 
         failure_reason = _trajectory_error(trajectory)
-        if failure_reason:
-            self.reset()
-            self.local_phase = LocalPhase.FAILED
-            return ManipulationStatus(
-                local_phase=self.local_phase,
-                state="REJECTED",
-                progress=0.0,
-                max_joint_error=float("inf"),
-                success=False,
-                failure_reason=failure_reason,
-                timestamp_ns=_safe_trajectory_timestamp(trajectory),
-            )
+        if not failure_reason and self._config is None:
+            failure_reason = "ArmExecutionConfig未注入，执行失败关闭"
         self.reset()
+        if failure_reason:
+            self.local_phase = LocalPhase.FAILED
+            status = ManipulationStatus(
+                self.local_phase, "REJECTED", 0.0, float("inf"), False,
+                failure_reason, _safe_trajectory_timestamp(trajectory),
+            )
+            self._terminal_status = status
+            return status
         self._trajectory = trajectory
         return ManipulationStatus(
-            local_phase=self.local_phase,
-            state="LOADED",
-            progress=0.0,
-            max_joint_error=float("inf"),
-            success=False,
-            failure_reason="轨迹已装载，但插值执行尚未开始",
-            timestamp_ns=_safe_trajectory_timestamp(trajectory),
+            self.local_phase, "LOADED", 0.0, float("inf"), False,
+            "轨迹已装载，等待首次合法反馈启动", _safe_trajectory_timestamp(trajectory),
         )
 
     def reset(self) -> None:
-        """清除当前轨迹和全部运行期状态，并回到 ``IDLE``。
-
-        Episode结束、任务切换或失败恢复准备重新装载时可调用。该方法只清内存状态，不会
-        生成关节命令；调用方仍需根据最新 ``RobotJointState`` 通过正常控制链创建保持
-        候选，不能把reset理解成机器人已经停止。
-        """
+        """只清除全部内存执行状态；不生成控制命令，也不代表机器人已经停止。"""
 
         self._trajectory = None
         self._waypoint_index = 0
         self._trajectory_started_ns = None
         self._stable_cycle_count = 0
+        self._last_step_ns = None
+        self._last_feedback_timestamp_ns = None
+        self._last_command = None
+        self._initial_position = None
+        self._terminal_status = None
         self._cached_verification = None
         self.local_phase = LocalPhase.IDLE
+
+    @staticmethod
+    def _joint_state_structure_error(actual: object) -> str:
+        if not isinstance(actual, RobotJointState):
+            return "actual_joints必须是RobotJointState实例"
+        if type(getattr(actual, "valid", None)) is not bool:
+            return "actual_joints.valid必须是严格bool"
+        if not actual.valid:
+            reason = getattr(actual, "failure_reason", "")
+            return "actual_joints无效" + (f"：{reason}" if isinstance(reason, str) and reason else "")
+        error = _finite_vector_error(getattr(actual, "position", None), 17, "actual_joints.position")
+        if error:
+            return error
+        try:
+            if "joint_names" not in vars(actual):
+                return "actual_joints.joint_names缺失，必须严格使用JOINT_NAMES顺序"
+        except TypeError:
+            return "actual_joints.joint_names缺失，必须严格使用JOINT_NAMES顺序"
+        try:
+            joint_names = tuple(getattr(actual, "joint_names"))
+        except (AttributeError, TypeError, ValueError):
+            return "actual_joints.joint_names必须严格使用JOINT_NAMES顺序"
+        if joint_names != JOINT_NAMES:
+            return "actual_joints.joint_names必须严格使用JOINT_NAMES顺序"
+        if not 0.0 <= float(actual.position[9]) <= 1.0:
+            return "actual_joints左夹爪反馈必须位于[0,1]"
+        if not 0.0 <= float(actual.position[16]) <= 1.0:
+            return "actual_joints右夹爪反馈必须位于[0,1]"
+        return ""
+
+    @classmethod
+    def _actual_error(cls, actual: object, timestamp_ns: int, max_age_ns: int) -> str:
+        structure_error = cls._joint_state_structure_error(actual)
+        if structure_error:
+            return structure_error
+        assert isinstance(actual, RobotJointState)
+        feedback_ns = getattr(actual, "timestamp_ns", None)
+        if type(feedback_ns) is not int or feedback_ns < 0:
+            return "actual_joints.timestamp_ns必须是非负整数且不能是bool"
+        if feedback_ns > timestamp_ns:
+            return "actual_joints.timestamp_ns不得来自未来"
+        if timestamp_ns - feedback_ns > max_age_ns:
+            return "actual_joints反馈已过期"
+        return ""
+
+    def _fallback_position(self, actual: object) -> tuple[float, ...]:
+        if isinstance(actual, RobotJointState):
+            error = _finite_vector_error(getattr(actual, "position", None), 17, "actual")
+            if not error:
+                return tuple(float(value) for value in actual.position)
+        if self._last_command is not None:
+            return self._last_command
+        if self._initial_position is not None:
+            return self._initial_position
+        return (0.0,) * 17
+
+    def _inactive_command(
+        self, actual: object, timestamp_ns: int, reason: str
+    ) -> ManipulationCommand:
+        return ManipulationCommand(
+            self._fallback_position(actual), (False,) * 17, self.local_phase,
+            timestamp_ns, timestamp_ns, False, reason,
+        )
+
+    def _fail(
+        self, actual: object, timestamp_ns: int, reason: str,
+        max_error: float = float("inf"),
+    ) -> tuple[ManipulationCommand, ManipulationStatus]:
+        self.local_phase = LocalPhase.FAILED
+        status = ManipulationStatus(
+            self.local_phase, "FAILED", self._progress(), max_error,
+            False, reason, timestamp_ns,
+        )
+        self._terminal_status = status
+        return self._inactive_command(actual, timestamp_ns, reason), status
+
+    def _progress(self) -> float:
+        if self._trajectory is None:
+            return 0.0
+        try:
+            waypoint_count = len(self._trajectory.waypoints)
+        except (AttributeError, TypeError, ValueError):
+            return 0.0
+        if waypoint_count <= 0:
+            return 0.0
+        return min(1.0, self._waypoint_index / waypoint_count)
+
+    def _phase_for_current(self, reached: bool) -> LocalPhase:
+        assert self._trajectory is not None
+        waypoint = self._trajectory.waypoints[self._waypoint_index]
+        phase = waypoint.phase
+        if self._trajectory.execution_phase is GlobalPhase.EXECUTE_PLACE:
+            return {
+                ArmMotionPhase.PREPLACE: LocalPhase.MOVE_PREPLACE,
+                ArmMotionPhase.LOWER: LocalPhase.LOWER_OBJECT,
+                ArmMotionPhase.RELEASE: LocalPhase.RELEASE,
+                ArmMotionPhase.POST_RELEASE_RETREAT: LocalPhase.STOW,
+            }[phase]
+        if phase is ArmMotionPhase.PREGRASP:
+            return (
+                LocalPhase.HUG_OPEN
+                if reached and self._is_last_waypoint_of_current_phase()
+                else LocalPhase.MOVE_PREGRASP
+            )
+        if phase is ArmMotionPhase.GRASP:
+            return (
+                LocalPhase.HUG_CLOSE
+                if self._is_last_waypoint_of_current_phase()
+                else LocalPhase.APPROACH
+            )
+        if phase is ArmMotionPhase.LIFT:
+            return (
+                LocalPhase.VERIFY
+                if reached and self._is_last_waypoint_of_current_phase()
+                else LocalPhase.TEST_LIFT
+            )
+        return (
+            LocalPhase.TRANSPORT_HOLD
+            if reached and self._is_last_waypoint_of_current_phase()
+            else LocalPhase.RETREAT
+        )
+
+    def _is_last_waypoint_of_current_phase(self) -> bool:
+        assert self._trajectory is not None
+        next_index = self._waypoint_index + 1
+        return (
+            next_index == len(self._trajectory.waypoints)
+            or self._trajectory.waypoints[next_index].phase
+            is not self._trajectory.waypoints[self._waypoint_index].phase
+        )
+
+    @staticmethod
+    def _limit_for_index(index: int, config: ArmExecutionConfig) -> float:
+        if index == 0:
+            return config.max_slide_velocity_m_s
+        if index in _GRIPPER_INDICES:
+            return config.max_gripper_velocity_per_s
+        return config.max_arm_velocity_rad_s
+
+    @staticmethod
+    def _tolerance_for_index(index: int, config: ArmExecutionConfig) -> float:
+        if index == 0:
+            return config.slide_tolerance_m
+        if index in _GRIPPER_INDICES:
+            return config.gripper_tolerance
+        return config.arm_tolerance_rad
+
+    def _initial_error(self, actual: tuple[float, ...], waypoint: object) -> str:
+        assert self._config is not None
+        limits = (
+            self._config.initial_slide_error_limit_m,
+            self._config.initial_arm_error_limit_rad,
+            self._config.initial_gripper_error_limit,
+        )
+        errors = [abs(actual[i] - waypoint.joint_position[i]) for i in range(17)
+                  if waypoint.controlled_mask[i]]
+        if waypoint.controlled_mask[0] and abs(actual[0] - waypoint.joint_position[0]) > limits[0]:
+            return "首路点slide误差超过initial_slide_error_limit_m"
+        if any(waypoint.controlled_mask[i] and
+               abs(actual[i] - waypoint.joint_position[i]) > limits[1] for i in _ARM_INDICES):
+            return "首路点arm误差超过initial_arm_error_limit_rad"
+        if any(waypoint.controlled_mask[i] and
+               abs(actual[i] - waypoint.joint_position[i]) > limits[2] for i in _GRIPPER_INDICES):
+            return "首路点gripper误差超过initial_gripper_error_limit"
+        assert errors
+        return ""
 
     def step(
         self, actual_joints: RobotJointState, timestamp_ns: int
     ) -> tuple[ManipulationCommand, ManipulationStatus]:
-        """按实际关节反馈推进一次局部轨迹与抓放状态机。
+        """按实际反馈推进最多一个路点，并输出本周期经分组限速的候选。"""
 
-        参数实际关节单位同 ``RobotJointState``，时间为纳秒；未来每个控制周期返回一个
-        短TTL ``ManipulationCommand`` 和对应 ``ManipulationStatus``。机械臂2实现时需要：
+        try:
+            timestamp_ns = _require_integer_ns(timestamp_ns, "timestamp_ns", positive=False)
+        except ValueError as exc:
+            safe_ns = self._last_step_ns if self._last_step_ns is not None else 0
+            if self._terminal_status is not None:
+                return (
+                    self._inactive_command(
+                        actual_joints, safe_ns,
+                        self._terminal_status.failure_reason or "执行器已进入终态",
+                    ),
+                    self._terminal_status,
+                )
+            return self._fail(actual_joints, safe_ns, str(exc))
+        if self._last_step_ns is not None and timestamp_ns < self._last_step_ns:
+            if self._terminal_status is not None:
+                return (
+                    self._inactive_command(
+                        actual_joints, timestamp_ns,
+                        self._terminal_status.failure_reason or "执行器已进入终态",
+                    ),
+                    self._terminal_status,
+                )
+            return self._fail(actual_joints, timestamp_ns, "step时间不得倒退")
+        if self._terminal_status is not None:
+            self._last_step_ns = timestamp_ns
+            return (
+                self._inactive_command(
+                    actual_joints, timestamp_ns,
+                    self._terminal_status.failure_reason or "执行器已进入终态",
+                ),
+                self._terminal_status,
+            )
+        if self._config is None:
+            return self._fail(actual_joints, timestamp_ns, "ArmExecutionConfig未注入，执行失败关闭")
+        actual_error = self._actual_error(actual_joints, timestamp_ns, self._config.feedback_max_age_ns)
+        if actual_error:
+            return self._fail(actual_joints, timestamp_ns, actual_error)
+        actual = tuple(float(value) for value in actual_joints.position)
+        feedback_timestamp_ns = actual_joints.timestamp_ns
+        if (
+            self._last_feedback_timestamp_ns is not None
+            and feedback_timestamp_ns < self._last_feedback_timestamp_ns
+        ):
+            return self._fail(actual_joints, timestamp_ns, "actual_joints反馈时间倒退")
+        is_new_feedback = (
+            self._last_feedback_timestamp_ns is None
+            or feedback_timestamp_ns > self._last_feedback_timestamp_ns
+        )
+        if is_new_feedback:
+            self._last_feedback_timestamp_ns = feedback_timestamp_ns
+        if self._trajectory is None:
+            self._last_step_ns = timestamp_ns
+            reason = "未装载JointTrajectory"
+            return self._inactive_command(actual_joints, timestamp_ns, reason), ManipulationStatus(
+                LocalPhase.IDLE, "NO_TRAJECTORY", 0.0, float("inf"), False, reason, timestamp_ns,
+            )
+        if self._last_step_ns is not None and timestamp_ns - self._last_step_ns > self._config.max_control_period_ns:
+            return self._fail(actual_joints, timestamp_ns, "控制周期间隔超过max_control_period_ns")
+        trajectory_error = _trajectory_error(self._trajectory)
+        if trajectory_error:
+            return self._fail(
+                actual_joints, timestamp_ns,
+                f"已装载轨迹运行期校验失败：{trajectory_error}",
+            )
 
-        1. 校验实际反馈、时间和已装载轨迹；按相对时间找到相邻路点并插值；
-        2. 严格遵守 ``controlled_mask``，未受控关节保持实际位置而不是填零；
-        3. 对slide、手臂、夹爪分别使用经评审的限速、容差和稳定周期；
-        4. 依实际误差推进预抓、张开、靠近、合拢、试抬、验证、撤离、运输、预放、
-           下放、释放和收回阶段；
-        5. 轨迹超时、反馈无效、误差不收敛或验证失败时返回明确失败并保持安全；
-        6. 把实际反馈证据形成结构化验证结果，再由ROS组装层/全局FSM转成业务事件。
+        if self._trajectory_started_ns is None:
+            if self._trajectory.timestamp_ns > timestamp_ns:
+                return self._fail(actual_joints, timestamp_ns, "轨迹生成时间不得来自未来")
+            if timestamp_ns - self._trajectory.timestamp_ns > self._config.trajectory_max_age_ns:
+                return self._fail(actual_joints, timestamp_ns, "轨迹在首次执行前已过期")
+            self._trajectory_started_ns = timestamp_ns
+            self._initial_position = actual
+            self._last_command = actual
+            first = self._trajectory.waypoints[0]
+            if first.time_from_start_s == 0.0:
+                initial_error = self._initial_error(actual, first)
+                if initial_error:
+                    return self._fail(actual_joints, timestamp_ns, initial_error)
 
-        抓取验证至少要用实际关节反馈；视觉证据应由感知模块通过后续评审的结构化接口
-        提供，本文件不能读取图像。当前仓库尚未把 ``GraspVerification`` 接入生产控制链，
-        也没有稳定的提交方法，因此本次不猜测验证来源或改变 ``step`` 签名。
+        assert self._trajectory_started_ns is not None
+        assert self._initial_position is not None
+        assert self._last_command is not None
+        elapsed_ns = timestamp_ns - self._trajectory_started_ns
+        waypoint = self._trajectory.waypoints[self._waypoint_index]
+        waypoint_time_ns = int(round(waypoint.time_from_start_s * 1_000_000_000))
+        final_time_ns = int(round(self._trajectory.waypoints[-1].time_from_start_s * 1_000_000_000))
+        if elapsed_ns > final_time_ns + self._config.total_timeout_margin_ns:
+            return self._fail(actual_joints, timestamp_ns, "整条轨迹超过total_timeout_margin_ns")
+        waiting_for_verification = (
+            self._trajectory.execution_phase is GlobalPhase.EXECUTE_PICK
+            and waypoint.phase is ArmMotionPhase.LIFT
+            and self._is_last_waypoint_of_current_phase()
+            and self.local_phase is LocalPhase.VERIFY
+        )
+        if (
+            not waiting_for_verification
+            and elapsed_ns > waypoint_time_ns + self._config.waypoint_timeout_margin_ns
+        ):
+            return self._fail(actual_joints, timestamp_ns, "当前路点超过waypoint_timeout_margin_ns")
 
-        上述算法仍未实现，当前始终抛出 ``NotImplementedError``。不能只因命令已发布、
-        轨迹时间走完或目标误差偶然变小就报告成功。
-        """
+        if self._waypoint_index == 0:
+            start_position = self._initial_position
+            start_time_ns = 0
+        else:
+            previous = self._trajectory.waypoints[self._waypoint_index - 1]
+            start_position = previous.joint_position
+            start_time_ns = int(round(previous.time_from_start_s * 1_000_000_000))
+        duration_ns = waypoint_time_ns - start_time_ns
+        alpha = 1.0 if duration_ns <= 0 else min(1.0, max(0.0, (elapsed_ns - start_time_ns) / duration_ns))
+        desired = list(actual)
+        for index in range(17):
+            if waypoint.controlled_mask[index]:
+                desired[index] = start_position[index] + alpha * (
+                    waypoint.joint_position[index] - start_position[index]
+                )
+        dt_s = 0.0 if self._last_step_ns is None else (timestamp_ns - self._last_step_ns) / 1_000_000_000
+        limited = list(actual)
+        for index in range(17):
+            if not waypoint.controlled_mask[index]:
+                continue
+            max_delta = self._limit_for_index(index, self._config) * dt_s
+            delta = desired[index] - self._last_command[index]
+            limited[index] = self._last_command[index] + max(-max_delta, min(max_delta, delta))
 
-        raise NotImplementedError("机械臂轨迹插值和局部抓放状态机尚未实现，请由机械臂2负责人完成")
+        errors = [abs(actual[i] - waypoint.joint_position[i]) for i in range(17)
+                  if waypoint.controlled_mask[i]]
+        reached = all(
+            abs(actual[i] - waypoint.joint_position[i]) <= self._tolerance_for_index(i, self._config)
+            for i in range(17) if waypoint.controlled_mask[i]
+        )
+        if not reached:
+            self._stable_cycle_count = 0
+        elif is_new_feedback:
+            self._stable_cycle_count = min(
+                self._config.settle_cycles,
+                self._stable_cycle_count + 1,
+            )
+        settled = reached and self._stable_cycle_count >= self._config.settle_cycles
+        self.local_phase = self._phase_for_current(settled)
+        max_error = max(errors)
+        command = ManipulationCommand(
+            tuple(limited), tuple(waypoint.controlled_mask), self.local_phase,
+            timestamp_ns, timestamp_ns + self._config.command_ttl_ns, True, "",
+        )
+        self._last_command = tuple(limited)
+        self._last_step_ns = timestamp_ns
+
+        if settled and elapsed_ns >= waypoint_time_ns:
+            if (
+                self._trajectory.execution_phase is GlobalPhase.EXECUTE_PICK
+                and waypoint.phase is ArmMotionPhase.LIFT
+                and self._is_last_waypoint_of_current_phase()
+            ):
+                self.local_phase = LocalPhase.VERIFY
+                command = ManipulationCommand(
+                    tuple(limited), tuple(waypoint.controlled_mask), self.local_phase,
+                    timestamp_ns, timestamp_ns + self._config.command_ttl_ns, True, "",
+                )
+                return command, ManipulationStatus(
+                    self.local_phase, "VERIFICATION_PENDING", self._progress(),
+                    max_error, False,
+                    "LIFT已稳定到位，等待真实GraspVerification；不得确认GraspContext",
+                    timestamp_ns,
+                )
+        if settled and is_new_feedback and elapsed_ns >= waypoint_time_ns:
+            self._stable_cycle_count = 0
+            self._waypoint_index += 1
+            if self._waypoint_index == len(self._trajectory.waypoints):
+                self.local_phase = LocalPhase.IDLE
+                reason = "放置轨迹运动学执行完成；物体位置与裁判语义仍待外部验证"
+                status = ManipulationStatus(
+                    self.local_phase,
+                    "MOTION_COMPLETED_PLACE_VERIFICATION_PENDING",
+                    1.0, max_error, False, reason, timestamp_ns,
+                )
+                self._terminal_status = status
+                return self._inactive_command(actual_joints, timestamp_ns, status.failure_reason or "轨迹运动学执行已完成"), status
+
+        return command, ManipulationStatus(
+            self.local_phase, "RUNNING", self._progress(), max_error,
+            False, "尚未完成当前轨迹", timestamp_ns,
+        )
