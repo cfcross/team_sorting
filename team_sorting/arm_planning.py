@@ -60,11 +60,6 @@ from .interfaces import (
 
 _KDL_TARGET_FRAME = "footprint"
 # ──────────────────────────────────────────────────────────────────
-# 临时常量：机器人底盘在 footprint 系中的固定位置（单位米）
-# TODO: 待系统提供正式 TF 后移除本常量，改用 TF 动态查询
-# ──────────────────────────────────────────────────────────────────
-_FOOTPRINT_ROBOT_XY: tuple[float, float] = (-0.70, 0.55)
-# ──────────────────────────────────────────────────────────────────
 # 包装盒尺寸（长24cm × 宽16cm × 高19cm，单位米）
 # 机械臂1负责人可根据实际硬件调整
 # ──────────────────────────────────────────────────────────────────
@@ -75,10 +70,10 @@ _BOX_HALF_WIDTH: float = 0.08
 _BOX_HALF_HEIGHT: float = 0.095
 
 # ──────────────────────────────────────────────────────────────────
-# 夹爪控制量（0~1 范围，具体开/闭语义以官方协议为准）
+# 夹爪控制量（0~1 范围）——必须通过 ArmPlanner 构造注入，禁止写死
 # ──────────────────────────────────────────────────────────────────
-_GRIPPER_OPEN: float = 0.5
-_GRIPPER_CLOSED: float = 0.0
+_DEFAULT_GRIPPER_OPEN: float = 0.5
+_DEFAULT_GRIPPER_CLOSED: float = 0.0
 
 # ──────────────────────────────────────────────────────────────────
 # 默认抓放几何偏移（单位米）——基于包装盒尺寸计算
@@ -101,6 +96,12 @@ _MAX_PLACE_DESCENT: float = 0.5  # 最大放置下降距离
 # 轨迹优化参数
 # ──────────────────────────────────────────────────────────────────
 _JOINT_DELTA_THRESHOLD: float = 0.5  # 关节跳变检测阈值（弧度）
+# ──────────────────────────────────────────────────────────────────
+# 首路点安全检查阈值（不同单位分开限制）
+# ──────────────────────────────────────────────────────────────────
+_FIRST_WP_SLIDE_MAX_DELTA_M: float = 0.3   # 滑轨首路点最大跳变（米）
+_FIRST_WP_ARM_MAX_DELTA_RAD: float = 1.0   # 手臂关节首路点最大跳变（弧度）
+_FIRST_WP_GRIPPER_MAX_DELTA: float = 0.5   # 夹爪首路点最大跳变（控制量）
 _BASE_TIME: float = 1.0              # 基础每阶段时间（秒）
 _TIME_PER_RADIAN: float = 2.0        # 每弧度关节变化所需时间（秒）
 _MIN_STAGE_TIME: float = 0.5         # 最小阶段时间
@@ -212,7 +213,7 @@ def _first_ik_solution(
 
 # ═══════════════════════════════════════════════════════════════════
 # OfficialKDLAdapter：薄适配器（Wrapper）
-# 
+#
 # 通俗理解：这是一个"翻译官"。
 # 我们把"希望机械臂末端到达的位置（xyz坐标+方向）"交给它，
 # 它调比赛官方的运动学求解器（MMK2Kdl）算出"每个关节应该转多少度"，
@@ -459,16 +460,26 @@ class ArmPlanner:
     world/odom到footprint的转换依赖尚未冻结，规划在footprint系中完成。
     """
 
-    def __init__(self, ik_adapter: OfficialKDLAdapter) -> None:
+    def __init__(
+        self,
+        ik_adapter: OfficialKDLAdapter,
+        *,
+        gripper_open: Optional[float] = None,
+        gripper_closed: Optional[float] = None,
+    ) -> None:
         """注入已由组装层管理的官方KDL薄适配器。
 
         构造只保存依赖，不调用 ``self_check``，因此单元测试可以传入具有 ``solve_ik``
-        方法的fake adapter。坐标变换依赖尚未形成稳定接口，本次不加入构造参数。
+        方法的fake adapter。夹爪开/闭控制量必须由装配层显式注入；未注入时规划阶段 fail closed。
         """
 
         if not callable(getattr(ik_adapter, "solve_ik", None)):
             raise TypeError("ik_adapter必须提供可调用的solve_ik方法")
         self._ik_adapter = ik_adapter
+
+        # 夹爪控制量：必须由装配层显式注入；未注入时规划阶段 fail closed
+        self._gripper_open = gripper_open
+        self._gripper_closed = gripper_closed
 
         # ---- 内部执行状态预留（供后续执行模块扩展使用） ----
         # 当前规划阶段描述（str），如 "grasp_approach"/"place_release"
@@ -477,14 +488,11 @@ class ArmPlanner:
         self._expected_grasp_state: bool = False
         # 期望放置状态：是否预期已释放物体
         self._expected_place_state: bool = False
-        # 抓取上下文（供 plan_place 反推释放位姿使用）
-        # 存储抓取完成时左右夹爪相对物体中心的偏移及朝向，放置成功后由 plan_place 或
-        # 外部调用 reset_context 清空。
-        self._grasp_context: Optional[dict[str, Any]] = None
+        # 注：持物状态由 ArmExecution/FSM 管理，ArmPlanner 不保存
 
     def reset_context(self) -> None:
-        """清空抓取上下文，供外部在任务重置或放置成功后调用。"""
-        self._grasp_context = None
+        """外部任务重置钩子（保留接口兼容，ArmPlanner 无内部持物状态）。"""
+        pass
 
     # ------------------------------------------------------------------
     # 内部辅助：无效结果构造
@@ -517,8 +525,8 @@ class ArmPlanner:
     # 内部辅助：路点构建
     # ------------------------------------------------------------------
 
-    @staticmethod
     def _build_waypoint(
+        self,
         ik: IKResult,
         actual_joints: RobotJointState,
         gripper_open: bool,
@@ -544,7 +552,7 @@ class ArmPlanner:
             for j in range(6):
                 pos[10 + j] = ik.right_joint_target[j]
 
-        gripper_val = _GRIPPER_OPEN if gripper_open else _GRIPPER_CLOSED
+        gripper_val = self._gripper_open if gripper_open else self._gripper_closed
         pos[9] = gripper_val
         pos[16] = gripper_val
 
@@ -648,6 +656,57 @@ class ArmPlanner:
         return None
 
     # ------------------------------------------------------------------
+    # 内部辅助：首路点安全检查
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _check_first_waypoint(
+        wp: JointWaypoint,
+        actual_joints: RobotJointState,
+    ) -> "Optional[str]":
+        """【首路点安全】检查 actual_joints → 第一个轨迹路点的跳变。
+
+        不同关节类型使用不同阈值：
+        - slide(0)：米
+        - head(1-2)：弧度
+        - left_arm(3-8)：弧度
+        - left_gripper(9)：控制量
+        - right_arm(10-15)：弧度
+        - right_gripper(16)：控制量
+        """
+        actual = actual_joints.position
+        wp_pos = wp.joint_position
+
+        # slide: 米
+        slide_delta = abs(wp_pos[0] - actual[0])
+        if slide_delta > _FIRST_WP_SLIDE_MAX_DELTA_M:
+            return (
+                f"首路点 slide 跳变 {actual[0]:.4f}→{wp_pos[0]:.4f} "
+                f"(Δ={slide_delta:.4f}m > 阈值{_FIRST_WP_SLIDE_MAX_DELTA_M}m)"
+            )
+
+        # arm joints (3-8, 10-15): 弧度
+        for base in (3, 10):
+            for j in range(base, base + 6):
+                delta = abs(wp_pos[j] - actual[j])
+                if delta > _FIRST_WP_ARM_MAX_DELTA_RAD:
+                    return (
+                        f"首路点 关节[{j}] 跳变 {actual[j]:.4f}→{wp_pos[j]:.4f} "
+                        f"(Δ={delta:.4f}rad > 阈值{_FIRST_WP_ARM_MAX_DELTA_RAD}rad)"
+                    )
+
+        # grippers (9, 16): 控制量
+        for j in (9, 16):
+            delta = abs(wp_pos[j] - actual[j])
+            if delta > _FIRST_WP_GRIPPER_MAX_DELTA:
+                return (
+                    f"首路点 夹爪[{j}] 跳变 {actual[j]:.4f}→{wp_pos[j]:.4f} "
+                    f"(Δ={delta:.4f} > 阈值{_FIRST_WP_GRIPPER_MAX_DELTA})"
+                )
+
+        return None
+
+    # ------------------------------------------------------------------
     # 内部辅助：几何安全检查（粗略安全过滤，不实现复杂碰撞检测）
     #
     # 注意：此检查仅根据简单距离/高度限制进行粗略过滤，防止生成明显
@@ -686,7 +745,8 @@ class ArmPlanner:
 
 
     def plan_grasp(
-        self, target: ObjectEstimate3D, actual_joints: RobotJointState
+        self, target: ObjectEstimate3D, actual_joints: RobotJointState,
+        *, now_ns: Optional[int] = None,
     ) -> tuple[GraspTarget, JointTrajectory]:
         """【🌟 核心方法】规划完整的抓取动作流程。
 
@@ -715,39 +775,44 @@ class ArmPlanner:
         """
 
         traj_id = f"grasp_{target.timestamp_ns}"
-        ts = target.timestamp_ns
+        ts = now_ns if now_ns is not None else target.timestamp_ns
 
         # ---- 输入校验 ----
         if not target.valid or not actual_joints.valid:
             reason = f"输入无效: target.valid={target.valid}, joints.valid={actual_joints.valid}"
             return self._null_grasp_result(traj_id, ts, reason)
 
-        # ---- 坐标系处理（临时方案，待系统提供正式 TF 后移除） ----
+        # ---- 夹爪配置检查 ----
+        if self._gripper_open is None or self._gripper_closed is None:
+            return self._null_grasp_result(
+                traj_id, ts, '夹爪开/闭控制量未注入，拒绝规划'
+            )
+
+        # ---- 坐标系处理 ----
+        # 只有已转换为 footprint 系的输入才能继续规划；
+        # world/odom 等非 footprint 系在没有正式 TF 时 fail closed。
         target_xyz = target.position_xyz
         frame_id = target.frame_id
         if frame_id == "footprint":
             tx, ty, tz = float(target_xyz[0]), float(target_xyz[1]), float(target_xyz[2])
         elif frame_id in ("world", "odom"):
-            # 临时方案：使用 _FOOTPRINT_ROBOT_XY 常量，
-            # 将 world/odom 坐标粗略转换到 footprint 系。
-            # TODO: 待系统提供正式 TF 后移除本段临时转换。
-            robot_x, robot_y = _FOOTPRINT_ROBOT_XY
-            tx = float(target_xyz[0]) - robot_x
-            ty = float(target_xyz[1]) - robot_y
-            tz = float(target_xyz[2])
+            return self._null_grasp_result(
+                traj_id, ts, f"世界/odom坐标系 '{frame_id}' 缺少TF转换，无法规划抓取"
+            )
         else:
             return self._null_grasp_result(
-                traj_id, ts, f"不支持坐标系 frame_id={frame_id}，仅支持 footprint/world/odom"
+                traj_id, ts, f"不支持坐标系 frame_id={frame_id}，仅支持 footprint"
             )
 
         if not all(math.isfinite(v) for v in (tx, ty, tz)):
             return self._null_grasp_result(traj_id, ts, f"目标位置含非有限值: ({tx},{ty},{tz})")
 
         # ---- 抓取方向计算 ----
-        # 机器人底盘中心在 footprint 系中的固定位置（临时方案，待 TF 替换）
-        robot_xy = _FOOTPRINT_ROBOT_XY
-        dx = tx - robot_xy[0]
-        dy = ty - robot_xy[1]
+        # 在 footprint 系中，机器人底盘位于原点 (0,0)。
+        # 考虑从 actual_joints 中提取的 yaw 偏转。
+        # 注：当前 yaw 经 base_state 传入；这里保留接口供后续扩展。
+        dx = tx - 0.0
+        dy = ty - 0.0
         dist = math.hypot(dx, dy)
         # 粗略距离安全过滤（非碰撞检测），防止目标明显不可达
         if dist > _MAX_GRASP_DIST:
@@ -792,6 +857,9 @@ class ArmPlanner:
 
         time_pre = self._compute_stage_time(None, ik_pre, actual_joints)
         wp_pre = self._build_waypoint(ik_pre, actual_joints, gripper_open=True, time_from_start_s=time_pre)
+        first_jump = self._check_first_waypoint(wp_pre, actual_joints)
+        if first_jump is not None:
+            return self._null_grasp_result(traj_id, ts, first_jump)
 
         # ---- 阶段 2：抓取（grasp） ----
         # 目标水平面，左右夹爪沿垂直方向偏移
@@ -886,38 +954,20 @@ class ArmPlanner:
             left_grasp=left_grasp_pose,
             right_grasp=right_grasp_pose,
             lift_delta_m=_LIFT_DELTA,
-            confidence=1.0,
+            confidence=float(getattr(target, 'confidence', 1.0)),
             valid=True,
         )
 
-        # ---- 保存抓取上下文（供 plan_place 使用） ----
-        # 记录抬升结束时左右夹爪末端相对物体中心的偏移
-        self._grasp_context = {
-            "yaw": yaw,
-            "grasp_dir": (grasp_dir_x, grasp_dir_y),
-            "perp_dir": (perp_x, perp_y),
-            "grasp_offset": grasp_offset,
-            # Z 偏移使用箱体半高 + 表面余量，保证放置时箱底贴合目标面、不悬空
-            "left_offset": (
-                perp_x * grasp_offset,
-                perp_y * grasp_offset,
-                _BOX_HALF_HEIGHT + _PLACE_SURFACE_OFFSET,
-            ),
-            "right_offset": (
-                -perp_x * grasp_offset,
-                -perp_y * grasp_offset,
-                _BOX_HALF_HEIGHT + _PLACE_SURFACE_OFFSET,
-            ),
-            "orient": orient,
-        }
-
+        # grasp context 作为规划结果数据由调用方管理，不写入实例状态
         return gt, jt
 
 
 
 
     def plan_place(
-        self, task: TaskSpec, actual_joints: RobotJointState
+        self, task: TaskSpec, actual_joints: RobotJointState,
+        *, now_ns: Optional[int] = None,
+        grasp_context: Optional[dict[str, Any]] = None,
     ) -> tuple[PlaceTarget, JointTrajectory]:
         """【🌟 核心方法】规划完整的放置动作流程。
 
@@ -941,18 +991,38 @@ class ArmPlanner:
         """
 
         traj_id = f"place_{task.task_id}"
-        # TaskSpec 无 timestamp_ns 字段时，使用实际关节时间戳作为后备
-        ts = getattr(task, "timestamp_ns", actual_joints.timestamp_ns)
+        ts = now_ns if now_ns is not None else getattr(task, "timestamp_ns", actual_joints.timestamp_ns)
 
         # ---- 输入校验 ----
         if not task.valid or not actual_joints.valid:
             reason = f"输入无效: task.valid={task.valid}, joints.valid={actual_joints.valid}"
             return self._null_place_result(traj_id, ts, reason)
 
-        if self._grasp_context is None:
-            return self._null_place_result(traj_id, ts, "未执行抓取，无法规划放置")
+        # place_world_xyz 合法性
+        place_xyz = task.place_world_xyz
+        if place_xyz is None:
+            return self._null_place_result(traj_id, ts, "place_world_xyz 为 None，无法规划放置")
+        try:
+            _ = _finite_vector(place_xyz, 3, "place_world_xyz")
+        except (ValueError, TypeError) as exc:
+            return self._null_place_result(traj_id, ts, f"place_world_xyz 无效: {exc}")
 
-        ctx = self._grasp_context
+        # place_type 合法性检查
+        if task.place_type not in ("point",):
+            return self._null_place_result(
+                traj_id, ts, f"不支持的 place_type='{task.place_type}'，当前仅支持 'point'"
+            )
+
+        # ---- 夹爪配置检查 ----
+        if self._gripper_open is None or self._gripper_closed is None:
+            return self._null_place_result(
+                traj_id, ts, '夹爪开/闭控制量未注入，拒绝规划'
+            )
+
+        if grasp_context is None:
+            return self._null_place_result(traj_id, ts, "缺少抓取上下文，无法规划放置")
+
+        ctx = grasp_context
         yaw: float = ctx["yaw"]
         grasp_dir_x: float = ctx["grasp_dir"][0]
         grasp_dir_y: float = ctx["grasp_dir"][1]
@@ -963,26 +1033,19 @@ class ArmPlanner:
         right_offset: tuple = ctx["right_offset"]
         orient: tuple = ctx["orient"]
 
-        # ---- 坐标系处理（临时方案，待系统提供正式 TF 后移除） ----
-        place_xyz = task.place_world_xyz
-        # TaskSpec 没有 place_frame_id 字段，默认假设为 world/odom
-        # TODO: 待 TaskSpec 增加 frame_id 字段后改用正式字段
-        # 临时方案：TaskSpec 尚无 frame_id 字段，默认 place_world_xyz 为 world 系。
-        # 待 TaskSpec 增加 frame_id 后替换为正式字段。
-        place_frame = "world"
+        # ---- 坐标系处理 ----
+        # place_world_xyz 语义：物体最终中心位置。
+        # 必须已转换为 footprint 系；world/odom 系无 TF 时 fail closed。
+        place_frame = getattr(task, "place_frame_id", None) or "world"
         if place_frame == "footprint":
             px, py, pz = float(place_xyz[0]), float(place_xyz[1]), float(place_xyz[2])
         elif place_frame in ("world", "odom"):
-            # 临时方案：使用 _FOOTPRINT_ROBOT_XY 常量，
-            # 将 world/odom 坐标粗略转换到 footprint 系。
-            # TODO: 待系统提供正式 TF 后移除本段临时转换。
-            robot_x, robot_y = _FOOTPRINT_ROBOT_XY
-            px = float(place_xyz[0]) - robot_x
-            py = float(place_xyz[1]) - robot_y
-            pz = float(place_xyz[2])
+            return self._null_place_result(
+                traj_id, ts, f"世界/odom坐标系 '{place_frame}' 缺少TF转换，无法规划放置"
+            )
         else:
             return self._null_place_result(
-                traj_id, ts, f"不支持坐标系 place_frame_id={place_frame}，仅支持 footprint/world/odom"
+                traj_id, ts, f"不支持的放置坐标系 place_frame='{place_frame}'"
             )
 
         if not all(math.isfinite(v) for v in (px, py, pz)):
@@ -1022,18 +1085,19 @@ class ArmPlanner:
             actual_joints, left_target=left_preplace_pose, right_target=right_preplace_pose,
         )
         if not ik_preplace.success:
-            self._grasp_context = None
             return self._null_place_result(traj_id, ts, f"预放置IK失败: {ik_preplace.failure_reason}")
 
         time_pre = self._compute_stage_time(None, ik_preplace, actual_joints)
         wp_preplace = self._build_waypoint(ik_preplace, actual_joints, gripper_open=False, time_from_start_s=time_pre)
+        first_jump = self._check_first_waypoint(wp_preplace, actual_joints)
+        if first_jump is not None:
+            return self._null_place_result(traj_id, ts, first_jump)
 
         # ---- 阶段 2：释放（release） ----
         # 下降到释放位姿，夹爪张开
         # 放置下降高度安全检查（粗略过滤，非完整碰撞检测）
         place_descent = preplace_z - left_release_z
         if place_descent > _MAX_PLACE_DESCENT:
-            self._grasp_context = None
             return self._null_place_result(
                 traj_id, ts, f"放置下降 {place_descent:.3f}m 超出限制 {_MAX_PLACE_DESCENT}m"
             )
@@ -1041,14 +1105,12 @@ class ArmPlanner:
             actual_joints, left_target=left_release_pose, right_target=right_release_pose,
         )
         if not ik_release.success:
-            self._grasp_context = None
             return self._null_place_result(traj_id, ts, f"释放IK失败: {ik_release.failure_reason}")
 
         time_release = time_pre + self._compute_stage_time(wp_preplace.joint_position, ik_release, actual_joints)
         wp_release = self._build_waypoint(ik_release, actual_joints, gripper_open=True, time_from_start_s=time_release)
         jump_reason = self._check_joint_jump("release", wp_release, wp_preplace)
         if jump_reason is not None:
-            self._grasp_context = None
             return self._null_place_result(traj_id, ts, jump_reason)
 
         # ---- 阶段 3：撤离（retreat） ----
@@ -1068,14 +1130,12 @@ class ArmPlanner:
             actual_joints, left_target=left_retreat_place_pose, right_target=right_retreat_place_pose,
         )
         if not ik_retreat.success:
-            self._grasp_context = None
             return self._null_place_result(traj_id, ts, f"撤离IK失败: {ik_retreat.failure_reason}")
 
         time_ret = time_release + self._compute_stage_time(wp_release.joint_position, ik_retreat, actual_joints)
         wp_retreat_place = self._build_waypoint(ik_retreat, actual_joints, gripper_open=True, time_from_start_s=time_ret)
         jump_reason = self._check_joint_jump("retreat", wp_retreat_place, wp_release)
         if jump_reason is not None:
-            self._grasp_context = None
             return self._null_place_result(traj_id, ts, jump_reason)
 
         # ---- 组装轨迹 ----
@@ -1093,8 +1153,7 @@ class ArmPlanner:
             valid=True,
         )
 
-        # ---- 清除上下文 ----
-        self._grasp_context = None
+        # grasp_context 由调用方传入，plan_place 不持有状态
 
         return pt, jt
 
