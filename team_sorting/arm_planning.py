@@ -3,7 +3,7 @@
 FK（正运动学）根据关节角计算末端在哪里；IK（逆运动学）根据末端希望到达的位置和
 方向反求关节目标。本文件的数据流是：
 
-``ObjectEstimate3D`` 当前物体中心 / ``TaskSpec.place_world_xyz`` 放置后的物体中心
+``ObjectEstimate3D`` 当前物体事实 / ``TaskSpec.place_world_xyz`` 放置后的物体中心
 → ``ArmPlanner`` 生成左右末端 ``Pose3D``
 → ``OfficialKDLAdapter`` 调用官方 ``MMK2Kdl``
 → ``IKResult``（slide + 左臂6轴 + 右臂6轴）
@@ -11,7 +11,7 @@ FK（正运动学）根据关节角计算末端在哪里；IK（逆运动学）�
 → ``JointTrajectory``
 → ``arm_execution`` 插值、执行并依据实际反馈判断结果。
 
-物体中心只有位置，不是夹爪末端位姿；夹爪还需要方向、双臂间距和安全偏移。官方双臂
+物体中心不是夹爪末端位姿；抓取还需要观测姿态、尺寸、双臂间距和安全偏移。官方双臂
 运动学向量是13维 ``[slide,left×6,right×6]``，单臂是7维 ``[slide,arm×6]``；团队
 17维路点还包含head和左右gripper，未控制关节必须保持实际反馈或使用
 ``controlled_mask=False``，不能补全为零。
@@ -31,6 +31,8 @@ import sys
 from typing import Any, Optional
 
 from .interfaces import (
+    ArmPlanningConfig,
+    GraspContext,
     GraspTarget,
     IKResult,
     JointTrajectory,
@@ -38,6 +40,7 @@ from .interfaces import (
     PlaceTarget,
     Pose3D,
     RobotJointState,
+    RigidTransform3D,
     TaskSpec,
 )
 
@@ -309,7 +312,7 @@ class ArmPlanner:
     """物体中心到抓放位姿和关节轨迹的规划器骨架。
 
     输入为 ``ObjectEstimate3D/TaskSpec/RobotJointState``，输出抓取/放置末端目标及
-    ``JointTrajectory``。视觉2只提供物体中心；本类未来结合物体尺寸、抓取方向、
+    ``JointTrajectory``。视觉2提供物体中心及可选感知事实；本类未来结合物体尺寸、姿态、
     object-to-gripper关系和安全偏移生成左右 ``Pose3D``，再转换到 ``footprint`` 求IK。
 
     ``pre-grasp`` 是接触前的安全预备位，``grasp`` 是包夹位置，``lift`` 是抓住后试抬，
@@ -319,15 +322,14 @@ class ArmPlanner:
 
     一个 ``ArmPlanner`` 实例持有一个由组装层完成自检的 ``OfficialKDLAdapter``，规划
     方法未来复用它调用 ``solve_ik``；本类不会在每次规划时重新创建或自检求解器。
-    当前 ``plan_grasp`` 没有 ``BaseState``，仓库也没有稳定的普通Python坐标变换接口，
-    所以world/odom到footprint的转换依赖尚未冻结，不能在这里假设frame等价或暗中查TF。
-
-    当前 ``plan_place`` 参数中没有抓取时的object-to-gripper关系。第一版暂定采用边界B：
-    未来由同一个planner实例在成功的 ``plan_grasp`` 后保存计划抓取关系，Episode结束、
-    抓取失败或任务重置时必须清除；存储结构和重置入口仍待系统评审，本次不实现状态。
+    坐标变换由组装层以纯Python ``RigidTransform3D`` 快照显式传入，本类不查询TF。
+    抓取时还需target到world的快照，用于记录物体观测到的world朝向；放置使用经过执行
+    反馈确认的 ``GraspContext``，且planner自身不保存任何跨调用抓取状态。
     """
 
-    def __init__(self, ik_adapter: OfficialKDLAdapter) -> None:
+    def __init__(
+        self, ik_adapter: OfficialKDLAdapter, config: ArmPlanningConfig
+    ) -> None:
         """注入已由组装层管理的官方KDL薄适配器。
 
         构造只保存依赖，不调用 ``self_check``，因此单元测试可以传入具有 ``solve_ik``
@@ -336,10 +338,19 @@ class ArmPlanner:
 
         if not callable(getattr(ik_adapter, "solve_ik", None)):
             raise TypeError("ik_adapter必须提供可调用的solve_ik方法")
+        if not isinstance(config, ArmPlanningConfig):
+            raise TypeError("config必须是ArmPlanningConfig")
         self._ik_adapter = ik_adapter
+        self._config = config
 
     def plan_grasp(
-        self, target: ObjectEstimate3D, actual_joints: RobotJointState
+        self,
+        task: TaskSpec,
+        target: ObjectEstimate3D,
+        target_to_footprint: RigidTransform3D,
+        target_to_world: RigidTransform3D,
+        actual_joints: RobotJointState,
+        now_ns: int,
     ) -> tuple[GraspTarget, JointTrajectory]:
         """生成 pre-grasp、grasp、lift 和 retreat 轨迹。
 
@@ -352,13 +363,20 @@ class ArmPlanner:
         raise NotImplementedError("双臂抓取位姿和轨迹规划尚未实现，请由机械臂1负责人完成")
 
     def plan_place(
-        self, task: TaskSpec, actual_joints: RobotJointState
+        self,
+        task: TaskSpec,
+        world_to_footprint: RigidTransform3D,
+        grasp_context: GraspContext,
+        actual_joints: RobotJointState,
+        now_ns: int,
     ) -> tuple[PlaceTarget, JointTrajectory]:
         """未来把 ``TaskSpec.place_world_xyz`` 转换为双臂放置轨迹。
 
-        ``place_world_xyz`` 是放置后的物体中心，不是夹爪Pose。机械臂1后续应利用抓取后
-        的object-to-gripper关系生成左右release和preplace Pose，再规划下降、释放和撤离
-        目标、调用IK并生成17维轨迹；不能直接把物体中心交给KDL。当前明确抛出异常。
+        ``place_world_xyz`` 是放置后的物体中心，不是夹爪Pose。正式目标方向唯一来自已
+        确认 ``GraspContext`` 中抓取时观测到的物体world姿态；缺失时必须失败关闭。
+        机械臂1后续利用规划的object-to-gripper关系生成左右release和preplace Pose，再
+        规划下降、释放和撤离目标、调用IK并生成17维轨迹；不能直接把物体中心交给KDL。
+        当前明确抛出异常。
         """
 
         raise NotImplementedError("双臂放置位姿和轨迹规划尚未实现，请由机械臂1负责人完成")

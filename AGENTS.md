@@ -90,6 +90,33 @@
 - 新增公共字段必须注明单位、`frame_id`、时间戳和失败语义；不适用时也要明确说明。
 - `RobotJointState` 是实际反馈；`IKResult` 是目标关节解。禁止混用或使用含义模糊的变量名。
 - `ObjectEstimate3D` 是物体中心估计；`place_world_xyz` 是目标物体中心。两者都不是夹爪末端位姿。
+- `ObjectEstimate3D` 只保存感知或配置直接支持的事实，禁止加入 `target_body`；有效中心估计
+  不强制要求 `object_id`、姿态或尺寸。任务 body 绑定只能由 ROS 组装层结合当前
+  `TaskSpec` 和唯一稳定目标完成，多目标歧义必须失败关闭。
+- `perception.estimator_3d.object_dimensions_m` 当前第三轴是相机视线近似深度，只能服务
+  启发式中心补偿；随机 yaw 下不得交换或猜测局部轴，也不得由此生产
+  `ObjectEstimate3D.size_xyz_m`。局部 XYZ 尺寸需要独立且 frame 语义明确的来源。
+- 有效 `TaskSpec` 的 `place_type` 只允许 `shelf_point`、`table_point`、
+  `shelf_prop_side`，`place_frame_id` 必须为 `world`；无效对象只要求非空失败原因，
+  不得为表达解析失败而伪造完整放置字段。缺失 JSON frame 只能由 `InstructionParser`
+  显式写入 `world`，dataclass 不得隐藏补默认值。
+- `/team/object_estimates` 内部 ROS 适配以零四元数表示未知姿态、全零 bbox size 表示未知
+  尺寸，反序列化恢复 `None`；不得把零四元数归一化为单位姿态。该规则不是官方协议。
+- `ArmMotionPhase` 只属于 `JointWaypoint`/`JointTrajectory` 规划语义，禁止进入现有
+  `LocalPhase`、命令、状态或 JSON 协议，未经后续评审不得添加运行时映射。
+- 有效 `JointTrajectory` 必须使用严格 `GlobalPhase` 并包含所属操作的四个有序阶段；
+  同阶段可连续多路点但不得跨操作或倒退。无效轨迹必须为空，允许空目标身份但必须说明原因。
+- `Pose3D` 必须在 frozen dataclass 构造时冻结有限位置、归一化非零四元数和非空 frame；
+  零四元数未知哨兵只属于 ROS `ObjectEstimate3D` 适配，禁止进入 `Pose3D`。
+- 所有 `_strict_finite_vector` 公共空间/关节向量项必须是非bool `numbers.Real`；数字字符串、
+  bytes或仅能经 `float()` 转换的对象必须拒绝，正常整数统一冻结为float。
+- `RigidTransform3D` frame与`GraspContext`身份/frame只去除首尾空白，不删除前导斜杠、
+  不做frame别名转换；同frame检查必须使用规范化后的字符串。
+- 有效 `JointWaypoint.controlled_mask` 至少一项为True；全False不得作为等待、停止或阶段标记。
+- 官方离线`mmk2_control.xml`已确认左右夹爪actuator硬`ctrlrange=[0,1]`；规划配置的
+  min/max不得越界。open/closed仍需仿真标定，verified=false时抓放验证必须失败关闭。
+- `GraspContext.confirmed` 只表示执行器根据实际反馈确认计划抓取成立；其中两条
+  object-to-gripper 关系仍是规划关系，不是执行器重新测量的标定结果。
 - `BaseCommand` 和 `ManipulationCommand` 只是候选建议；`FinalAction` 是 `ActionMux` 的输出。
 - `FinalAction.values` 必须严格包含 19 项，禁止复制、重排或重新定义索引。
 - `ActionMuxDecision`只能由同一次ActionMux仲裁产生；禁止从`FinalAction`或failure_reason反推mask。

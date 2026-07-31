@@ -595,7 +595,8 @@ class Perception3DEstimator:
     ) -> None:
         """保存三维估计参数，构造阶段不加载任何官方依赖。
 
-        ``object_dimensions_m`` 的值依次为宽、高、沿相机视线近似深度，单位米。
+        ``object_dimensions_m`` 的值依次为宽、高、沿相机视线近似深度，单位米；它只
+        服务当前启发式中心补偿，不是经过frame语义确认的物体局部XYZ尺寸生产源。
         ``max_track_age_s`` 为轨迹超时秒数，``max_input_skew_s`` 为
         Detection/Depth/CameraInfo 最大绝对时间差秒数，``max_position_jump_m``
         为相邻有效轨迹点允许的最大三维跳变。``ambiguity_ratio`` 控制稳定ID与其他
@@ -1031,16 +1032,20 @@ class Perception3DEstimator:
         )
         confidence = max(0.0, min(1.0, confidence))
         return ObjectEstimate3D(
-            detection.class_id,
-            filtered_point,
-            confidence,
-            output_frame,
-            timestamp_ns,
+            class_id=detection.class_id,
+            position_xyz=filtered_point,
+            confidence=confidence,
+            frame_id=output_frame,
+            timestamp_ns=timestamp_ns,
             valid=True,
             failure_reason=(
                 "heuristic center approximation "
                 "(surface-to-center not validated)"
             ),
+            object_id=track_key,
+            orientation_xyzw=None,
+            # _dims第三轴是相机视线近似深度；随机yaw下不能冒充物体局部XYZ尺寸。
+            size_xyz_m=None,
         )
 
     def _surface_probe(
@@ -1094,6 +1099,7 @@ class Perception3DEstimator:
 
         假设物体深度轴近似与相机 Z 轴对齐；已知物体沿视线深度时，把 Z 后移半深，
         同时等比例放大 X/Y 以保持点位于同一光学射线上。未知尺寸或非正 Z 不补偿。
+        此处维度不随随机yaw交换，也不输出为 ``ObjectEstimate3D.size_xyz_m``。
         """
 
         x, y, z = camera_point
@@ -1484,13 +1490,16 @@ class Perception3DEstimator:
         """构造不可用的诊断结果；零坐标仅作为无效值占位，绝不标记成功。"""
 
         return ObjectEstimate3D(
-            class_id,
-            (0.0, 0.0, 0.0),
-            0.0,
-            output_frame,
-            timestamp_ns,
+            class_id=class_id,
+            position_xyz=(0.0, 0.0, 0.0),
+            confidence=0.0,
+            frame_id=output_frame,
+            timestamp_ns=timestamp_ns,
             valid=False,
             failure_reason=reason,
+            object_id=None,
+            orientation_xyzw=None,
+            size_xyz_m=None,
         )
 
 

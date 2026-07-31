@@ -24,6 +24,8 @@ import math
 from numbers import Real
 
 from .interfaces import (
+    ArmMotionPhase,
+    GlobalPhase,
     JointTrajectory,
     LocalPhase,
     ManipulationCommand,
@@ -63,22 +65,80 @@ def _finite_vector_error(values: object, expected_length: int, name: str) -> str
     return ""
 
 
-def _trajectory_error(trajectory: JointTrajectory) -> str:
+def _trajectory_error(trajectory: object) -> str:
     """防御性检查公共轨迹，防止损坏对象进入未来的控制循环。"""
 
-    if not trajectory.valid:
-        return trajectory.failure_reason or "轨迹标记为无效"
-    if not isinstance(trajectory.trajectory_id, str) or not trajectory.trajectory_id.strip():
+    if not isinstance(trajectory, JointTrajectory):
+        return "trajectory必须是JointTrajectory实例"
+    valid = getattr(trajectory, "valid", None)
+    if type(valid) is not bool:
+        return "valid必须是严格bool"
+    timestamp_ns = getattr(trajectory, "timestamp_ns", None)
+    if type(timestamp_ns) is not int or timestamp_ns < 0:
+        return "timestamp_ns必须是非负整数且不能是bool"
+    task_id = getattr(trajectory, "task_id", None)
+    if type(task_id) is not int or task_id < 0:
+        return "task_id必须是非负整数且不能是bool"
+    execution_phase = getattr(trajectory, "execution_phase", None)
+    if not isinstance(execution_phase, GlobalPhase):
+        return "execution_phase必须严格使用GlobalPhase"
+    if execution_phase not in {
+        GlobalPhase.EXECUTE_PICK,
+        GlobalPhase.EXECUTE_PLACE,
+    }:
+        return "execution_phase只能是EXECUTE_PICK或EXECUTE_PLACE"
+    failure_reason = getattr(trajectory, "failure_reason", None)
+    if not valid:
+        if not isinstance(failure_reason, str) or not failure_reason.strip():
+            return "无效轨迹必须提供非空failure_reason"
+        return failure_reason
+
+    trajectory_id = getattr(trajectory, "trajectory_id", None)
+    if not isinstance(trajectory_id, str) or not trajectory_id.strip():
         return "trajectory_id必须是非空字符串"
+    target_body = getattr(trajectory, "target_body", None)
+    if not isinstance(target_body, str) or not target_body.strip():
+        return "target_body必须是非空字符串"
+    if not isinstance(failure_reason, str) or failure_reason:
+        return "有效轨迹的failure_reason必须是空字符串"
     try:
-        waypoints = tuple(trajectory.waypoints)
+        waypoints = tuple(getattr(trajectory, "waypoints", None))
     except (TypeError, ValueError, OverflowError):
         return "waypoints必须是非空可迭代路点序列"
     if not waypoints:
         return "轨迹不能为空"
 
+    required_phases = (
+        (
+            ArmMotionPhase.PREGRASP,
+            ArmMotionPhase.GRASP,
+            ArmMotionPhase.LIFT,
+            ArmMotionPhase.RETREAT,
+        )
+        if execution_phase is GlobalPhase.EXECUTE_PICK
+        else (
+            ArmMotionPhase.PREPLACE,
+            ArmMotionPhase.LOWER,
+            ArmMotionPhase.RELEASE,
+            ArmMotionPhase.POST_RELEASE_RETREAT,
+        )
+    )
+    phase_indices = {phase: index for index, phase in enumerate(required_phases)}
+
     previous_time: float | None = None
+    previous_phase_index = 0
+    observed_phases: set[ArmMotionPhase] = set()
     for waypoint_index, waypoint in enumerate(waypoints):
+        phase = getattr(waypoint, "phase", None)
+        if not isinstance(phase, ArmMotionPhase):
+            return f"waypoints[{waypoint_index}].phase必须是ArmMotionPhase"
+        if phase not in phase_indices:
+            return f"{execution_phase.value}轨迹不允许阶段{phase.value}"
+        phase_index = phase_indices[phase]
+        if phase_index < previous_phase_index:
+            return "waypoints.phase只能按规定顺序前进，不得倒退"
+        previous_phase_index = phase_index
+        observed_phases.add(phase)
         time_value = getattr(waypoint, "time_from_start_s", None)
         if isinstance(time_value, bool) or not isinstance(time_value, Real):
             return f"waypoints[{waypoint_index}].time_from_start_s必须是真实有限数"
@@ -108,7 +168,17 @@ def _trajectory_error(trajectory: JointTrajectory) -> str:
             return f"waypoints[{waypoint_index}].controlled_mask必须恰好包含17项"
         if any(type(item) is not bool for item in mask_items):
             return f"waypoints[{waypoint_index}].controlled_mask每项都必须是真正bool"
+        if not any(mask_items):
+            return f"waypoints[{waypoint_index}].controlled_mask至少一项必须为True"
+    missing = tuple(phase.value for phase in required_phases if phase not in observed_phases)
+    if missing:
+        return f"轨迹缺少必要阶段：{missing}"
     return ""
+
+
+def _safe_trajectory_timestamp(trajectory: object) -> int:
+    value = getattr(trajectory, "timestamp_ns", None)
+    return value if type(value) is int and value >= 0 else 0
 
 
 class ArmExecutionController:
@@ -121,9 +191,10 @@ class ArmExecutionController:
     ``RETREAT`` 撤离，``TRANSPORT_HOLD`` 运输保持，``MOVE_PREPLACE`` 到预放姿态，
     ``LOWER_OBJECT`` 下放，``RELEASE`` 释放，``STOW`` 收回，``FAILED`` 表示局部执行失败。
 
-    这些枚举值存在不等于流程已经实现。当前 ``JointTrajectory`` 没有标明“抓取/放置”
-    或起始局部阶段，所以仅装载轨迹时保持中性的 ``IDLE``，不能猜成
-    ``MOVE_PREGRASP``。完整阶段推进仍由 ``step`` 的后续实现负责。
+    这些枚举值存在不等于流程已经实现。``JointTrajectory.execution_phase`` 与路点的
+    ``ArmMotionPhase`` 只描述规划目标，不表示执行器已经进入对应 ``LocalPhase``；本次
+    仅校验字段，装载后保持中性的 ``IDLE``，且不新增两种阶段的运行时映射。完整阶段
+    推进仍由 ``step`` 的后续实现负责。
 
     """
 
@@ -188,6 +259,7 @@ class ArmExecutionController:
         装载采用原子语义：先清除旧轨迹的索引、开始时间、稳定计数和验证缓存，再保存
         通过检查的新轨迹。拒绝新轨迹时同样清除旧执行上下文，避免下一周期误执行旧动作。
         ``LOADED`` 只表示轨迹已经保存，尚未开始插值，更不表示机器人到位。
+        损坏对象的时间字段不合法或缺失时，拒绝状态使用安全诊断时间0。
         """
 
         failure_reason = _trajectory_error(trajectory)
@@ -201,7 +273,7 @@ class ArmExecutionController:
                 max_joint_error=float("inf"),
                 success=False,
                 failure_reason=failure_reason,
-                timestamp_ns=trajectory.timestamp_ns,
+                timestamp_ns=_safe_trajectory_timestamp(trajectory),
             )
         self.reset()
         self._trajectory = trajectory
@@ -212,7 +284,7 @@ class ArmExecutionController:
             max_joint_error=float("inf"),
             success=False,
             failure_reason="轨迹已装载，但插值执行尚未开始",
-            timestamp_ns=trajectory.timestamp_ns,
+            timestamp_ns=_safe_trajectory_timestamp(trajectory),
         )
 
     def reset(self) -> None:

@@ -24,6 +24,7 @@ MMK2Kdl 适配与规划骨架；同时静态检查少量 config/launch 约定。
 """
 
 import math
+from dataclasses import replace
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -36,14 +37,20 @@ import yaml
 import team_sorting.perception_3d as perception_3d_module
 from team_sorting.arm_planning import ArmPlanner, OfficialKDLAdapter, _pose_to_matrix
 from team_sorting.interfaces import (
+    ArmPlanningConfig,
+    ArmMotionPhase,
     BaseState,
     CameraIntrinsics,
     Detection2D,
     DepthFrame,
+    GraspContext,
+    GraspTarget,
     NavGoal,
     ObjectEstimate3D,
+    PlaceTarget,
     Pose3D,
     RobotJointState,
+    RigidTransform3D,
     SlotType,
     TaskSpec,
 )
@@ -63,7 +70,13 @@ from team_sorting.perception_3d import (
     median_depth_m,
     project_pixel_to_camera,
 )
-from team_sorting.ros_nodes import _perception_pipeline_from_config
+from team_sorting.ros_nodes import (
+    _arm_planning_config_from_config,
+    _estimates_from_vision,
+    _estimates_to_vision,
+    _perception_pipeline_from_config,
+    _validate_vision_schema,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -398,7 +411,17 @@ def _nav_base(
 
 
 def _nav_task(place: tuple[float, float, float] = (2.0, 0.0, 0.5)) -> TaskSpec:
-    return TaskSpec(1, "move box", "box", "box_body", "pink", "point", place, 0.1)
+    return TaskSpec(
+        task_id=1,
+        instruction="move box",
+        target_kind="box",
+        target_body="box_body",
+        target_color="pink",
+        place_type="table_point",
+        place_world_xyz=place,
+        place_frame_id="world",
+        place_radius=0.1,
+    )
 
 
 def _nav_goal(
@@ -620,10 +643,9 @@ def test_projection_and_delayed_adapters_import_without_official_environment() -
     adapters = (OfficialYoloAdapter(), CameraTransformProvider(), OfficialKDLAdapter())
     assert all(adapter is not None for adapter in adapters)
     with pytest.raises(NotImplementedError, match="机械臂1负责人"):
-        ArmPlanner(OfficialKDLAdapter()).plan_grasp(
-            ObjectEstimate3D("yellow", (0.4, 0.0, 0.8), 0.8, "base_link", 10),
-            _actual_joints(),
-        )
+            ArmPlanner(OfficialKDLAdapter(), ArmPlanningConfig()).plan_grasp(
+                None, None, None, None, None, 0  # type: ignore[arg-type]
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1213,8 +1235,28 @@ def test_perception_3d_single_frame_world_coordinate_and_timestamp() -> None:
     assert result.position_xyz == pytest.approx((1.0, 2.0, 4.1))
     assert result.frame_id == "odom"
     assert result.timestamp_ns == 100
+    assert result.size_xyz_m is None
     assert "heuristic center approximation" in result.failure_reason
     assert estimator._tracks == {}
+
+
+def test_perception_dimensions_only_compensate_center_not_local_size_axes() -> None:
+    estimator = Perception3DEstimator(
+        _OffsetTransformProvider(),
+        converge_frames=1,
+        object_dimensions_m={"pink": (0.11, 0.22, 0.33)},
+    )
+    result = estimator.estimate(
+        (_estimator_detection(track_id=9),),
+        _estimator_depth(1000.0, 100),
+        _intrinsics(timestamp_ns=100),
+        _base(),
+        _actual_joints(),
+    )[0]
+    assert result.valid
+    assert result.position_xyz[2] == pytest.approx(1.165)
+    assert result.size_xyz_m is None
+    assert estimator._dims["pink"] == (0.11, 0.22, 0.33)
 
 
 def test_perception_3d_depth_failure_is_invalid_without_stopping_batch() -> None:
@@ -2777,6 +2819,10 @@ def test_kdl_legal_actual_position_and_valid_state_reaches_solver() -> None:
 
 @pytest.mark.parametrize("frame_id", ["base_link", "base_footprint", "world", "odom", ""])
 def test_kdl_solve_rejects_unconverted_or_unconfirmed_frames(frame_id: str) -> None:
+    if not frame_id:
+        with pytest.raises(ValueError, match="frame_id"):
+            _arm_target(frame_id)
+        return
     adapter = OfficialKDLAdapter()
     adapter._solver = _RecordingKDL(solutions=((0.1, 1, 2, 3, 4, 5, 6),))
     result = adapter.solve_ik(_planning_joints(), left_target=_arm_target(frame_id))
@@ -2899,6 +2945,18 @@ def test_kdl_rejects_malformed_or_inconsistent_solutions(
 # ---------------------------------------------------------------------------
 
 
+def _damaged_pose(
+    position: object = (0.1, 0.2, 0.3),
+    orientation: object = (0.0, 0.0, 0.0, 1.0),
+    frame_id: object = "footprint",
+) -> Pose3D:
+    pose = object.__new__(Pose3D)
+    object.__setattr__(pose, "position_xyz", position)
+    object.__setattr__(pose, "orientation_xyzw", orientation)
+    object.__setattr__(pose, "frame_id", frame_id)
+    return pose
+
+
 @pytest.mark.parametrize(
     "position",
     [
@@ -2911,7 +2969,7 @@ def test_kdl_rejects_malformed_or_inconsistent_solutions(
     ],
 )
 def test_pose_to_matrix_rejects_invalid_position(position: object) -> None:
-    pose = Pose3D(position, (0.0, 0.0, 0.0, 1.0), "footprint")  # type: ignore[arg-type]
+    pose = _damaged_pose(position=position)
     with pytest.raises(ValueError, match="position_xyz"):
         _pose_to_matrix(pose, np)
 
@@ -2928,25 +2986,66 @@ def test_pose_to_matrix_rejects_invalid_position(position: object) -> None:
     ],
 )
 def test_pose_to_matrix_rejects_invalid_orientation(orientation: object) -> None:
-    pose = Pose3D((0.1, 0.2, 0.3), orientation, "footprint")  # type: ignore[arg-type]
+    pose = _damaged_pose(orientation=orientation)
     with pytest.raises(ValueError, match="orientation_xyzw"):
         _pose_to_matrix(pose, np)
 
 
 def test_pose_to_matrix_rejects_zero_norm_quaternion() -> None:
-    pose = Pose3D((0.1, 0.2, 0.3), (0.0, 0.0, 0.0, 0.0), "footprint")
+    pose = _damaged_pose(orientation=(0.0, 0.0, 0.0, 0.0))
     with pytest.raises(ValueError, match="范数为零"):
         _pose_to_matrix(pose, np)
 
 
 def test_pose_to_matrix_normalizes_identity_quaternion_and_translation() -> None:
     pose = Pose3D((0.1, -0.2, 0.3), (0.0, 0.0, 0.0, 2.0), "footprint")
+    assert pose.orientation_xyzw == (0.0, 0.0, 0.0, 1.0)
     matrix = _pose_to_matrix(pose, np)
     assert matrix.shape == (4, 4)
     assert np.isfinite(matrix).all()
     assert matrix[:3, :3] == pytest.approx(np.eye(3))
     assert matrix[:3, 3] == pytest.approx((0.1, -0.2, 0.3))
     assert matrix[3, :] == pytest.approx((0.0, 0.0, 0.0, 1.0))
+
+
+@pytest.mark.parametrize("position", [(math.nan, 0, 0), (True, 0, 0)])
+def test_pose3d_constructor_rejects_invalid_position(position: object) -> None:
+    with pytest.raises(ValueError, match="position_xyz"):
+        Pose3D(position, (0, 0, 0, 1), "footprint")  # type: ignore[arg-type]
+
+
+def test_strict_vectors_reject_numeric_strings_and_normalize_integers() -> None:
+    with pytest.raises(ValueError, match="numbers.Real"):
+        Pose3D(("1", "2", "3"), (0, 0, 0, 1), "footprint")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="numbers.Real"):
+        Pose3D((1, 2, 3), ("0", "0", "0", "1"), "footprint")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="numbers.Real"):
+        RigidTransform3D(
+            "camera", "world", ("1", "2", "3"), (0, 0, 0, 1), 1, True
+        )  # type: ignore[arg-type]
+    pose = Pose3D((1, 2, 3), (0, 0, 0, 2), "footprint")
+    assert pose.position_xyz == (1.0, 2.0, 3.0)
+    assert pose.orientation_xyzw == (0.0, 0.0, 0.0, 1.0)
+
+
+def test_pose3d_constructor_rejects_zero_quaternion_and_empty_frame() -> None:
+    with pytest.raises(ValueError, match="范数"):
+        Pose3D((0, 0, 0), (0, 0, 0, 0), "footprint")
+    with pytest.raises(ValueError, match="frame_id"):
+        Pose3D((0, 0, 0), (0, 0, 0, 1), "  ")
+
+
+def test_valid_targets_reject_damaged_pose_objects() -> None:
+    damaged = _damaged_pose(position=(math.nan, 0.0, 0.0))
+    with pytest.raises(ValueError, match="损坏"):
+        GraspTarget(
+            damaged, damaged, damaged, damaged, damaged, damaged, damaged, damaged,
+            None, 0.8,
+        )
+    with pytest.raises(ValueError, match="损坏"):
+        PlaceTarget(
+            damaged, damaged, damaged, damaged, damaged, damaged, damaged, 0.0
+        )
 
 
 def test_pose_to_matrix_known_ninety_degree_rotation() -> None:
@@ -2964,13 +3063,378 @@ def test_pose_to_matrix_known_ninety_degree_rotation() -> None:
 # ArmPlanner临时未实现约束
 # ---------------------------------------------------------------------------
 
+
+class _VisionStamp:
+    def __init__(self) -> None:
+        self.sec = 0
+        self.nanosec = 0
+
+
+class _VisionHeader:
+    def __init__(self) -> None:
+        self.frame_id = ""
+        self.stamp = _VisionStamp()
+
+
+class _VisionVector3:
+    def __init__(self) -> None:
+        self.x = self.y = self.z = 0.0
+
+
+class _VisionQuaternion(_VisionVector3):
+    def __init__(self) -> None:
+        super().__init__()
+        self.w = 0.0
+
+
+class _VisionPose:
+    def __init__(self) -> None:
+        self.position = _VisionVector3()
+        self.orientation = _VisionQuaternion()
+
+
+class _VisionHypothesis:
+    def __init__(self) -> None:
+        self.class_id = ""
+        self.score = 0.0
+
+
+class _VisionResult:
+    def __init__(self) -> None:
+        self.hypothesis = _VisionHypothesis()
+        self.pose = SimpleNamespace(pose=_VisionPose())
+
+
+class _VisionDetection:
+    def __init__(self) -> None:
+        self.header = _VisionHeader()
+        self.id = ""
+        self.bbox = SimpleNamespace(size=_VisionVector3())
+        self.results: list[object] = []
+
+
+class _VisionArray:
+    def __init__(self) -> None:
+        self.header = _VisionHeader()
+        self.detections: list[object] = []
+
+
+def _vision_types() -> SimpleNamespace:
+    return SimpleNamespace(
+        Detection3DArray=_VisionArray,
+        Detection3D=_VisionDetection,
+        ObjectHypothesisWithPose=_VisionResult,
+    )
+
+
+def _gripper_config_fields() -> dict[str, object]:
+    return {
+        "max_slide_waypoint_delta_m": 0.1,
+        "max_arm_waypoint_delta_rad": 0.2,
+        "max_gripper_waypoint_delta": 0.1,
+        "left_gripper_min": 0.0,
+        "left_gripper_max": 1.0,
+        "right_gripper_min": 0.0,
+        "right_gripper_max": 1.0,
+        "left_gripper_open": 0.9,
+        "left_gripper_closed": 0.2,
+        "right_gripper_open": 0.9,
+        "right_gripper_closed": 0.2,
+        "gripper_verified_in_official_environment": True,
+    }
+
+
+def test_task_spec_valid_and_invalid_contracts_are_distinct() -> None:
+    invalid = TaskSpec(
+        task_id=3,
+        instruction="无法解析",
+        target_kind="",
+        target_body="",
+        target_color="",
+        valid=False,
+        failure_reason="缺少官方放置字段",
+    )
+    assert invalid.place_world_xyz is None and invalid.place_frame_id == ""
+
+    with pytest.raises(ValueError, match="target_kind"):
+        replace(invalid, valid=True, failure_reason="")
+    with pytest.raises(ValueError, match="place_frame_id"):
+        TaskSpec(3, "x", "box", "box", "pink", "table_point", (1, 2, 3), "", 0.1)
+
+
+@pytest.mark.parametrize(
+    "field_name", ["instruction", "target_kind", "target_body", "target_color"]
+)
+def test_valid_task_spec_requires_all_official_identity_fields(field_name: str) -> None:
+    values = {
+        "task_id": 1,
+        "instruction": "把粉色箱体放到桌面点",
+        "target_kind": "cuboid_box",
+        "target_body": "box_pink",
+        "target_color": "pink",
+        "place_type": "table_point",
+        "place_world_xyz": (1.0, 2.0, 0.8),
+        "place_frame_id": "world",
+        "place_radius": 0.1,
+    }
+    values[field_name] = ""
+    with pytest.raises(ValueError, match=field_name):
+        TaskSpec(**values)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("place_type", ["shelf_point", "table_point"])
+def test_task_spec_accepts_only_official_point_types(place_type: str) -> None:
+    task = TaskSpec(
+        1, "move", "box", "box", "pink", place_type,
+        (1.0, 2.0, 3.0), "world", 0.1,
+    )
+    assert task.place_type == place_type
+    with pytest.raises(ValueError, match="不得携带"):
+        replace(task, direction="left")
+
+
+def test_object_estimate_optional_perception_facts_remain_optional() -> None:
+    estimate = ObjectEstimate3D("pink", (1, 2, 3), 0.8, "odom", 4)
+    assert estimate.object_id is None
+    assert estimate.orientation_xyzw is None
+    assert estimate.size_xyz_m is None
+    assert not hasattr(estimate, "target_body")
+
+
+def test_rigid_transform_normalizes_and_enforces_same_frame_identity() -> None:
+    transform = RigidTransform3D(
+        "camera", "world", (1, 2, 3), (0, 0, 0, 2), 10, True
+    )
+    assert transform.rotation_xyzw == (0.0, 0.0, 0.0, 1.0)
+    assert RigidTransform3D(
+        "world", "world", (0, 0, 0), (0, 0, 0, -2), 10, True
+    ).rotation_xyzw == (0.0, 0.0, 0.0, -1.0)
+    with pytest.raises(ValueError, match="同frame"):
+        RigidTransform3D("world", "world", (0.01, 0, 0), (0, 0, 0, 1), 10, True)
+    invalid = RigidTransform3D("camera", "world", None, None, 10, False, "TF缺失")
+    assert invalid.translation_xyz is invalid.rotation_xyzw is None
+
+
+def test_rigid_transform_normalizes_frame_whitespace_before_identity_check() -> None:
+    transform = RigidTransform3D(
+        " world ", " world ", (0, 0, 0), (0, 0, 0, 2), 10, True
+    )
+    assert transform.source_frame == transform.target_frame == "world"
+    slash = RigidTransform3D(
+        " /odom ", " footprint ", (0, 0, 0), (0, 0, 0, 1), 10, True
+    )
+    assert slash.source_frame == "/odom"
+    assert slash.target_frame == "footprint"
+    with pytest.raises(ValueError, match="同frame"):
+        RigidTransform3D(
+            " world ", "world", (0.01, 0, 0), (0, 0, 0, 1), 10, True
+        )
+
+
+def test_arm_planning_config_validates_grasp_without_place_calibration() -> None:
+    config = ArmPlanningConfig(
+        min_object_confidence=0.7,
+        transform_max_age_ns=100,
+        object_estimate_max_age_ns=100,
+        joint_state_max_age_ns=100,
+        planned_context_max_age_ns=100,
+        pregrasp_distance_m=0.1,
+        grasp_contact_offset_m=0.0,
+        lift_distance_m=0.1,
+        retreat_distance_m=0.1,
+        pregrasp_duration_s=1.0,
+        grasp_duration_s=1.0,
+        lift_duration_s=1.0,
+        retreat_duration_s=1.0,
+        **_gripper_config_fields(),
+    )
+    config.validate_for_grasp()
+    with pytest.raises(ValueError, match="confirmed_context_max_age_ns"):
+        config.validate_for_place()
+
+
+def test_arm_planning_config_validates_place_without_grasp_calibration() -> None:
+    config = ArmPlanningConfig(
+        transform_max_age_ns=100,
+        joint_state_max_age_ns=100,
+        confirmed_context_max_age_ns=100,
+        preplace_height_m=0.1,
+        release_offset_m=0.0,
+        post_release_retreat_distance_m=0.1,
+        settle_time_s=0.0,
+        preplace_duration_s=1.0,
+        lower_duration_s=1.0,
+        release_duration_s=1.0,
+        post_release_retreat_duration_s=1.0,
+        **_gripper_config_fields(),
+    )
+    config.validate_for_place()
+    with pytest.raises(ValueError, match="min_object_confidence"):
+        config.validate_for_grasp()
+
+
+def test_arm_planning_config_yaml_is_disabled_and_uncalibrated() -> None:
+    config = yaml.safe_load((Path(__file__).parents[1] / "config/config.yaml").read_text())
+    enabled, planning = _arm_planning_config_from_config(config)
+    arm = config["arm_planning"]
+    assert enabled is False
+    assert isinstance(planning, ArmPlanningConfig)
+    assert planning.gripper_verified_in_official_environment is False
+    assert planning.left_gripper_min == planning.right_gripper_min == 0.0
+    assert planning.left_gripper_max == planning.right_gripper_max == 1.0
+    assert planning.left_gripper_open is planning.left_gripper_closed is None
+    assert planning.right_gripper_open is planning.right_gripper_closed is None
+    assert all(
+        value is None
+        for key, value in arm.items()
+        if key not in {
+            "enabled",
+            "gripper_verified_in_official_environment",
+            "left_gripper_min",
+            "left_gripper_max",
+            "right_gripper_min",
+            "right_gripper_max",
+        }
+    )
+    with pytest.raises(ValueError):
+        planning.validate_for_grasp()
+    with pytest.raises(ValueError):
+        planning.validate_for_place()
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"left_gripper_min": -0.1, "left_gripper_max": 1.0},
+        {"right_gripper_min": 0.0, "right_gripper_max": 1.1},
+        {"left_gripper_min": -1.0, "left_gripper_max": 1.0},
+        {"right_gripper_min": 0.0, "right_gripper_max": 2.0},
+    ],
+)
+def test_arm_planning_config_rejects_gripper_range_outside_official_ctrlrange(
+    overrides: dict[str, float],
+) -> None:
+    with pytest.raises(ValueError, match=r"ctrlrange \[0, 1\]"):
+        ArmPlanningConfig(**overrides)
+
+
+def test_arm_planning_config_accepts_official_gripper_ctrlrange() -> None:
+    config = ArmPlanningConfig(
+        left_gripper_min=0.0,
+        left_gripper_max=1.0,
+        right_gripper_min=0.0,
+        right_gripper_max=1.0,
+    )
+    assert config.left_gripper_min == config.right_gripper_min == 0.0
+    assert config.left_gripper_max == config.right_gripper_max == 1.0
+
+
+@pytest.mark.parametrize("enabled", [0, 1, "false"])
+def test_arm_planning_config_reader_rejects_non_bool_enabled(enabled: object) -> None:
+    config = yaml.safe_load((Path(__file__).parents[1] / "config/config.yaml").read_text())
+    config["arm_planning"]["enabled"] = enabled
+    with pytest.raises(ValueError, match="enabled"):
+        _arm_planning_config_from_config(config)
+
+
+def test_arm_planning_config_reader_rejects_bad_section_unknown_and_value() -> None:
+    config = yaml.safe_load((Path(__file__).parents[1] / "config/config.yaml").read_text())
+    with pytest.raises(ValueError, match="config 必须是 Mapping"):
+        _arm_planning_config_from_config([])  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="Mapping"):
+        _arm_planning_config_from_config({"arm_planning": []})
+
+    config["arm_planning"]["typo_distance"] = None
+    with pytest.raises(ValueError, match="未知字段"):
+        _arm_planning_config_from_config(config)
+    del config["arm_planning"]["typo_distance"]
+
+    config["arm_planning"]["pregrasp_distance_m"] = -0.1
+    with pytest.raises(ValueError, match="pregrasp_distance_m"):
+        _arm_planning_config_from_config(config)
+
+
+def test_arm_planning_config_reader_rejects_missing_explicit_null_field() -> None:
+    config = yaml.safe_load((Path(__file__).parents[1] / "config/config.yaml").read_text())
+    del config["arm_planning"]["pregrasp_distance_m"]
+    with pytest.raises(ValueError, match="缺少显式字段"):
+        _arm_planning_config_from_config(config)
+
+
+def test_arm_planning_enabled_does_not_fake_operation_calibration() -> None:
+    config = yaml.safe_load((Path(__file__).parents[1] / "config/config.yaml").read_text())
+    config["arm_planning"]["enabled"] = True
+    enabled, planning = _arm_planning_config_from_config(config)
+    assert enabled is True
+    with pytest.raises(ValueError, match="min_object_confidence"):
+        planning.validate_for_grasp()
+    with pytest.raises(ValueError, match="transform_max_age_ns"):
+        planning.validate_for_place()
+
+
+def test_grasp_context_confirmation_does_not_change_planned_relations() -> None:
+    left = RigidTransform3D("left_gripper", "object-7", (0.1, 0, 0), (0, 0, 0, 1), 20, True)
+    right = RigidTransform3D("right_gripper", "object-7", (-0.1, 0, 0), (0, 0, 0, 1), 20, True)
+    planned = GraspContext(
+        1, " box_body ", " pink ", " stable:7 ", " object-7 ", (0.24, 0.16, 0.19),
+        left, right, (0, 0, 0, 1), 20, 21, None, False, True,
+    )
+    assert (
+        planned.target_body,
+        planned.target_class_id,
+        planned.object_id,
+        planned.object_frame,
+    ) == ("box_body", "pink", "stable:7", "object-7")
+    confirmed = replace(planned, confirmed=True, confirmed_at_ns=30)
+    assert confirmed.object_from_left_gripper is left
+    assert confirmed.object_from_right_gripper is right
+
+
+def test_ros_unknown_orientation_and_size_round_trip_as_none() -> None:
+    ros = _vision_types()
+    _validate_vision_schema(ros)
+    estimate = ObjectEstimate3D(
+        "pink", (1, 2, 3), 0.9, "odom", 123,
+        object_id="stable:7", orientation_xyzw=None, size_xyz_m=None,
+    )
+    message = _estimates_to_vision((estimate,), ros, _VisionStamp())
+    pose = message.detections[0].results[0].pose.pose
+    assert (pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w) == (0, 0, 0, 0)
+    assert tuple(vars(message.detections[0].bbox.size).values()) == (0, 0, 0)
+    decoded = _estimates_from_vision(message)[0]
+    assert decoded.orientation_xyzw is None and decoded.size_xyz_m is None
+    assert decoded.object_id == "stable:7"
+
+
+def test_ros_observed_orientation_and_size_round_trip_normalized() -> None:
+    estimate = ObjectEstimate3D(
+        "pink", (1, 2, 3), 0.9, "odom", 123,
+        orientation_xyzw=(0, 0, 0, 2), size_xyz_m=(0.24, 0.16, 0.19),
+    )
+    decoded = _estimates_from_vision(
+        _estimates_to_vision((estimate,), _vision_types(), _VisionStamp())
+    )[0]
+    assert decoded.orientation_xyzw == (0.0, 0.0, 0.0, 1.0)
+    assert decoded.size_xyz_m == pytest.approx((0.24, 0.16, 0.19))
+
+
+def test_ros_rejects_partial_zero_size_sentinel() -> None:
+    message = _estimates_to_vision(
+        (ObjectEstimate3D("pink", (1, 2, 3), 0.9, "odom", 123),),
+        _vision_types(),
+        _VisionStamp(),
+    )
+    message.detections[0].bbox.size.x = 0.2
+    with pytest.raises(ValueError, match="全零或三轴均为正数"):
+        _estimates_from_vision(message)
+
 # 当前作用：防止抓放Pose和轨迹尚未实现时返回零路点、空轨迹或伪成功。
 # TODO(arm-planner-implementation)：plan_grasp/plan_place真正实现时，必须在同一提交中
 # 替换为抓取Pose、多阶段IK、17维路点、不可达失败和放置上下文测试；生产方法仍未实现
 # 时不得删除本组。
 def test_arm_planner_methods_remain_explicitly_unimplemented() -> None:
     fake_adapter = _InjectedIKAdapter()
-    planner = ArmPlanner(fake_adapter)  # type: ignore[arg-type]
+    planner = ArmPlanner(fake_adapter, ArmPlanningConfig())  # type: ignore[arg-type]
     assert planner._ik_adapter is fake_adapter
     assert not fake_adapter.self_check_called
     joints = _planning_joints()
@@ -2981,16 +3445,17 @@ def test_arm_planner_methods_remain_explicitly_unimplemented() -> None:
         target_kind="box",
         target_body="box_body",
         target_color="pink",
-        place_type="point",
+        place_type="table_point",
         place_world_xyz=(2.0, 3.0, 0.5),
+        place_frame_id="world",
         place_radius=0.1,
     )
     with pytest.raises(NotImplementedError, match="机械臂1负责人"):
-        planner.plan_grasp(target, joints)
+        planner.plan_grasp(task, target, None, None, joints, 100)  # type: ignore[arg-type]
     with pytest.raises(NotImplementedError, match="机械臂1负责人"):
-        planner.plan_place(task, joints)
+        planner.plan_place(task, None, None, joints, 100)  # type: ignore[arg-type]
 
 
 def test_arm_planner_rejects_dependency_without_solve_ik() -> None:
     with pytest.raises(TypeError, match="solve_ik"):
-        ArmPlanner(object())  # type: ignore[arg-type]
+        ArmPlanner(object(), ArmPlanningConfig())  # type: ignore[arg-type]

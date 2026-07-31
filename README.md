@@ -132,8 +132,10 @@ ROS 2 节点可以理解为一个独立运行、通过话题交换消息的程�
   `/head_camera/color/camera_info`、Odom `/slamware_ros_sdk_server_node/odom`、
   `/joint_states`。RGB 与 Depth 近似同步；Odom 和 JointState 取时间上最近且未超出容差的值。
 - **发布**：`/team/object_estimates`，类型为
-  `vision_msgs/msg/Detection3DArray`，载荷包含类别、三维位置、置信度、时间和坐标系；
-  `slot_type` 不通过该消息传输。
+  `vision_msgs/msg/Detection3DArray`，载荷包含类别、稳定身份（可用时）、三维中心、
+  可选姿态/尺寸、置信度、时间和坐标系；`slot_type` 不通过该消息传输。团队内部适配
+  约定以零四元数表示“姿态不可用”、全零 `bbox.size` 表示“尺寸不可用”，接收时恢复
+  为 `None`；零四元数绝不归一化为单位姿态。该哨兵不是官方协议。
 - **调用**：`perception_2d.py` 的 `OfficialYoloAdapter` 与
   `Detection2DStabilizer`，`perception_3d.py` 的 `CameraTransformProvider` 与
   `Perception3DEstimator`，以及 `interfaces.py` 中的感知接口。
@@ -263,16 +265,20 @@ Referee taskinfo / gameinfo / score
 
 | 接口 | 最关键的含义 |
 |---|---|
-| `TaskSpec` | `InstructionParser` 输出的结构化任务；包含目标属性与放置约束。`place_world_xyz` 是目标物体中心，不是夹爪末端位姿。 |
+| `TaskSpec` | `InstructionParser` 输出的结构化任务；有效任务只接受官方 `shelf_point`、`table_point`、`shelf_prop_side`，放置 frame 严格为 `world`。`place_world_xyz` 是目标物体中心，不是夹爪末端位姿。 |
 | `BaseState` | 来自 Odom 的底盘实际位置、姿态和速度；无效或过期时不能作为到达依据。 |
 | `RobotJointState` | `/joint_states` 映射出的 17 维**实际反馈**；它不是规划目标，也不是 IK 解。 |
 | `SensorSnapshot` | `team_client_node` 一个周期的轻量快照：任务、底盘、实际关节、三维目标；不含图像。 |
 | `Detection2D` | 图像像素坐标中的类别框、置信度、RGB frame 与时间；稳定器输出还携带非负 `track_id`，不带三维位置。 |
-| `ObjectEstimate3D` | 目标**物体中心的估计位置**、frame、时间、置信度和 `valid/failure_reason`；已按配置尺寸沿光学射线补偿可见表面点，但不是夹爪末端位姿。 |
+| `ObjectEstimate3D` | 纯感知事实：目标**物体中心估计**及可选 `object_id`、观测姿态、明确提供的物体局部 XYZ 尺寸；有效中心估计不要求三个可选事实存在，也不携带 `target_body`。当前三维估计器不生产尺寸。 |
+| `Pose3D` | 严格有效 Pose：向量项必须是非bool `numbers.Real`，三项位置有限、四元数归一化非零且 frame 非空；不接受数字字符串，不跨 frame 重命名。 |
 | `NavGoal` | 底盘在指定 frame 中的 XY、yaw 目标和容差；物体放置点不能直接当作停车点。 |
 | `BaseCommand` | 导航模块提交给 `ActionMux` 的短时有效速度**建议**，不是已经发送的动作。 |
 | `IKResult` | 官方 KDL 求得的 slide/左右臂**目标关节解**；不是 `RobotJointState` 的实际反馈。 |
-| `JointTrajectory` | 带相对时间的 17 维关节路点计划；它不证明轨迹已执行。 |
+| `RigidTransform3D` | 带 source/target frame、时间和失败语义的刚体变换快照；有效四元数会冻结为单位四元数，不自动交换 frame 求逆。 |
+| `GraspContext` | 计划的 object-to-gripper 关系、抓取时物体 world 姿态及执行确认。`confirmed` 只确认计划抓取成立，不把规划关系提升为真实测量标定。 |
+| `ArmPlanningConfig` | 允许未标定字段为 `None`，通过 `validate_for_grasp()` / `validate_for_place()` 分操作失败关闭；无笼统 `valid` 字段。 |
+| `JointTrajectory` | 绑定任务与严格 `GlobalPhase` 的17维计划；抓取必须完整按 PREGRASP→GRASP→LIFT→RETREAT，放置必须完整按 PREPLACE→LOWER→RELEASE→POST_RELEASE_RETREAT。无效轨迹为空且不伪造 `target_body`。 |
 | `ManipulationCommand` | 执行器在本周期提交的关节目标**建议**，`controlled_mask` 指明哪些关节可覆盖保持值。 |
 | `FSMStatus` | 当前全局/局部阶段、重试、成功和失败原因的遥测；只有 `DONE` 才表示 FSM 成功。 |
 | `FinalAction` | `ActionMux` 每周期生成的唯一 19 维最终动作对象；只有 `valid=True` 且经过 `OfficialCommandPublisher` 成功发布后，才能视为实际控制动作。 |
@@ -285,6 +291,35 @@ Referee taskinfo / gameinfo / score
 3. `BaseCommand` 和 `ManipulationCommand` 都只是模块建议；`ActionMux` 先生成
    `FinalAction`；`ActionMuxDecision`记录请求与接受关系，`ActionDispatchRecord`记录
    本地publisher调用事实。即使publisher正常返回，也不能称为Server已接受或机器人已执行。
+
+### 机械臂公共契约冻结（提交1）
+
+放置姿态采用“保持抓取时观测到的 world 姿态”这一唯一来源：感知提供合法物体姿态后，
+规划抓取生成 `GraspContext.object_orientation_world_xyzw_at_grasp`；执行器只能依据实际反馈
+确认或拒绝同一规划上下文。未来 `plan_place` 以 `TaskSpec.place_world_xyz` 为物体目标中心、
+以上下文姿态为物体目标方向，再由规划的 object-to-gripper 关系计算左右 release Pose。
+目标姿态缺失、上下文未确认/过期或 frame 不成立时必须失败关闭；不得补单位四元数、忽略
+yaw、根据颜色产生姿态，或把确认后的规划关系描述为真实测量。
+
+`class_id` 是感知类别，`object_id` 是可选稳定轨迹身份，`TaskSpec.target_body` 是官方任务
+中的物体 body 身份，三者不互相改名。未来 ROS 组装层必须依据当前任务与显式支持的类别
+关联选择唯一稳定目标，把完整 `TaskSpec` 与该目标一起传给 `plan_grasp`；零个候选、多个
+同等候选、身份不稳定或任务/类别不匹配均失败关闭。`perception_3d` 不读取当前任务语义。
+
+`ArmMotionPhase` 仅用于 `JointWaypoint` 的规划区段；`LocalPhase` 仍是执行器/FSM 的实时
+状态。提交1没有二者的运行时映射，没有推进 FSM，也没有生成或发布控制命令。
+有效路点至少控制一个关节；全False mask不能表示等待、停止或阶段标签。等待由带实际
+目标的路点时间表达，停止仍由正常安全控制链处理。
+
+有效 `TaskSpec` 必须保留官方提供的 `instruction`、`target_kind`、`target_body` 和
+`target_color`，不得从 task ID 或颜色规则反向补造。`ros_nodes` 对 `arm_planning`
+配置执行严格字段读取：总门必须为 bool、未知/缺失键拒绝、显式 null 保持 `None`；读取
+不会构造 `ArmPlanner`，未来调用方仍须按操作分别验证配置。
+
+左右夹爪 `min/max=[0,1]` 来自新版官方离线 `mmk2_control.xml` actuator
+`ctrlrange="0. 1."`，属于已冻结的控制硬范围。`open/closed` 仍为未标定 `null`，
+`gripper_verified_in_official_environment=false`；确认硬范围不代表开闭值或夹持效果已验证，
+所以抓取和放置操作验证继续失败关闭。
 
 ## 8. 19 维动作
 
@@ -428,7 +463,7 @@ orphan 规则见
 | `perception.stabilizer_2d.min_confirmed_hits` | `2` | 轨迹连续命中两帧后才输出稳定 `track_id` |
 | `perception.estimator_3d.ema_alpha` | `0.5` | 同一稳定 `track_id` 的三维中心 EMA 当前样本权重 |
 | `perception.estimator_3d.max_position_jump_m` | `1.0` | 单轨迹相邻三维中心最大允许跳变 |
-| `perception.estimator_3d.object_dimensions_m.*` | `[0.24, 0.16, 0.19]` | 三类包装盒完整宽/高/深，单位米 |
+| `perception.estimator_3d.object_dimensions_m.*` | `[0.24, 0.16, 0.19]` | 启发式中心补偿使用的宽、高、沿相机视线近似深度；不是物体局部XYZ尺寸 |
 | `recorder.enabled` | `false` | 默认不启动记录 |
 | `recorder.record_rosbag` | `true` | 启动 Recorder 时同时管理 rosbag |
 | `recorder.root_dir` | `./team_sorting_dataset` | Episode 根目录 |
@@ -440,9 +475,11 @@ orphan 规则见
 
 官方 `mono16` 深度图的原始数值单位按当前代码和测试约定为毫米，因此乘
 `depth_unit_scale_m=0.001` 转为米。例如原始值 `1200` 表示 `1.2 m`。
-三类尺寸来自正式 `material_sorting/mjcf/material_competition.xml` 中
-`movable_box size="0.12 0.08 0.095"` 的 MuJoCo 半尺寸，配置保存完整尺寸；
-当前中心补偿使用第三项作为沿相机视线的近似物体深度。
+三项初值来自正式 `material_sorting/mjcf/material_competition.xml` 中
+`movable_box size="0.12 0.08 0.095"` 的 MuJoCo 半尺寸，配置保存其两倍值；当前仅把
+第三项用于沿相机视线的启发式中心补偿。官方场景会随机改变箱体 yaw，因此这组值暂时
+不是经过 frame 语义确认的物体局部 XYZ 尺寸源，三维估计器输出 `size_xyz_m=None`。
+外部明确提供的合法局部尺寸仍可通过团队 ROS 适配往返；后续尺寸源需另行评审。
 
 `recorder.rosbag_topics` 当前逐项记录：
 

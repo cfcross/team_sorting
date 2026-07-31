@@ -314,6 +314,8 @@ class InstructionParser:
             target_color=target_color,
             place_type=place_type,
             place_world_xyz=place_world,
+            # 官方字段名已经明确其坐标语义；TaskSpec构造器不隐藏补默认frame。
+            place_frame_id="world",
             place_radius=place_radius,
             ref_prop=ref_prop,
             ref_prop_body=ref_prop_body,

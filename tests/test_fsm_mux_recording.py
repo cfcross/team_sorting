@@ -39,6 +39,7 @@ from team_sorting.arm_execution import ArmExecutionController
 from team_sorting.fsm import FSMEvent, GlobalFSM, InstructionParser
 from team_sorting.interfaces import (
     ACTION_NAMES,
+    ArmMotionPhase,
     BaseCommand,
     FSMStatus,
     GlobalPhase,
@@ -94,6 +95,21 @@ def _status(
         timestamp_ns=1_000,
     )
 
+
+def _official_task_data(**overrides: object) -> dict[str, object]:
+    task: dict[str, object] = {
+        "task_id": 1,
+        "instruction": "把粉色箱体放到桌面目标点",
+        "target_kind": "cuboid_box",
+        "target_body": "box_pink",
+        "target_color": "pink",
+        "place_type": "table_point",
+        "place_world": [1.0, 2.0, 0.8],
+        "place_radius": 0.1,
+    }
+    task.update(overrides)
+    return task
+
 def _loaded_fsm(
     max_pick_retries: int = 1,
     # ————————————————————————————————
@@ -102,14 +118,7 @@ def _loaded_fsm(
     phase_timeouts_ns: dict[GlobalPhase, int] | None = None,
     # ————————————————————————————————
 ) -> GlobalFSM:
-    raw = json.dumps(
-        {
-            "task_id": 1,
-            "target_body": "box",
-            "place_type": "world_point",
-            "place_world": [1.0, 2.0, 0.8],
-        }
-    )
+    raw = json.dumps(_official_task_data())
     task = InstructionParser().parse(raw, 100)[0]
     fsm = GlobalFSM(
         max_pick_retries=max_pick_retries,
@@ -132,8 +141,14 @@ def _advance(fsm: GlobalFSM, *events: FSMEvent, start_ns: int = 1_000) -> None:
 def _execution_waypoint(
     time_from_start_s: float = 0.0,
     controlled_mask: tuple[bool, ...] = (True,) * 17,
+    phase: ArmMotionPhase = ArmMotionPhase.PREGRASP,
 ) -> JointWaypoint:
-    return JointWaypoint(time_from_start_s, _joints().position, controlled_mask)
+    return JointWaypoint(
+        phase,
+        time_from_start_s,
+        _joints().position,
+        controlled_mask,
+    )
 
 
 def _execution_trajectory(
@@ -142,15 +157,34 @@ def _execution_trajectory(
     *,
     valid: bool = True,
     failure_reason: str = "",
+    execution_phase: object = GlobalPhase.EXECUTE_PICK,
+    target_body: str = "box",
 ) -> JointTrajectory:
-    selected_waypoints = (_execution_waypoint(),) if waypoints is None else waypoints
-    return JointTrajectory(
-        trajectory_id=trajectory_id,
-        waypoints=selected_waypoints,  # type: ignore[arg-type]
-        timestamp_ns=2_000,
-        valid=valid,
-        failure_reason=failure_reason,
+    selected_waypoints = (
+        (
+            _execution_waypoint(0.0, phase=ArmMotionPhase.PREGRASP),
+            _execution_waypoint(1.0, phase=ArmMotionPhase.GRASP),
+            _execution_waypoint(2.0, phase=ArmMotionPhase.LIFT),
+            _execution_waypoint(3.0, phase=ArmMotionPhase.RETREAT),
+        )
+        if waypoints is None
+        else waypoints
     )
+    # 机械臂执行边界必须防御来自反序列化/进程边界的损坏对象；这里有意绕过
+    # frozen dataclass构造校验，保留既有ArmExecutionController防御测试。
+    trajectory = object.__new__(JointTrajectory)
+    for name, value in (
+        ("trajectory_id", trajectory_id),
+        ("task_id", 1),
+        ("target_body", target_body),
+        ("execution_phase", execution_phase),
+        ("waypoints", selected_waypoints),
+        ("timestamp_ns", 2_000),
+        ("valid", valid),
+        ("failure_reason", failure_reason),
+    ):
+        object.__setattr__(trajectory, name, value)
+    return trajectory
 
 
 # FinalAction与19维顺序
@@ -451,10 +485,11 @@ def test_instruction_parser_and_basic_fsm_transitions() -> None:
             "tasks": [
                 {
                     "task_id": 7,
-                    "instruction": "把粉色箱体放到目标位置",
-                    "target_body": "box",
+                        "instruction": "把粉色箱体放到目标位置",
+                        "target_kind": "cuboid_box",
+                        "target_body": "box",
                     "target_color": "pink",
-                    "place_type": "world_point",
+                        "place_type": "table_point",
                     "place_world": [1.0, 2.0, 0.8],
                     "place_radius": 0.1,
                 }
@@ -463,6 +498,7 @@ def test_instruction_parser_and_basic_fsm_transitions() -> None:
         ensure_ascii=False,
     )
     task = InstructionParser().parse(raw, 100)[0]
+    assert task.place_frame_id == "world"
     assert task.task_id == 7
     assert task.place_world_xyz == (1.0, 2.0, 0.8)
 
@@ -628,6 +664,13 @@ def test_fsm_legal_transitions_update_phase_entry_time_and_local_is_telemetry() 
     assert fsm.handle_event(FSMEvent.TARGET_FOUND, 130)
     assert fsm.phase is GlobalPhase.NAV_TO_PICK
     assert fsm.phase_entered_ns == 130
+
+
+@pytest.mark.parametrize("place_type", ["world_point", "world", "relative", "point"])
+def test_instruction_parser_rejects_non_official_place_type(place_type: str) -> None:
+    raw = json.dumps(_official_task_data(place_type=place_type))
+    with pytest.raises(ValueError, match="place_type"):
+        InstructionParser().parse(raw, 100)
 
 
 def test_fsm_rejects_negative_and_stale_mutating_timestamps() -> None:
@@ -1185,14 +1228,7 @@ def test_fsm_time_reads_reject_stale_and_allow_equal_timestamp() -> None:
 
 
 def test_fsm_accepts_equal_timestamps_without_skipping_event_order() -> None:
-    raw = json.dumps(
-        {
-            "task_id": 1,
-            "target_body": "box",
-            "place_type": "world_point",
-            "place_world": [1.0, 2.0, 0.8],
-        }
-    )
+    raw = json.dumps(_official_task_data())
     task = InstructionParser().parse(raw, 100)[0]
     fsm = GlobalFSM()
 
@@ -1215,6 +1251,7 @@ def test_fsm_repeated_task_submission_does_not_reset_active_task() -> None:
         [
             {
                 "task": 1,
+                "instruction": "把粉色箱体放到货架点",
                 "target_kind": "cuboid_box",
                 "target_body": "box_pink",
                 "target_color": "pink",
@@ -1224,6 +1261,7 @@ def test_fsm_repeated_task_submission_does_not_reset_active_task() -> None:
             },
             {
                 "task": 2,
+                "instruction": "把棕色箱体放到桌面点",
                 "target_kind": "cuboid_box",
                 "target_body": "box_brown",
                 "target_color": "brown",
@@ -1233,6 +1271,7 @@ def test_fsm_repeated_task_submission_does_not_reset_active_task() -> None:
             },
             {
                 "task": 3,
+                "instruction": "把黄色箱体放到包装箱左侧",
                 "target_kind": "cuboid_box",
                 "target_body": "box_yellow",
                 "target_color": "yellow",
@@ -1269,13 +1308,12 @@ def test_fsm_repeated_task_submission_does_not_reset_active_task() -> None:
 
 def test_instruction_parser_rejects_negative_place_radius() -> None:
     raw = json.dumps(
-        {
-            "task": 1,
-            "target_body": "box_pink",
-            "place_type": "shelf_point",
-            "place_world": [-2.68, 0.778, 1.156],
-            "place_radius": -0.01,
-        }
+        _official_task_data(
+            task=1,
+            place_type="shelf_point",
+            place_world=[-2.68, 0.778, 1.156],
+            place_radius=-0.01,
+        )
     )
     with pytest.raises(ValueError, match="place_radius"):
         InstructionParser().parse(raw, 100)
@@ -1295,13 +1333,7 @@ def test_instruction_parser_rejects_negative_place_radius() -> None:
 def test_instruction_parser_rejects_non_strict_numeric_values(
     invalid_fields: dict[str, object],
 ) -> None:
-    task_data = {
-        "task_id": 1,
-        "target_body": "box",
-        "place_type": "world_point",
-        "place_world": [1.0, 2.0, 0.8],
-        "place_radius": 0.1,
-    }
+    task_data = _official_task_data()
     task_data.update(invalid_fields)
     with pytest.raises(ValueError):
         InstructionParser().parse(json.dumps(task_data), 100)
@@ -1312,16 +1344,23 @@ def test_instruction_parser_keeps_valid_integer_and_coordinates() -> None:
         [
             {
                 "task_id": 7,
+                "instruction": "搬运粉色箱体",
+                "target_kind": "cuboid_box",
                 "target_body": "box",
-                "place_type": "world_point",
+                "target_color": "pink",
+                "place_type": "table_point",
                 "place_world": [1, 2.0, 0.8],
                 "place_radius": 0.1,
             },
             {
                 "task_id": "8",
+                "instruction": "搬运棕色箱体",
+                "target_kind": "cuboid_box",
                 "target_body": "box",
-                "place_type": "world_point",
+                "target_color": "brown",
+                "place_type": "table_point",
                 "place_world": {"x": 0.5, "y": -0.2, "z": 0.7},
+                "place_radius": 0.1,
             },
         ]
     )
@@ -1340,7 +1379,7 @@ def test_official_instruction_array_preserves_task_and_new_fields() -> None:
                 "target_kind": "material",
                 "target_body": "box",
                 "target_color": "yellow",
-                "place_type": "relative",
+                "place_type": "shelf_prop_side",
                 "place_world": [0.5, -0.2, 0.7],
                 "place_radius": 0.15,
                 "ref_prop": "shelf",
@@ -1402,7 +1441,7 @@ def test_instruction_raw_and_task_are_written_to_metadata(tmp_path: Path) -> Non
                 "target_kind": "material",
                 "target_body": "box",
                 "target_color": "brown",
-                "place_type": "world",
+                "place_type": "table_point",
                 "place_world": [1.0, 0.0, 0.6],
                 "place_radius": 0.1,
             }
@@ -1618,14 +1657,7 @@ def test_recorder_instruction_write_failure_rolls_back_and_retries_once(
 ) -> None:
     recorder = EpisodeRecorder(tmp_path)
     recorder.start("instruction_retry", 0, "测试边界")
-    raw = json.dumps(
-        {
-            "task_id": 7,
-            "target_body": "box",
-            "place_type": "world_point",
-            "place_world": [1.0, 2.0, 0.8],
-        }
-    )
+    raw = json.dumps(_official_task_data(task_id=7))
     _fail_next_metadata_replace(monkeypatch)
 
     with pytest.raises(RuntimeError, match="原子写入"):
@@ -1660,8 +1692,9 @@ def test_recorder_preserves_all_parsed_tasks(tmp_path: Path) -> None:
                 "target_kind": "material",
                 "target_body": "box",
                 "target_color": "pink",
-                "place_type": "world",
+                "place_type": "table_point",
                 "place_world": [1.0, 2.0, 0.8],
+                "place_radius": 0.1,
             },
             {
                 "task_id": 2,
@@ -1669,8 +1702,9 @@ def test_recorder_preserves_all_parsed_tasks(tmp_path: Path) -> None:
                 "target_kind": "material",
                 "target_body": "box",
                 "target_color": "brown",
-                "place_type": "world",
+                "place_type": "table_point",
                 "place_world": [2.0, 1.0, 0.9],
+                "place_radius": 0.1,
             },
         ],
         ensure_ascii=False,
@@ -2194,6 +2228,282 @@ def test_arm_execution_rejects_empty_or_explicitly_invalid_trajectory() -> None:
     assert "规划器报告无解" in invalid.failure_reason
 
 
+def test_public_trajectory_requires_independent_arm_motion_phase() -> None:
+    waypoints = (
+        _execution_waypoint(0.0, phase=ArmMotionPhase.PREGRASP),
+        _execution_waypoint(1.0, phase=ArmMotionPhase.GRASP),
+        _execution_waypoint(2.0, phase=ArmMotionPhase.LIFT),
+        _execution_waypoint(3.0, phase=ArmMotionPhase.RETREAT),
+    )
+    trajectory = JointTrajectory(
+        trajectory_id="pick-1",
+        task_id=1,
+        target_body="box",
+        execution_phase=GlobalPhase.EXECUTE_PICK,
+        waypoints=waypoints,
+        timestamp_ns=2_000,
+    )
+    assert waypoints[0].phase is ArmMotionPhase.PREGRASP
+    assert trajectory.execution_phase is GlobalPhase.EXECUTE_PICK
+    with pytest.raises(ValueError, match="ArmMotionPhase"):
+        JointWaypoint(
+            LocalPhase.MOVE_PREGRASP, 0.0, _joints().position, (True,) * 17
+        )  # type: ignore[arg-type]
+
+
+def test_joint_waypoint_rejects_all_false_controlled_mask() -> None:
+    with pytest.raises(ValueError, match="至少一项必须为 True"):
+        JointWaypoint(
+            ArmMotionPhase.PREGRASP, 0.0, _joints().position, (False,) * 17
+        )
+
+
+def _waypoints_for_phases(
+    phases: tuple[ArmMotionPhase, ...],
+) -> tuple[JointWaypoint, ...]:
+    return tuple(
+        _execution_waypoint(float(index), phase=phase)
+        for index, phase in enumerate(phases)
+    )
+
+
+def test_joint_trajectory_rejects_plain_string_execution_phase() -> None:
+    with pytest.raises(ValueError, match="严格使用 GlobalPhase"):
+        JointTrajectory(
+            "pick", 1, "box", "EXECUTE_PICK", (), 2_000, False, "失败"
+        )  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("execution_phase", "phases", "unexpected"),
+    [
+        (
+            GlobalPhase.EXECUTE_PICK,
+            (
+                ArmMotionPhase.PREGRASP,
+                ArmMotionPhase.GRASP,
+                ArmMotionPhase.LIFT,
+                ArmMotionPhase.RELEASE,
+            ),
+            "RELEASE",
+        ),
+        (
+            GlobalPhase.EXECUTE_PLACE,
+            (
+                ArmMotionPhase.PREPLACE,
+                ArmMotionPhase.LOWER,
+                ArmMotionPhase.GRASP,
+                ArmMotionPhase.RELEASE,
+                ArmMotionPhase.POST_RELEASE_RETREAT,
+            ),
+            "GRASP",
+        ),
+    ],
+)
+def test_joint_trajectory_rejects_cross_operation_phase(
+    execution_phase: GlobalPhase,
+    phases: tuple[ArmMotionPhase, ...],
+    unexpected: str,
+) -> None:
+    with pytest.raises(ValueError, match=unexpected):
+        JointTrajectory(
+            "trajectory", 1, "box", execution_phase,
+            _waypoints_for_phases(phases), 2_000,
+        )
+
+
+def test_joint_trajectory_rejects_phase_backtracking_and_missing_phase() -> None:
+    with pytest.raises(ValueError, match="不得倒退"):
+        JointTrajectory(
+            "pick", 1, "box", GlobalPhase.EXECUTE_PICK,
+            _waypoints_for_phases(
+                (
+                    ArmMotionPhase.PREGRASP,
+                    ArmMotionPhase.GRASP,
+                    ArmMotionPhase.PREGRASP,
+                    ArmMotionPhase.LIFT,
+                    ArmMotionPhase.RETREAT,
+                )
+            ),
+            2_000,
+        )
+    with pytest.raises(ValueError, match="缺少必要阶段"):
+        JointTrajectory(
+            "pick", 1, "box", GlobalPhase.EXECUTE_PICK,
+            _waypoints_for_phases(
+                (ArmMotionPhase.PREGRASP, ArmMotionPhase.GRASP, ArmMotionPhase.LIFT)
+            ),
+            2_000,
+        )
+
+
+def test_joint_trajectory_allows_multiple_waypoints_per_phase() -> None:
+    phases = tuple(
+        phase
+        for phase in (
+            ArmMotionPhase.PREGRASP,
+            ArmMotionPhase.GRASP,
+            ArmMotionPhase.LIFT,
+            ArmMotionPhase.RETREAT,
+        )
+        for _ in range(2)
+    )
+    trajectory = JointTrajectory(
+        "pick", 1, "box", GlobalPhase.EXECUTE_PICK,
+        _waypoints_for_phases(phases), 2_000,
+    )
+    assert len(trajectory.waypoints) == 8
+
+
+def test_arm_execution_loads_complete_pick_and_place_trajectories() -> None:
+    pick = _execution_trajectory()
+    place = _execution_trajectory(
+        execution_phase=GlobalPhase.EXECUTE_PLACE,
+        waypoints=_waypoints_for_phases(
+            (
+                ArmMotionPhase.PREPLACE,
+                ArmMotionPhase.LOWER,
+                ArmMotionPhase.RELEASE,
+                ArmMotionPhase.POST_RELEASE_RETREAT,
+            )
+        ),
+    )
+    assert ArmExecutionController().start_trajectory(pick).state == "LOADED"
+    assert ArmExecutionController().start_trajectory(place).state == "LOADED"
+
+
+def test_arm_execution_rejects_damaged_phase_contract() -> None:
+    string_phase = _execution_trajectory(execution_phase="EXECUTE_PICK")
+    mixed = _execution_trajectory(
+        waypoints=_waypoints_for_phases(
+            (
+                ArmMotionPhase.PREGRASP,
+                ArmMotionPhase.GRASP,
+                ArmMotionPhase.LIFT,
+                ArmMotionPhase.RELEASE,
+            )
+        )
+    )
+    backtracking = _execution_trajectory(
+        waypoints=_waypoints_for_phases(
+            (
+                ArmMotionPhase.PREGRASP,
+                ArmMotionPhase.GRASP,
+                ArmMotionPhase.PREGRASP,
+                ArmMotionPhase.LIFT,
+                ArmMotionPhase.RETREAT,
+            )
+        )
+    )
+    missing = _execution_trajectory(
+        waypoints=_waypoints_for_phases(
+            (ArmMotionPhase.PREGRASP, ArmMotionPhase.GRASP, ArmMotionPhase.LIFT)
+        )
+    )
+    assert "GlobalPhase" in ArmExecutionController().start_trajectory(string_phase).failure_reason
+    assert "RELEASE" in ArmExecutionController().start_trajectory(mixed).failure_reason
+    assert "不得倒退" in ArmExecutionController().start_trajectory(backtracking).failure_reason
+    assert "缺少必要阶段" in ArmExecutionController().start_trajectory(missing).failure_reason
+
+
+def test_arm_execution_rejects_damaged_all_false_waypoint() -> None:
+    phases = (
+        ArmMotionPhase.PREGRASP,
+        ArmMotionPhase.GRASP,
+        ArmMotionPhase.LIFT,
+        ArmMotionPhase.RETREAT,
+    )
+    waypoints = tuple(
+        SimpleNamespace(
+            phase=phase,
+            time_from_start_s=float(index),
+            joint_position=_joints().position,
+            controlled_mask=(False,) * 17,
+        )
+        for index, phase in enumerate(phases)
+    )
+    status = ArmExecutionController().start_trajectory(
+        _execution_trajectory(waypoints=waypoints)
+    )
+    assert status.state == "REJECTED"
+    assert "至少一项必须为True" in status.failure_reason
+
+
+@pytest.mark.parametrize("bad_valid", ["yes", 0])
+def test_arm_execution_rejects_non_bool_valid_without_exception(
+    bad_valid: object,
+) -> None:
+    damaged = object.__new__(JointTrajectory)
+    object.__setattr__(damaged, "valid", bad_valid)
+    object.__setattr__(damaged, "timestamp_ns", 9_000)
+    status = ArmExecutionController().start_trajectory(damaged)
+    assert status.state == "REJECTED"
+    assert "valid必须是严格bool" in status.failure_reason
+    assert status.timestamp_ns == 9_000
+
+
+def test_arm_execution_uses_zero_timestamp_for_damaged_timestamp() -> None:
+    damaged = object.__new__(JointTrajectory)
+    object.__setattr__(damaged, "valid", True)
+    object.__setattr__(damaged, "timestamp_ns", "100")
+    status = ArmExecutionController().start_trajectory(damaged)
+    assert status.state == "REJECTED"
+    assert "timestamp_ns" in status.failure_reason
+    assert status.timestamp_ns == 0
+
+
+def test_arm_execution_rejects_missing_trajectory_attributes_without_exception() -> None:
+    damaged = object.__new__(JointTrajectory)
+    object.__setattr__(damaged, "valid", True)
+    object.__setattr__(damaged, "timestamp_ns", 10)
+    status = ArmExecutionController().start_trajectory(damaged)
+    assert status.state == "REJECTED"
+    assert "task_id" in status.failure_reason
+    assert status.timestamp_ns == 10
+
+
+def test_arm_execution_rejects_non_trajectory_instance_without_exception() -> None:
+    status = ArmExecutionController().start_trajectory(SimpleNamespace())  # type: ignore[arg-type]
+    assert status.state == "REJECTED"
+    assert "JointTrajectory实例" in status.failure_reason
+    assert status.timestamp_ns == 0
+
+
+def test_invalid_joint_trajectory_does_not_require_fake_target_identity() -> None:
+    invalid = JointTrajectory(
+        "", 1, "", GlobalPhase.EXECUTE_PICK, (), 2_000, False, "任务无效"
+    )
+    assert not invalid.valid and invalid.target_body == ""
+    with pytest.raises(ValueError, match="waypoints 必须为空"):
+        JointTrajectory(
+            "", 1, "", GlobalPhase.EXECUTE_PICK,
+            (_execution_waypoint(),), 2_000, False, "规划失败",
+        )
+    with pytest.raises(ValueError, match="target_body"):
+        JointTrajectory(
+            "pick", 1, "", GlobalPhase.EXECUTE_PICK,
+            _waypoints_for_phases(
+                (
+                    ArmMotionPhase.PREGRASP,
+                    ArmMotionPhase.GRASP,
+                    ArmMotionPhase.LIFT,
+                    ArmMotionPhase.RETREAT,
+                )
+            ),
+            2_000,
+        )
+
+    damaged = object.__new__(JointTrajectory)
+    object.__setattr__(damaged, "valid", False)
+    object.__setattr__(damaged, "failure_reason", "上游任务无效")
+    object.__setattr__(damaged, "timestamp_ns", 2_000)
+    object.__setattr__(damaged, "task_id", 1)
+    object.__setattr__(damaged, "execution_phase", GlobalPhase.EXECUTE_PICK)
+    status = ArmExecutionController().start_trajectory(damaged)
+    assert status.state == "REJECTED"
+    assert status.failure_reason == "上游任务无效"
+
+
 def test_arm_execution_rejects_empty_trajectory_id() -> None:
     status = ArmExecutionController().start_trajectory(_execution_trajectory("  "))
 
@@ -2204,6 +2514,7 @@ def test_arm_execution_rejects_empty_trajectory_id() -> None:
 @pytest.mark.parametrize("time_s", [-0.1, True, float("nan"), float("inf")])
 def test_arm_execution_rejects_invalid_waypoint_time(time_s: object) -> None:
     waypoint = SimpleNamespace(
+        phase=ArmMotionPhase.PREGRASP,
         time_from_start_s=time_s,
         joint_position=_joints().position,
         controlled_mask=(True,) * 17,
@@ -2248,6 +2559,7 @@ def test_arm_execution_rechecks_waypoint_joint_positions(
     joint_position: tuple[object, ...],
 ) -> None:
     waypoint = SimpleNamespace(
+        phase=ArmMotionPhase.PREGRASP,
         time_from_start_s=0.0,
         joint_position=joint_position,
         controlled_mask=(True,) * 17,
@@ -2269,6 +2581,7 @@ def test_arm_execution_requires_exact_boolean_controlled_mask(
     mask: tuple[object, ...],
 ) -> None:
     waypoint = SimpleNamespace(
+        phase=ArmMotionPhase.PREGRASP,
         time_from_start_s=0.0,
         joint_position=_joints().position,
         controlled_mask=mask,
@@ -2284,9 +2597,7 @@ def test_arm_execution_requires_exact_boolean_controlled_mask(
 
 def test_arm_execution_valid_load_is_neutral_and_not_started() -> None:
     controller = ArmExecutionController()
-    trajectory = _execution_trajectory(
-        waypoints=(_execution_waypoint(0.0), _execution_waypoint(1.0))
-    )
+    trajectory = _execution_trajectory()
 
     status = controller.start_trajectory(trajectory)
 
