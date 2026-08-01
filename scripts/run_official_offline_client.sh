@@ -6,8 +6,19 @@ PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DRY_RUN="${DRY_RUN:-0}"
 OFFICIAL_ROOT="${MATERIAL_SORTING_OFFICIAL_ROOT:-}"
 CLIENT_GPUS="${TEAM_SORTING_CLIENT_GPUS-all}"
+COLCON_CACHE_VOLUME="${TEAM_SORTING_COLCON_CACHE_VOLUME:-team_sorting_offline_client_colcon_v1}"
+CLEAN_BUILD="${TEAM_SORTING_CLEAN_BUILD:-0}"
 YOLO_CHECKPOINT="${MATERIAL_SORTING_YOLO_CHECKPOINT:-}"
 MJCF_PATH="${TEAM_SORTING_MJCF:-}"
+
+if [[ -z "${COLCON_CACHE_VOLUME}" ]]; then
+    echo "错误：TEAM_SORTING_COLCON_CACHE_VOLUME不能为空" >&2
+    exit 1
+fi
+if [[ "${CLEAN_BUILD}" != "0" && "${CLEAN_BUILD}" != "1" ]]; then
+    echo "错误：TEAM_SORTING_CLEAN_BUILD只能是0或1" >&2
+    exit 1
+fi
 
 validate_optional_path() {
     local label="$1" value="$2"
@@ -37,8 +48,10 @@ command=(docker run --rm -it --network host
     -e ROS_DOMAIN_ID=99
     -e RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
     -e MATERIAL_SORTING_OFFICIAL_ROOT=/workspace/official
+    -e "TEAM_SORTING_CLEAN_BUILD=${CLEAN_BUILD}"
     -v "${PROJECT_ROOT}:/workspace/baseline:rw"
-    -v "${OFFICIAL_ROOT}:/workspace/official:ro")
+    -v "${OFFICIAL_ROOT}:/workspace/official:ro"
+    -v "${COLCON_CACHE_VOLUME}:/opt/team_sorting_colcon")
 case "${CLIENT_GPUS}" in
     ""|none)
         GPU_BEHAVIOR="disabled (no --gpus argument)"
@@ -57,7 +70,7 @@ if [[ -n "${MJCF_PATH}" ]]; then
               -v "${MJCF_PATH}:/workspace/runtime/scene.xml:ro")
 fi
 command+=("${IMAGE_NAME}" bash -lc
-    'set -euo pipefail
+    'set -eo pipefail
 source /opt/ros/humble/setup.bash
 test -d /workspace/baseline/team_sorting
 test -d "${MATERIAL_SORTING_OFFICIAL_ROOT}"
@@ -67,15 +80,27 @@ printf "baseline=%s\nofficial=%s\nyolo=%s\nmjcf=%s\nobserve_only=true\n" \
   /workspace/baseline "${MATERIAL_SORTING_OFFICIAL_ROOT}" \
   "${MATERIAL_SORTING_YOLO_CHECKPOINT:-<adapter-search>}" "${TEAM_SORTING_MJCF:-<adapter-search>}"
 cd /workspace/baseline
-colcon build --packages-select team_sorting \
-  --build-base /tmp/team_sorting_build --install-base /tmp/team_sorting_install \
-  --log-base /tmp/team_sorting_log
-source /tmp/team_sorting_install/setup.bash
+if [[ "${TEAM_SORTING_CLEAN_BUILD}" == "1" ]]; then
+  rm -rf /opt/team_sorting_colcon/build \
+         /opt/team_sorting_colcon/install \
+         /opt/team_sorting_colcon/log
+fi
+colcon --log-base /opt/team_sorting_colcon/log build \
+  --packages-select team_sorting --symlink-install \
+  --build-base /opt/team_sorting_colcon/build \
+  --install-base /opt/team_sorting_colcon/install
+source /opt/team_sorting_colcon/install/setup.bash
 ros2 launch team_sorting team.launch.xml')
 
 printf 'Client image: %s\nProject mount: %s -> /workspace/baseline\n' "${IMAGE_NAME}" "${PROJECT_ROOT}"
 printf 'ROS_DOMAIN_ID=99\nRMW_IMPLEMENTATION=rmw_cyclonedds_cpp\n'
 printf 'GPU behavior: %s\n' "${GPU_BEHAVIOR}"
+printf 'Colcon cache volume: %s -> /opt/team_sorting_colcon\n' "${COLCON_CACHE_VOLUME}"
+printf 'Clean build: %s\n' "${CLEAN_BUILD}"
+printf 'Colcon paths: build=%s install=%s log=%s\n' \
+    /opt/team_sorting_colcon/build \
+    /opt/team_sorting_colcon/install \
+    /opt/team_sorting_colcon/log
 printf 'Command:'; printf ' %q' "${command[@]}"; printf '\n'
 if [[ "${DRY_RUN}" == "1" ]]; then
     exit 0

@@ -10,6 +10,12 @@ SCRIPT = Path("scripts/run_official_offline_client.sh").resolve()
 
 def _run(tmp_path: Path, **overrides: str) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
+    for name in (
+        "TEAM_SORTING_CLIENT_GPUS",
+        "TEAM_SORTING_COLCON_CACHE_VOLUME",
+        "TEAM_SORTING_CLEAN_BUILD",
+    ):
+        env.pop(name, None)
     env.update({"DRY_RUN": "1", **overrides})
     return subprocess.run(
         ["bash", str(SCRIPT)], env=env, text=True, capture_output=True, check=False
@@ -46,6 +52,12 @@ def test_default_dry_run_includes_all_gpus_and_observe_only(tmp_path):
     assert "GPU behavior: --gpus all" in result.stdout
     assert "--gpus all" in result.stdout
     assert "observe_only=true" in result.stdout
+    assert "team_sorting_offline_client_colcon_v1:/opt/team_sorting_colcon" in result.stdout
+    assert "/opt/team_sorting_colcon/build" in result.stdout
+    assert "/opt/team_sorting_colcon/install" in result.stdout
+    assert "/opt/team_sorting_colcon/log" in result.stdout
+    assert "--symlink-install" in result.stdout
+    assert "Clean build: 0" in result.stdout
 
 
 def test_none_or_empty_gpu_setting_omits_docker_gpus_argument(tmp_path):
@@ -71,3 +83,39 @@ def test_custom_gpu_value_is_passed_as_one_docker_argument(tmp_path):
     assert result.returncode == 0
     assert "GPU behavior: --gpus device=0,1" in result.stdout
     assert "--gpus device=0\\,1" in result.stdout
+
+
+def test_host_keeps_nounset_but_container_ros_setup_does_not_use_it():
+    source = SCRIPT.read_text(encoding="utf-8")
+    assert source.startswith("#!/usr/bin/env bash\nset -euo pipefail\n")
+    container = source[source.index("'set -eo pipefail") :]
+    ros_source = container.index("source /opt/ros/humble/setup.bash")
+    assert "set -eo pipefail" in container[:ros_source]
+    assert "set -u" not in container[:ros_source]
+    assert "set -euo pipefail" not in container[:ros_source]
+    assert "source /opt/team_sorting_colcon/install/setup.bash" in container
+
+
+def test_clean_build_and_custom_cache_volume_are_transmitted(tmp_path):
+    result = _run(
+        tmp_path,
+        MATERIAL_SORTING_OFFICIAL_ROOT=str(_official_root(tmp_path)),
+        TEAM_SORTING_CLEAN_BUILD="1",
+        TEAM_SORTING_COLCON_CACHE_VOLUME="custom_colcon_cache",
+    )
+    assert result.returncode == 0
+    assert "Colcon cache volume: custom_colcon_cache -> /opt/team_sorting_colcon" in result.stdout
+    assert "Clean build: 1" in result.stdout
+    assert "custom_colcon_cache:/opt/team_sorting_colcon" in result.stdout
+    assert "TEAM_SORTING_CLEAN_BUILD=1" in result.stdout
+    assert "rm -rf /opt/team_sorting_colcon/build" in result.stdout
+
+
+def test_invalid_clean_build_value_fails_before_docker(tmp_path):
+    result = _run(
+        tmp_path,
+        MATERIAL_SORTING_OFFICIAL_ROOT=str(_official_root(tmp_path)),
+        TEAM_SORTING_CLEAN_BUILD="yes",
+    )
+    assert result.returncode != 0
+    assert "只能是0或1" in result.stderr

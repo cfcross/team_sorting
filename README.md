@@ -403,13 +403,16 @@ TTL（time to live，有效期）规定一条候选命令最多能存活多久�
 
 ## 10. VLA 数据记录
 
-Episode 是一次连续采集片段。当前临时边界是 recorder 节点启动到停止；正式比赛的开始、
-结束和任务切分规则仍待确认。一个 Episode 计划/当前能够覆盖的数据如下：
+Recorder 节点从启动到停止连续保存一个原始 Run，不按官方 Task 或已结算 attempt 拆分
+rosbag，也不把这个文件边界冒充为正式训练 Episode。官方三任务及每任务最多三次已结算
+attempt 的比赛生命周期已经明确；`competition_contexts.jsonl` 和 metadata 中的索引用于
+在同一原始 Run 内恢复 Run/Task/Attempt 层级。当前能够覆盖的数据如下：
 
 | 数据 | 保存位置 | 当前说明 |
 |---|---|---|
 | `instruction_raw` | `metadata.json`，同时在 rosbag 保留原消息 | 原文即使解析失败也保留 |
-| 解析后的 `TaskSpec` | `metadata.json` | 由唯一 `InstructionParser` 生成；当前记录第一条任务 |
+| 解析后的 `TaskSpec` | `metadata.json` | 由唯一 `InstructionParser` 生成；完整三任务保存在 `parsed_tasks`，旧 `task` 字段仅作 metadata 消费者兼容，不参与当前任务选择 |
+| `CompetitionContext` | `competition_contexts.jsonl`、`metadata.json` | 连续记录公开裁判上下文，并按 `run_id`、`task_id`、已结算 attempt 建立索引，不拆分整局 Run |
 | RGB、Depth、CameraInfo | rosbag | 原始高带宽 ROS 消息，不在 Python 回调中逐帧复制 |
 | Odom、JointState | rosbag | 保留原消息、时间和 frame |
 | `ObjectEstimate3D` | rosbag 中的 `/team/object_estimates` | 保存团队感知输出 |
@@ -419,7 +422,7 @@ Episode 是一次连续采集片段。当前临时边界是 recorder 节点启�
 | 严格动作配对 | `action_frames.jsonl` | 同 sequence、同 timestamp 的两条遥测结构化配对，不是执行确认 |
 | 配对异常 | `action_pairing_issues.jsonl` | 无效、重复、冲突、超时、容量淘汰与关闭孤儿 |
 | referee 信息 | `metadata.json`，同时进入 rosbag | 原样记录 taskinfo、gameinfo、score，能解析 JSON 时附解析值 |
-| success / score 等结果 | FSM JSONL、referee metadata | `FSMStatus.success` 和 score 已有记录链；官方 Episode 级 success/final result 的来源与接线待确认 |
+| success / score 等结果 | FSM JSONL、referee metadata | 官方累计分数来自公开 `/referee/score`，任务进度来自 taskinfo/gameinfo；`FSMStatus.success` 只是本地 FSM 诊断，不能冒充官方比赛结果 |
 
 三种格式各司其职：
 
@@ -427,8 +430,8 @@ Episode 是一次连续采集片段。当前临时边界是 recorder 节点启�
   时间戳和坐标系。
 - **JSONL** 是“一行一个 JSON 对象”，便于逐周期读取；保存 FSM、两条原始合法动作
   遥测、严格配对 Frame 和配对 Issue。
-- **metadata** 是一个 Episode 的摘要，保存任务原文、`TaskSpec`、裁判消息、bag 状态、
-  话题计数和可选最终结果。
+- **metadata** 是一个原始 Run 的摘要，保存任务原文、完整 `TaskSpec` 集合、
+  CompetitionContext 索引、裁判消息、bag 状态、话题计数和可选最终结果。
 
 专家训练动作只能使用 `ActionMux` 生成、`valid=True` 且已经过
 `OfficialCommandPublisher` 成功发布的 `FinalAction`。`valid=False` 的 `FinalAction`
@@ -566,7 +569,9 @@ ros2 launch team_sorting team.launch.xml record_data:=true
 
 `scripts/run_official_offline_client.sh` 将当前项目挂载到
 `/workspace/baseline`，在 `material_sorting:offline-client` 内 source ROS 2
-Humble 并使用 `/tmp` 中全新的 build/install/log 重新构建。它固定使用 host network、
+Humble。命名卷 `team_sorting_offline_client_colcon_v1` 默认挂载到
+`/opt/team_sorting_colcon`，其中的 build/install/log 可跨 `--rm` 容器复用，源码仍
+来自 `/workspace/baseline`，并使用 `--symlink-install` 做增量开发构建。它固定使用 host network、
 `ROS_DOMAIN_ID=99`、`rmw_cyclonedds_cpp`，默认配置仍为 observe-only，不启动或修改
 官方 Server，也不联网下载模型。宿主机 `MATERIAL_SORTING_OFFICIAL_ROOT` 是必填目录，
 脚本会在 Docker 启动前验证官方 Server 关键文件。`TEAM_SORTING_CLIENT_GPUS` 默认
@@ -579,6 +584,11 @@ TEAM_SORTING_MJCF=/absolute/path/to/material_competition.xml \
 TEAM_SORTING_CLIENT_GPUS=all \
 DRY_RUN=1 ./scripts/run_official_offline_client.sh
 ```
+
+可用 `TEAM_SORTING_COLCON_CACHE_VOLUME` 覆盖缓存卷名。需要排除旧构建缓存时设置
+`TEAM_SORTING_CLEAN_BUILD=1`；它只删除命名卷内的 build/install/log，不删除
+`/workspace/baseline` 源码。容器内部在 source ROS 和 colcon setup 时保留
+`errexit`/`pipefail`，但不启用会与 ROS setup 冲突的 Bash `nounset`。
 
 TeamClient 将完整三任务集合与 `/referee/taskinfo`、`/referee/gameinfo`、
 `/referee/score` 严格组合，并在配置化的 `/team/competition_context` 发布 schema v1
@@ -620,17 +630,32 @@ JSON。`attempt` 是当前任务已结算次数；任务切换只重建本地单
 因此“生成诊断FinalAction”不等于“发送位置保持命令”。`create_hold_command()`仍保留给
 未来明确授权的主动保持场景。“仓库骨架完成”绝不等于“比赛代码完成”。
 
-### 待确认
+### 已由正式官方源码确认
 
-以下事实无法从当前仓库代码确认，联调前应向赛事方或官方工程核对：
+- Server 每 0.5 秒在 `/material/instruction` 发布完整且有序的三任务列表；一次比赛运行按
+  Task 1→2→3 连续推进，而不是从列表中只选择一种任务变体。
+- Client 一次启动持续处理三项任务的生命周期。TeamClient 保留完整任务集合，并严格组合
+  公开 `/referee/taskinfo`、`/referee/gameinfo`、`/referee/score` 选择当前 active task，
+  不再固定采用 `tasks[0]`。
+- 每项任务最多有三次已结算 attempt；放置成功或机会用尽后进入下一任务。同一 Task 的
+  attempt 变化和 Task 切换都不会复位 Server、机器人或物品，只会重新武装本地单任务 FSM。
+- Recorder 连续保存整局原始 Run，不因 Task/attempt 变化清空历史；
+  `competition_contexts.jsonl` 和 metadata 按 Run/Task/已结算 attempt 建立索引。
+- 正式随机 Server 开发入口 `start_official_random_server.sh` 显式设置
+  `MATERIAL_RANDOMIZE=1`。这描述的是正式启动入口，不把 Python 环境变量的缺省解析
+  与脚本运行模式混为一谈。
 
-- 当前比赛是否为“一次运行随机选择一种任务变体”，以及任务数组与 Episode 的正式语义；
-  当前 client 和 Recorder 都只使用解析结果的第一条任务，不能宣称一次运行会连续完成多项任务。
-- `MATERIAL_RANDOMIZE` 的实际默认值；
-- `world` 与 `odom` 是否永久重合，以及官方 `MMK2FK` 的真实输出 frame；
-- 正式 Episode 的开始、结束、任务切分规则，以及官方最终 success/result 的来源和话题；
-- Server 是否有命令 watchdog、官方控制所需频率，以及当前五组控制话题是否与最终比赛环境一致；
-- 官方 Python 模块最终导入路径、YOLO 权重/MJCF 位置和 `vision_msgs` 具体版本。
+以上 CompetitionContext 和记录边界对齐只说明比赛生命周期契约已经接通，不表示导航、
+抓取、放置、机械臂执行或完整比赛闭环已经完成。当前默认仍是 observe-only。
+
+### 仍需在线环境验证
+
+- ROS 话题的实际 QoS、三条裁判消息的调度时序，以及瞬态不一致后的在线恢复表现；
+- `world`、`odom` 与官方 `MMK2FK` 输出 frame 的在线一致性；
+- Server 命令 watchdog、正式控制所需频率，以及五组控制话题在最终环境中的连接；
+- 官方 Client 镜像内 YOLO、MJCF、KDL 的实际路径及 `vision_msgs` 版本；
+- CameraInfo、Odom 和 TF 的在线消息 frame、时间戳与更新行为；
+- 默认 observe-only 运行时是否确实没有任何官方控制话题发布。
 
 ## 14. 团队分工
 
