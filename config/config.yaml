@@ -51,6 +51,10 @@ control:
 topics:
   # 任务：官方 Server 发布；TeamClientNode 和 DatasetRecorderNode 订阅。
   instruction: "/material/instruction"
+  referee_taskinfo: "/referee/taskinfo"
+  referee_gameinfo: "/referee/gameinfo"
+  referee_score: "/referee/score"
+  competition_context: "/team/competition_context"
   # 头部相机：官方相机驱动发布；PerceptionNode 消费，Recorder的bag列表在下方另列。
   rgb: "/head_camera/color/image_raw"
   depth: "/head_camera/aligned_depth_to_color/image_raw"
@@ -259,6 +263,7 @@ recorder:
     - "/joint_states"                                # 机器人实际关节反馈
     - "/team/object_estimates"                       # 团队三维目标估计
     - "/team/fsm_status"                             # FSM阶段遥测
+    - "/team/competition_context"                    # 结构化run/task/attempt上下文
     - "/team/final_action"                           # ActionMux唯一最终动作遥测
     - "/referee/taskinfo"                            # 裁判任务信息
     - "/referee/gameinfo"                            # 裁判比赛状态

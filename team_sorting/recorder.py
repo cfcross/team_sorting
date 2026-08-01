@@ -51,6 +51,7 @@ from .interfaces import (
     fsm_status_to_json,
 )
 from .fsm import InstructionParser
+from .competition_context import CompetitionContext
 from .recording_contracts import (
     ActionDispatchPairer,
     ActionPairingConfig,
@@ -153,6 +154,8 @@ class EpisodeMetadata:
     rosbag_exit_code: Optional[int] = None
     ended_at_ns: Optional[int] = None
     referee_messages: list[dict[str, Any]] = field(default_factory=list)
+    competition_context_count: int = 0
+    competition_context_index: list[dict[str, Any]] = field(default_factory=list)
     final_result: Optional[dict[str, Any]] = None
     topic_counts: dict[str, int] = field(default_factory=dict)
 
@@ -198,6 +201,7 @@ class EpisodeRecorder:
             else None
         )
         self._action_pairer: Optional[ActionDispatchPairer] = None
+        self._last_competition_context_key: Optional[tuple[str, Optional[int], int]] = None
 
     def check_root(self) -> Path:
         """检查并创建数据根目录。
@@ -300,6 +304,7 @@ class EpisodeRecorder:
             if self._action_pairing_config is not None
             else None
         )
+        self._last_competition_context_key = None
         return episode_dir
 
     def record_final_action(self, action: FinalAction) -> None:
@@ -629,6 +634,31 @@ class EpisodeRecorder:
         self._count(topic, metadata)
         self._write_metadata(metadata)
         self.metadata = metadata
+
+    def record_competition_context(self, context: CompetitionContext) -> None:
+        """Append structured run/task/settled-attempt context without splitting rosbag."""
+
+        if not isinstance(context, CompetitionContext):
+            raise ValueError("context必须是CompetitionContext")
+        metadata = deepcopy(self._active_metadata())
+        key = (context.run_id, context.current_task_id, context.current_attempt_count)
+        sequence = metadata.competition_context_count
+        self._append_line(self._active_path("competition_contexts.jsonl"), context.to_json())
+        metadata.competition_context_count += 1
+        if key != self._last_competition_context_key:
+            metadata.competition_context_index.append({
+                "sequence": sequence,
+                "run_id": context.run_id,
+                "task_id": context.current_task_id,
+                "settled_attempt_count": context.current_attempt_count,
+                "referee_timestamp_ns": context.referee_timestamp_ns,
+                "context_valid": context.valid,
+                "failure_reason": context.failure_reason,
+            })
+        self._count("/team/competition_context", metadata)
+        self._write_metadata(metadata)
+        self.metadata = metadata
+        self._last_competition_context_key = key
 
     def mark_rosbag_started(self, output_path: str | Path) -> None:
         """在外部 rosbag 进程成功创建后更新 Episode 元数据。

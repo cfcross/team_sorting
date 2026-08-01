@@ -97,6 +97,7 @@ from typing import Any, Mapping, Optional
 from .action_mux import ActionMux, ActionMuxConfig
 from .controller_manifest import validate_controller_config
 from .arm_execution import ArmExecutionController
+from .competition_context import CompetitionContext, CompetitionRunCoordinator
 from .external_candidate import (
     ExternalCandidateConfig,
     ExternalCandidateConsumer,
@@ -801,8 +802,10 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             self._joint_cache = TimestampedCache()
             self._latest_estimates: tuple[ObjectEstimate3D, ...] = ()
             self._parsed_tasks: tuple[TaskSpec, ...] = ()
-            self._pending_task: Optional[TaskSpec] = None
-            self._warned_multiple_tasks = False
+            self._instruction_raw = ""
+            self._coordinator = CompetitionRunCoordinator()
+            self._active_context: Optional[CompetitionContext] = None
+            self._last_activated_context: Optional[CompetitionContext] = None
             self._local_io_ready = False
             self._system_ready_submitted = False
             self._last_control_warning = ""
@@ -862,7 +865,20 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 ros.String, action_dispatch_topic, 10
             )
             self._fsm_pub = self.create_publisher(ros.String, topics["fsm_status"], 10)
+            self._context_pub = self.create_publisher(
+                ros.String, topics["competition_context"], 10
+            )
             self.create_subscription(ros.String, topics["instruction"], self._on_instruction, 10)
+            self.create_subscription(
+                ros.String, topics["referee_taskinfo"], self._on_referee_taskinfo, 10
+            )
+            self.create_subscription(
+                ros.String, topics["referee_gameinfo"], self._on_referee_gameinfo, 10
+            )
+            self.create_subscription(
+                getattr(ros, "Int32", ros.String),
+                topics["referee_score"], self._on_referee_score, 10
+            )
             if _external_candidate_subscription_enabled(self._external_candidate_config):
                 self._external_candidate_subscription = self.create_subscription(
                     ros.String,
@@ -886,34 +902,85 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             now_ns = self.get_clock().now().nanoseconds
             try:
                 tasks = self._parser.parse(message.data, now_ns)
-                # 解析只回答“消息中有哪些任务”；选择回答“当前采用哪一个”，两者分开
-                # 才能在正式规则发布后替换策略而不改 InstructionParser。
                 self._parsed_tasks = tasks
-                selected_task = self._select_task(tasks)
-                # 每次合法广播都刷新 consumer 自己的指令活性时间；下面的 FSM 语义去重
-                # 保持原样，不会重复提交相同任务。
-                self._external_candidate.update_instruction(
-                    message.data, selected_task.task_id, now_ns
-                )
-                selected_fingerprint = self._task_semantic_fingerprint(selected_task)
-                if (
-                    self._fsm.task is not None
-                    and selected_fingerprint == self._task_semantic_fingerprint(self._fsm.task)
-                ):
-                    return
-                if (
-                    self._pending_task is not None
-                    and selected_fingerprint
-                    == self._task_semantic_fingerprint(self._pending_task)
-                ):
-                    return
-                # 周期广播只更新时间，不应把同一业务任务再次提交给FSM。不同任务仍
-                # 先缓存；是否以及何时激活新的任务，待官方确认。
-                self._pending_task = selected_task
-                if self._system_ready_submitted:
-                    self._submit_pending_task(now_ns)
+                self._instruction_raw = message.data
+                changed = self._coordinator.update_tasks(tasks, now_ns)
+                if changed:
+                    self.get_logger().info("收到新的完整三任务集合，已创建新的本地run身份")
+                self._refresh_competition_context(now_ns)
             except ValueError as exc:
                 self.get_logger().error(f"任务解析失败：{exc}")
+
+        def _on_referee_taskinfo(self, message: Any) -> None:
+            now_ns = self.get_clock().now().nanoseconds
+            try:
+                self._coordinator.referee.update_taskinfo(message.data, now_ns)
+            except (AttributeError, TypeError, ValueError) as exc:
+                self.get_logger().error(f"裁判taskinfo解析失败：{exc}")
+            self._refresh_competition_context(now_ns)
+
+        def _on_referee_gameinfo(self, message: Any) -> None:
+            now_ns = self.get_clock().now().nanoseconds
+            try:
+                self._coordinator.referee.update_gameinfo(message.data, now_ns)
+            except (AttributeError, TypeError, ValueError) as exc:
+                self.get_logger().error(f"裁判gameinfo解析失败：{exc}")
+            self._refresh_competition_context(now_ns)
+
+        def _on_referee_score(self, message: Any) -> None:
+            now_ns = self.get_clock().now().nanoseconds
+            try:
+                self._coordinator.referee.update_score(message.data, now_ns)
+            except (AttributeError, TypeError, ValueError) as exc:
+                self.get_logger().error(f"裁判score解析失败：{exc}")
+            self._refresh_competition_context(now_ns)
+
+        def _refresh_competition_context(self, now_ns: int) -> None:
+            context = self._coordinator.context()
+            message = self._ros.String()
+            message.data = context.to_json()
+            self._context_pub.publish(message)
+            self._active_context = context
+            if not context.valid or context.finished or context.active_task is None:
+                return
+            if not self._system_ready_submitted:
+                return
+            if not self._coordinator.active_task_changed(context):
+                return
+            previous = self._last_activated_context
+            same_run_and_task = (
+                previous is not None
+                and previous.run_id == context.run_id
+                and previous.current_task_id == context.current_task_id
+            )
+            if same_run_and_task:
+                self.get_logger().info(
+                    "attempt_transition: 官方attempt已结算，当前进入同一任务的下一次"
+                    f"局内尝试：{previous.current_attempt_count} -> "
+                    f"{context.current_attempt_count}。此操作只重建本地单任务FSM，"
+                    "不代表Server、机器人或物品复位。"
+                )
+            else:
+                old_id = None if previous is None else previous.current_task_id
+                self.get_logger().info(
+                    f"task_transition: 官方当前任务切换：{old_id} -> "
+                    f"{context.current_task_id}；仅重建本地单任务FSM，"
+                    "不代表Server、机器人或物品复位。"
+                )
+            # GlobalFSM is deliberately a one-task machine. Rebuilding it on
+            # an official task/attempt transition is a local software reset
+            # only; it never requests or claims a server, robot, or object reset.
+            self._fsm = GlobalFSM(max_pick_retries=int(self._config["fsm"]["max_pick_retries"]))
+            self._fsm.handle_event(FSMEvent.SYSTEM_READY, now_ns)
+            self._fsm.submit_task(context.active_task, now_ns)
+            self._last_activated_context = context
+            active_instruction = json.dumps(
+                context.to_dict()["active_task"], ensure_ascii=False,
+                sort_keys=True, separators=(",", ":"), allow_nan=False,
+            )
+            self._external_candidate.update_instruction(
+                active_instruction, context.current_task_id, now_ns
+            )
 
         def _on_external_candidate(self, message: Any) -> None:
             """Validate and reserve one candidate; never creates or publishes an action."""
@@ -948,32 +1015,6 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 task.failure_reason,
             )
 
-        def _select_task(self, tasks: tuple[TaskSpec, ...]) -> TaskSpec:
-            """选择当前提交给 FSM 的任务，同时保留完整解析结果。
-
-            单条任务直接采用；多条任务为兼容旧版本暂取第一条。正式选择、排序或是否
-            顺序执行仍待官方确认，不能在这里写死比赛规则。
-            """
-
-            if not tasks:
-                raise ValueError("任务选择不能接收空任务列表")
-            if len(tasks) > 1 and not self._warned_multiple_tasks:
-                self.get_logger().warning(
-                    f"收到 {len(tasks)} 条任务，当前兼容策略暂选第一条；完整解析结果已缓存，"
-                    "正式多任务语义待官方确认"
-                )
-                self._warned_multiple_tasks = True
-            # TODO(official-task-selection): 官方规则确认后只替换本函数，不默认顺序执行。
-            return tasks[0]
-
-        def _submit_pending_task(self, now_ns: int) -> None:
-            if not self._system_ready_submitted or self._pending_task is None:
-                return
-            if self._fsm.submit_task(self._pending_task, now_ns):
-                self._pending_task = None
-            else:
-                self.get_logger().warning("当前 FSM 阶段不接受已缓存任务，任务仍保留待诊断")
-
         def _check_readiness(
             self,
             now_ns: int,
@@ -999,7 +1040,7 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 return
             self._system_ready_submitted = True
             _log_input_issue_on_change(self, self._input_issues, "readiness", "")
-            self._submit_pending_task(now_ns)
+            self._refresh_competition_context(now_ns)
 
         def _on_odom(self, message: Any) -> None:
             try:
@@ -1470,7 +1511,11 @@ def _create_perception_node(ros: SimpleNamespace) -> type:
                     "perception.depth_unit_scale_m 必须是正的有限数；"
                     f"实际值={self._depth_unit_scale_m!r}"
                 )
-            self._camera_info: Optional[CameraIntrinsics] = None
+            # CameraInfo is static calibration in the official server: its
+            # header is empty/zero.  Cache only K and dimensions here; bind it
+            # to each synchronized image frame below instead of pretending the
+            # calibration message itself is a new sensor measurement.
+            self._camera_calibration_cache = StaticCameraCalibrationCache()
             self._last_frame_issue = ""
             self._input_issues: dict[str, str] = {}
             self._base_cache = TimestampedCache()
@@ -1516,27 +1561,9 @@ def _create_perception_node(ros: SimpleNamespace) -> type:
 
         def _on_camera_info(self, message: Any) -> None:
             try:
-                k = tuple(float(value) for value in message.k)
-                if len(k) != 9:
-                    raise ValueError(f"CameraInfo.K 必须有9项，实际为{len(k)}项")
-                if not all(math.isfinite(value) for value in k):
-                    raise ValueError("CameraInfo.K 包含 NaN 或 Inf")
-                if k[0] <= 0.0 or k[4] <= 0.0:
-                    raise ValueError("CameraInfo 的 fx 和 fy 必须大于0")
-                width = int(message.width)
-                height = int(message.height)
-                if width <= 0 or height <= 0:
-                    raise ValueError("CameraInfo 图像宽高必须大于0")
-                self._camera_info = CameraIntrinsics(
-                    k=k,
-                    width=width,
-                    height=height,
-                    frame_id=str(message.header.frame_id),
-                    timestamp_ns=_stamp_to_ns(message.header.stamp),
-                )
+                self._camera_calibration_cache.update(message)
                 _log_input_issue_on_change(self, self._input_issues, "camera_info", "")
             except (AttributeError, TypeError, ValueError) as exc:
-                self._camera_info = None
                 _log_input_issue_on_change(
                     self,
                     self._input_issues,
@@ -1588,7 +1615,7 @@ def _create_perception_node(ros: SimpleNamespace) -> type:
                 base = self._base_cache.nearest(timestamp_ns, self._state_max_delta_ns)
                 joints = self._joint_cache.nearest(timestamp_ns, self._state_max_delta_ns)
                 missing: list[str] = []
-                if self._camera_info is None:
+                if self._camera_calibration_cache.value is None:
                     missing.append("CameraInfo")
                 if base is None or not base.valid:
                     missing.append("邻近有效Odom")
@@ -1602,22 +1629,26 @@ def _create_perception_node(ros: SimpleNamespace) -> type:
                 rgb = RGBFrame(
                     image=self._bridge.imgmsg_to_cv2(rgb_message, desired_encoding="bgr8"),
                     encoding="bgr8",
-                    frame_id=str(rgb_message.header.frame_id),
+                    frame_id=normalize_ros_frame_id(rgb_message.header.frame_id),
                     timestamp_ns=timestamp_ns,
                 )
                 depth = DepthFrame(
                     image=self._bridge.imgmsg_to_cv2(depth_message, desired_encoding="passthrough"),
                     unit_scale_m=self._depth_unit_scale_m,
-                    frame_id=str(depth_message.header.frame_id),
+                    frame_id=normalize_ros_frame_id(depth_message.header.frame_id),
                     timestamp_ns=_stamp_to_ns(depth_message.header.stamp),
                 )
+                assert self._camera_calibration_cache.value is not None
+                intrinsics = bind_static_camera_calibration(
+                    self._camera_calibration_cache.value, rgb_message, depth_message
+                )
                 detections = self._stabilizer.update(
-                    self._yolo.detect(rgb, depth, self._camera_info),
+                    self._yolo.detect(rgb, depth, intrinsics),
                     frame_timestamp_ns=rgb.timestamp_ns,
                     frame_id=rgb.frame_id,
                 )
                 estimates = self._estimator.estimate(
-                    detections, depth, self._camera_info, base, joints
+                    detections, depth, intrinsics, base, joints
                 )
                 self._publisher.publish(
                     _estimates_to_vision(estimates, self._ros, rgb_message.header.stamp)
@@ -1697,7 +1728,7 @@ def _create_recorder_node(ros: SimpleNamespace) -> type:
             self._recorder.start(
                 episode_id,
                 now_ns,
-                "临时边界：recorder 节点启动到停止；正式 Episode 边界待赛事方确认",
+                "原始Run文件边界：recorder节点启动到停止；不是正式训练Episode边界",
             )
             try:
                 if bool(recorder_config.get("record_rosbag", True)):
@@ -1730,18 +1761,24 @@ def _create_recorder_node(ros: SimpleNamespace) -> type:
                 )
                 self.create_subscription(
                     ros.String,
-                    "/referee/taskinfo",
-                    lambda message: self._on_referee_text("/referee/taskinfo", message),
+                    topics["competition_context"],
+                    self._on_competition_context,
                     10,
                 )
                 self.create_subscription(
                     ros.String,
-                    "/referee/gameinfo",
-                    lambda message: self._on_referee_text("/referee/gameinfo", message),
+                    topics["referee_taskinfo"],
+                    lambda message: self._on_referee_text(topics["referee_taskinfo"], message),
                     10,
                 )
                 self.create_subscription(
-                    ros.Int32, "/referee/score", self._on_referee_score, 10
+                    ros.String,
+                    topics["referee_gameinfo"],
+                    lambda message: self._on_referee_text(topics["referee_gameinfo"], message),
+                    10,
+                )
+                self.create_subscription(
+                    ros.Int32, topics["referee_score"], self._on_referee_score, 10
                 )
             except Exception as exc:  # noqa: BLE001 - 初始化失败必须回滚后原样上抛
                 # bag 已启动后若 Timer 或订阅创建失败，必须先停止子进程并结束元数据，
@@ -1842,6 +1879,14 @@ def _create_recorder_node(ros: SimpleNamespace) -> type:
                 )
             except (ValueError, RuntimeError) as exc:
                 self.get_logger().error(f"记录裁判元数据失败：{exc}")
+
+        def _on_competition_context(self, message: Any) -> None:
+            try:
+                self._recorder.record_competition_context(
+                    CompetitionContext.from_json(message.data)
+                )
+            except (ValueError, RuntimeError) as exc:
+                self.get_logger().error(f"记录CompetitionContext失败：{exc}")
 
         def _on_referee_score(self, message: Any) -> None:
             try:
@@ -2232,6 +2277,86 @@ def _set_stamp(stamp: Any, timestamp_ns: int) -> None:
     stamp.nanosec = timestamp_ns % 1_000_000_000
 
 
+def normalize_ros_frame_id(value: object) -> str:
+    """Remove only legacy leading slashes from a ROS frame identifier."""
+
+    if not isinstance(value, str):
+        raise ValueError("frame_id必须是字符串")
+    normalized = value.lstrip("/")
+    if not normalized:
+        raise ValueError("frame_id规范化后不能为空")
+    return normalized
+
+
+def static_camera_calibration_from_message(
+    message: Any,
+) -> tuple[tuple[float, ...], int, int]:
+    """Validate and extract only static K/width/height from CameraInfo."""
+
+    k = tuple(float(value) for value in message.k)
+    if len(k) != 9:
+        raise ValueError(f"CameraInfo.K 必须有9项，实际为{len(k)}项")
+    if not all(math.isfinite(value) for value in k):
+        raise ValueError("CameraInfo.K 包含 NaN 或 Inf")
+    if k[0] <= 0.0 or k[4] <= 0.0:
+        raise ValueError("CameraInfo 的 fx 和 fy 必须大于0")
+    width, height = int(message.width), int(message.height)
+    if width <= 0 or height <= 0:
+        raise ValueError("CameraInfo 图像宽高必须大于0")
+    return k, width, height
+
+
+def bind_static_camera_calibration(
+    calibration: tuple[tuple[float, ...], int, int],
+    rgb_message: Any,
+    depth_message: Any,
+) -> CameraIntrinsics:
+    """Bind static calibration to the current synchronized image context."""
+
+    k, width, height = calibration
+    rgb_frame = normalize_ros_frame_id(rgb_message.header.frame_id)
+    depth_frame = normalize_ros_frame_id(depth_message.header.frame_id)
+    if rgb_frame != depth_frame:
+        raise ValueError(f"RGB/Depth frame冲突：{rgb_frame!r} != {depth_frame!r}")
+    for label, message in (("RGB", rgb_message), ("Depth", depth_message)):
+        if int(message.width) != width or int(message.height) != height:
+            raise ValueError(
+                f"{label}尺寸与CameraInfo不一致：{message.width}x{message.height} != {width}x{height}"
+            )
+    return CameraIntrinsics(
+        k=k, width=width, height=height, frame_id=rgb_frame,
+        timestamp_ns=_stamp_to_ns(rgb_message.header.stamp),
+    )
+
+
+class StaticCameraCalibrationCache:
+    """Latch runtime CameraInfo changes invalid until node restart."""
+
+    def __init__(self) -> None:
+        self._value: Optional[tuple[tuple[float, ...], int, int]] = None
+        self._rejected = False
+
+    @property
+    def value(self) -> Optional[tuple[tuple[float, ...], int, int]]:
+        return self._value
+
+    def update(self, message: Any) -> tuple[tuple[float, ...], int, int]:
+        try:
+            calibration = static_camera_calibration_from_message(message)
+        except (AttributeError, TypeError, ValueError):
+            self._value = None
+            self._rejected = True
+            raise
+        if self._value is not None and calibration != self._value:
+            self._value = None
+            self._rejected = True
+            raise ValueError("CameraInfo K或图像尺寸运行中突变，已清空标定并fail-closed")
+        if self._rejected:
+            raise ValueError("CameraInfo标定已因运行中突变锁定为无效")
+        self._value = calibration
+        return calibration
+
+
 def _base_state_from_odom(message: Any) -> BaseState:
     try:
         pose = message.pose.pose
@@ -2276,7 +2401,7 @@ def _base_state_from_odom(message: Any) -> BaseState:
         yaw=yaw,
         linear_velocity_xyz=linear_velocity,
         angular_velocity_xyz=angular_velocity,
-        frame_id=str(message.header.frame_id),
+        frame_id=normalize_ros_frame_id(message.header.frame_id),
         timestamp_ns=timestamp_ns,
     )
 

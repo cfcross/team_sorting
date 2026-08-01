@@ -562,6 +562,33 @@ ros2 launch team_sorting team.launch.xml record_data:=true
 当前未实现算法会抛出中文 `NotImplementedError` 或返回 `valid/success=False`，不会
 伪造成功。即使节点能启动，也不能据此推断当前代码已能完成比赛。
 
+### 官方 offline Client 容器开发入口
+
+`scripts/run_official_offline_client.sh` 将当前项目挂载到
+`/workspace/baseline`，在 `material_sorting:offline-client` 内 source ROS 2
+Humble 并使用 `/tmp` 中全新的 build/install/log 重新构建。它固定使用 host network、
+`ROS_DOMAIN_ID=99`、`rmw_cyclonedds_cpp`，默认配置仍为 observe-only，不启动或修改
+官方 Server，也不联网下载模型。宿主机 `MATERIAL_SORTING_OFFICIAL_ROOT` 是必填目录，
+脚本会在 Docker 启动前验证官方 Server 关键文件。`TEAM_SORTING_CLIENT_GPUS` 默认
+为 `all`；无 NVIDIA GPU 的环境必须显式设为 `none`（空字符串同样禁用 GPU 参数）。
+
+```bash
+MATERIAL_SORTING_OFFICIAL_ROOT=/absolute/path/to/official \
+MATERIAL_SORTING_YOLO_CHECKPOINT=/absolute/path/to/material_box.pt \
+TEAM_SORTING_MJCF=/absolute/path/to/material_competition.xml \
+TEAM_SORTING_CLIENT_GPUS=all \
+DRY_RUN=1 ./scripts/run_official_offline_client.sh
+```
+
+TeamClient 将完整三任务集合与 `/referee/taskinfo`、`/referee/gameinfo`、
+`/referee/score` 严格组合，并在配置化的 `/team/competition_context` 发布 schema v1
+JSON。`attempt` 是当前任务已结算次数；任务切换只重建本地单任务 `GlobalFSM`，不表示
+官方物理场景复位。同一任务的 `attempt` 增加也只重新武装本地单任务 FSM，不改变
+`run_id`、不生成新任务集合、不清空 Recorder 历史，也不代表 Server、机器人或物品
+复位。Recorder 仍连续保存一个原始 Run，并用
+`competition_contexts.jsonl` 和 metadata 索引恢复 Run/Task/Attempt 层级；节点启动到
+停止不再被描述为正式训练 Episode 边界。
+
 ## 13. 当前已完成和未完成
 
 ### 架构已经完成

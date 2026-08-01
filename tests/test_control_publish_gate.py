@@ -34,9 +34,22 @@ OFFICIAL_TOPICS = {
 }
 TEAM_TELEMETRY_TOPICS = {
     "/team/action_dispatch",
+    "/team/competition_context",
     "/team/final_action",
     "/team/fsm_status",
 }
+OFFICIAL_TASKS = [
+    {"task": 1, "instruction": "task one", "target_kind": "cuboid_box",
+     "target_body": "box_1", "target_color": "pink", "place_type": "shelf_point",
+     "place_world": [1.0, 2.0, 3.0], "place_radius": 0.24},
+    {"task": 2, "instruction": "task two", "target_kind": "cuboid_box",
+     "target_body": "box_2", "target_color": "brown", "place_type": "table_point",
+     "place_world": [2.0, 2.0, 3.0], "place_radius": 0.28},
+    {"task": 3, "instruction": "task three", "target_kind": "cuboid_box",
+     "target_body": "box_3", "target_color": "yellow", "place_type": "shelf_prop_side",
+     "place_world": [3.0, 2.0, 3.0], "place_radius": 0.24,
+     "ref_prop": "packaging_box", "ref_prop_body": "prop", "direction": "left"},
+]
 
 
 class _Context:
@@ -179,6 +192,27 @@ def _tracking_enabled() -> dict[str, bool]:
     return {"enabled": True, "fresh_reset_confirmed": True}
 
 
+def _message(data: Any) -> _Message:
+    message = _Message()
+    message.data = data
+    return message
+
+
+def _feed_official_context(
+    node: Any, *, task: int, attempt: int, score: int = 0
+) -> None:
+    node._on_referee_taskinfo(
+        _message(f"任务{task}: {OFFICIAL_TASKS[task - 1]['instruction']}")
+    )
+    node._on_referee_gameinfo(
+        _message(
+            f"t=1.0s score={score} task={task}/3 best=[0, 0, 0] "
+            f"attempt={attempt} step=-"
+        )
+    )
+    node._on_referee_score(_message(score))
+
+
 def _joints() -> RobotJointState:
     return RobotJointState(
         position=(0.0,) * 17,
@@ -258,6 +292,82 @@ def test_default_config_is_observe_only_and_creates_no_official_publishers() -> 
     assert set(node.publishers) == TEAM_TELEMETRY_TOPICS
     assert not OFFICIAL_TOPICS.intersection(node.publishers)
     assert any("official_publish_disabled" in message for _, message in node.logger.messages)
+
+
+def test_settled_attempts_rearm_only_the_local_single_task_fsm() -> None:
+    node = _node()
+    node._system_ready_submitted = True
+    node._on_instruction(_message(json.dumps(OFFICIAL_TASKS)))
+
+    _feed_official_context(node, task=1, attempt=0)
+    run_id = node._active_context.run_id
+    first_fsm = node._fsm
+    assert node._fsm.task.task_id == 1
+
+    _feed_official_context(node, task=1, attempt=0)
+    assert node._fsm is first_fsm
+
+    _feed_official_context(node, task=1, attempt=1)
+    second_fsm = node._fsm
+    assert second_fsm is not first_fsm
+    assert node._fsm.task.task_id == 1
+    assert node._active_context.run_id == run_id
+
+    _feed_official_context(node, task=1, attempt=2)
+    assert node._fsm is not second_fsm
+    assert node._fsm.task.task_id == 1
+    assert node._active_context.run_id == run_id
+
+    logs = [message for _level, message in node.logger.messages]
+    assert sum("task_transition" in message for message in logs) == 1
+    assert sum("attempt_transition" in message for message in logs) == 2
+    assert any("不代表Server、机器人或物品复位" in message for message in logs)
+    assert not any("Server reset" in message for message in logs)
+
+
+def test_official_publish_order_recovers_once_without_task1_fallback() -> None:
+    node = _node()
+    node._system_ready_submitted = True
+    node._on_instruction(_message(json.dumps(OFFICIAL_TASKS)))
+    _feed_official_context(node, task=1, attempt=0)
+    task1_fsm = node._fsm
+
+    node._on_referee_taskinfo(_message("任务2: task two"))
+    after_taskinfo = json.loads(node.publishers["/team/competition_context"].messages[-1].data)
+    assert not after_taskinfo["valid"]
+    assert node._fsm is task1_fsm
+
+    node._on_referee_gameinfo(
+        _message("t=2.0s score=10 task=2/3 best=[0, 0, 0] attempt=0 step=-")
+    )
+    after_gameinfo = json.loads(node.publishers["/team/competition_context"].messages[-1].data)
+    assert not after_gameinfo["valid"]
+    assert node._fsm is task1_fsm
+
+    node._on_referee_score(_message(10))
+    task2_fsm = node._fsm
+    recovered = node._active_context
+    assert recovered.valid and recovered.active_task.task_id == 2
+    assert task2_fsm is not task1_fsm
+
+    _feed_official_context(node, task=2, attempt=0, score=10)
+    assert node._fsm is task2_fsm
+    logs = [message for _level, message in node.logger.messages]
+    assert sum("task_transition" in message for message in logs) == 2
+
+
+def test_malformed_referee_message_then_complete_topics_recovers_once() -> None:
+    node = _node()
+    node._system_ready_submitted = True
+    node._on_instruction(_message(json.dumps(OFFICIAL_TASKS)))
+    node._on_referee_gameinfo(_message("malformed"))
+    assert not node._active_context.valid
+
+    _feed_official_context(node, task=1, attempt=0)
+    recovered_fsm = node._fsm
+    assert node._active_context.valid and node._fsm.task.task_id == 1
+    _feed_official_context(node, task=1, attempt=0)
+    assert node._fsm is recovered_fsm
 
 
 @pytest.mark.parametrize(
