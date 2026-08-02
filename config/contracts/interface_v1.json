@@ -1,0 +1,1631 @@
+{
+  "schema_name": "team_sorting.interface",
+  "schema_version": 1,
+  "contract_status": "frozen",
+  "action_contract": {
+    "schema_version": 1,
+    "dimension_count": 19,
+    "canonical_names_source": "team_sorting.interfaces.ACTION_NAMES",
+    "semantic_alignment": "Action indices 2..18 correspond semantically and positionally to JOINT_NAMES; the two name arrays are deliberately not string-equal.",
+    "base_is_not_direct_wheel_command": true,
+    "official_cmd_vel_accepted_limits_status": "unresolved",
+    "position_zero_is_stop": false,
+    "uncontrolled_position_fill_zero_forbidden": true,
+    "gripper_open_close_direction_status": "unresolved",
+    "dimensions": [
+      {
+        "index": 0,
+        "name": "base_v",
+        "component": "base",
+        "control_mode": "velocity",
+        "unit": "m/s",
+        "safe_min": -0.25,
+        "safe_max": 0.25,
+        "runtime_min": null,
+        "runtime_max": null,
+        "runtime_range_status": "unresolved",
+        "official_topic_group": "base",
+        "group_index": 0,
+        "official_message_field": "Twist.linear.x",
+        "hold_semantics": "零值表示零速度请求；是否发布仍由ActionMux与dispatch门决定。",
+        "training_label_semantics": "只有dispatched_action中非null的精确payload可作为命令标签候选。",
+        "source_reference": "official examples/ros2/mmk2_ros2.py cmd_vel_callback; team controller manifest V1",
+        "status": "partially_verified"
+      },
+      {
+        "index": 1,
+        "name": "base_w",
+        "component": "base",
+        "control_mode": "velocity",
+        "unit": "rad/s",
+        "safe_min": -0.5,
+        "safe_max": 0.5,
+        "runtime_min": null,
+        "runtime_max": null,
+        "runtime_range_status": "unresolved",
+        "official_topic_group": "base",
+        "group_index": 1,
+        "official_message_field": "Twist.angular.z",
+        "hold_semantics": "零值表示零速度请求；是否发布仍由ActionMux与dispatch门决定。",
+        "training_label_semantics": "只有dispatched_action中非null的精确payload可作为命令标签候选。",
+        "source_reference": "official examples/ros2/mmk2_ros2.py cmd_vel_callback; team controller manifest V1",
+        "status": "partially_verified"
+      },
+      {
+        "index": 2,
+        "name": "slide",
+        "component": "spine",
+        "control_mode": "absolute_position",
+        "unit": "m",
+        "safe_min": -0.04,
+        "safe_max": 0.87,
+        "runtime_min": -0.04,
+        "runtime_max": 0.87,
+        "official_topic_group": "spine",
+        "group_index": 0,
+        "joint_state_name": "slide_joint",
+        "hold_semantics": "这是位置目标；0不是停止，未控制维度不得补零。保持诊断值来自新鲜实际JointState，实际命令以dispatch payload为准。",
+        "training_label_semantics": "只有dispatched_action中非null的精确payload可作为命令标签候选。",
+        "source_reference": "team_sorting.controller_manifest.MMK2_CONTROLLER_MANIFEST_V1; official MMK2 control MJCF",
+        "status": "runtime_verified"
+      },
+      {
+        "index": 3,
+        "name": "head_yaw",
+        "component": "head",
+        "control_mode": "absolute_position",
+        "unit": "rad",
+        "safe_min": -0.5,
+        "safe_max": 0.5,
+        "runtime_min": -0.5,
+        "runtime_max": 0.5,
+        "official_topic_group": "head",
+        "group_index": 0,
+        "joint_state_name": "head_yaw_joint",
+        "hold_semantics": "这是位置目标；0不是停止，未控制维度不得补零。保持诊断值来自新鲜实际JointState，实际命令以dispatch payload为准。",
+        "training_label_semantics": "head-only精确训练命令必须来自dispatch payload，不能从FinalAction或JointState推断。",
+        "source_reference": "team_sorting.controller_manifest.MMK2_CONTROLLER_MANIFEST_V1; official MMK2 control MJCF",
+        "status": "runtime_verified"
+      },
+      {
+        "index": 4,
+        "name": "head_pitch",
+        "component": "head",
+        "control_mode": "absolute_position",
+        "unit": "rad",
+        "safe_min": -1.18,
+        "safe_max": 0.16,
+        "runtime_min": -1.18,
+        "runtime_max": 0.16,
+        "official_topic_group": "head",
+        "group_index": 1,
+        "joint_state_name": "head_pitch_joint",
+        "hold_semantics": "这是位置目标；0不是停止，未控制维度不得补零。保持诊断值来自新鲜实际JointState，实际命令以dispatch payload为准。",
+        "training_label_semantics": "head-only精确训练命令必须来自dispatch payload，不能从FinalAction或JointState推断。",
+        "source_reference": "team_sorting.controller_manifest.MMK2_CONTROLLER_MANIFEST_V1; official MMK2 control MJCF",
+        "status": "runtime_verified"
+      },
+      {
+        "index": 5,
+        "name": "left_arm_joint_1",
+        "component": "left_arm",
+        "control_mode": "absolute_position",
+        "unit": "rad",
+        "safe_min": -3.14,
+        "safe_max": 2.089,
+        "runtime_min": -3.151,
+        "runtime_max": 2.089,
+        "official_topic_group": "left_arm",
+        "group_index": 0,
+        "joint_state_name": "left_arm_joint1",
+        "hold_semantics": "这是位置目标；0不是停止，未控制维度不得补零。保持诊断值来自新鲜实际JointState，实际命令以dispatch payload为准。",
+        "training_label_semantics": "只有dispatched_action中非null的精确payload可作为命令标签候选。",
+        "source_reference": "team_sorting.controller_manifest.MMK2_CONTROLLER_MANIFEST_V1; official MMK2 control MJCF",
+        "status": "runtime_verified"
+      },
+      {
+        "index": 6,
+        "name": "left_arm_joint_2",
+        "component": "left_arm",
+        "control_mode": "absolute_position",
+        "unit": "rad",
+        "safe_min": -2.5,
+        "safe_max": 0.181,
+        "runtime_min": -2.963,
+        "runtime_max": 0.181,
+        "official_topic_group": "left_arm",
+        "group_index": 1,
+        "joint_state_name": "left_arm_joint2",
+        "hold_semantics": "这是位置目标；0不是停止，未控制维度不得补零。保持诊断值来自新鲜实际JointState，实际命令以dispatch payload为准。",
+        "training_label_semantics": "只有dispatched_action中非null的精确payload可作为命令标签候选。",
+        "source_reference": "team_sorting.controller_manifest.MMK2_CONTROLLER_MANIFEST_V1; official MMK2 control MJCF",
+        "status": "runtime_verified"
+      },
+      {
+        "index": 7,
+        "name": "left_arm_joint_3",
+        "component": "left_arm",
+        "control_mode": "absolute_position",
+        "unit": "rad",
+        "safe_min": -0.094,
+        "safe_max": 3.14,
+        "runtime_min": -0.094,
+        "runtime_max": 3.161,
+        "official_topic_group": "left_arm",
+        "group_index": 2,
+        "joint_state_name": "left_arm_joint3",
+        "hold_semantics": "这是位置目标；0不是停止，未控制维度不得补零。保持诊断值来自新鲜实际JointState，实际命令以dispatch payload为准。",
+        "training_label_semantics": "只有dispatched_action中非null的精确payload可作为命令标签候选。",
+        "source_reference": "team_sorting.controller_manifest.MMK2_CONTROLLER_MANIFEST_V1; official MMK2 control MJCF",
+        "status": "runtime_verified"
+      },
+      {
+        "index": 8,
+        "name": "left_arm_joint_4",
+        "component": "left_arm",
+        "control_mode": "absolute_position",
+        "unit": "rad",
+        "safe_min": -2.6,
+        "safe_max": 2.6,
+        "runtime_min": -3.012,
+        "runtime_max": 3.012,
+        "official_topic_group": "left_arm",
+        "group_index": 3,
+        "joint_state_name": "left_arm_joint4",
+        "hold_semantics": "这是位置目标；0不是停止，未控制维度不得补零。保持诊断值来自新鲜实际JointState，实际命令以dispatch payload为准。",
+        "training_label_semantics": "只有dispatched_action中非null的精确payload可作为命令标签候选。",
+        "source_reference": "team_sorting.controller_manifest.MMK2_CONTROLLER_MANIFEST_V1; official MMK2 control MJCF",
+        "status": "runtime_verified"
+      },
+      {
+        "index": 9,
+        "name": "left_arm_joint_5",
+        "component": "left_arm",
+        "control_mode": "absolute_position",
+        "unit": "rad",
+        "safe_min": -1.859,
+        "safe_max": 1.859,
+        "runtime_min": -1.859,
+        "runtime_max": 1.859,
+        "official_topic_group": "left_arm",
+        "group_index": 4,
+        "joint_state_name": "left_arm_joint5",
+        "hold_semantics": "这是位置目标；0不是停止，未控制维度不得补零。保持诊断值来自新鲜实际JointState，实际命令以dispatch payload为准。",
+        "training_label_semantics": "只有dispatched_action中非null的精确payload可作为命令标签候选。",
+        "source_reference": "team_sorting.controller_manifest.MMK2_CONTROLLER_MANIFEST_V1; official MMK2 control MJCF",
+        "status": "runtime_verified"
+      },
+      {
+        "index": 10,
+        "name": "left_arm_joint_6",
+        "component": "left_arm",
+        "control_mode": "absolute_position",
+        "unit": "rad",
+        "safe_min": -2.6,
+        "safe_max": 2.6,
+        "runtime_min": -3.017,
+        "runtime_max": 3.017,
+        "official_topic_group": "left_arm",
+        "group_index": 5,
+        "joint_state_name": "left_arm_joint6",
+        "hold_semantics": "这是位置目标；0不是停止，未控制维度不得补零。保持诊断值来自新鲜实际JointState，实际命令以dispatch payload为准。",
+        "training_label_semantics": "只有dispatched_action中非null的精确payload可作为命令标签候选。",
+        "source_reference": "team_sorting.controller_manifest.MMK2_CONTROLLER_MANIFEST_V1; official MMK2 control MJCF",
+        "status": "runtime_verified"
+      },
+      {
+        "index": 11,
+        "name": "left_gripper",
+        "component": "left_arm",
+        "control_mode": "normalized_position",
+        "unit": "dimensionless",
+        "safe_min": 0,
+        "safe_max": 1,
+        "runtime_min": 0,
+        "runtime_max": 1,
+        "official_topic_group": "left_arm",
+        "group_index": 6,
+        "joint_state_name": "left_arm_eef_gripper_joint",
+        "hold_semantics": "这是位置目标；0不是停止，未控制维度不得补零。保持诊断值来自新鲜实际JointState，实际命令以dispatch payload为准。",
+        "training_label_semantics": "只有dispatched_action中非null的精确payload可作为命令标签候选。",
+        "source_reference": "team_sorting.controller_manifest.MMK2_CONTROLLER_MANIFEST_V1; official MMK2 control MJCF",
+        "status": "unresolved"
+      },
+      {
+        "index": 12,
+        "name": "right_arm_joint_1",
+        "component": "right_arm",
+        "control_mode": "absolute_position",
+        "unit": "rad",
+        "safe_min": -3.14,
+        "safe_max": 2.089,
+        "runtime_min": -3.151,
+        "runtime_max": 2.089,
+        "official_topic_group": "right_arm",
+        "group_index": 0,
+        "joint_state_name": "right_arm_joint1",
+        "hold_semantics": "这是位置目标；0不是停止，未控制维度不得补零。保持诊断值来自新鲜实际JointState，实际命令以dispatch payload为准。",
+        "training_label_semantics": "只有dispatched_action中非null的精确payload可作为命令标签候选。",
+        "source_reference": "team_sorting.controller_manifest.MMK2_CONTROLLER_MANIFEST_V1; official MMK2 control MJCF",
+        "status": "runtime_verified"
+      },
+      {
+        "index": 13,
+        "name": "right_arm_joint_2",
+        "component": "right_arm",
+        "control_mode": "absolute_position",
+        "unit": "rad",
+        "safe_min": -2.5,
+        "safe_max": 0.181,
+        "runtime_min": -2.963,
+        "runtime_max": 0.181,
+        "official_topic_group": "right_arm",
+        "group_index": 1,
+        "joint_state_name": "right_arm_joint2",
+        "hold_semantics": "这是位置目标；0不是停止，未控制维度不得补零。保持诊断值来自新鲜实际JointState，实际命令以dispatch payload为准。",
+        "training_label_semantics": "只有dispatched_action中非null的精确payload可作为命令标签候选。",
+        "source_reference": "team_sorting.controller_manifest.MMK2_CONTROLLER_MANIFEST_V1; official MMK2 control MJCF",
+        "status": "runtime_verified"
+      },
+      {
+        "index": 14,
+        "name": "right_arm_joint_3",
+        "component": "right_arm",
+        "control_mode": "absolute_position",
+        "unit": "rad",
+        "safe_min": -0.094,
+        "safe_max": 3.14,
+        "runtime_min": -0.094,
+        "runtime_max": 3.161,
+        "official_topic_group": "right_arm",
+        "group_index": 2,
+        "joint_state_name": "right_arm_joint3",
+        "hold_semantics": "这是位置目标；0不是停止，未控制维度不得补零。保持诊断值来自新鲜实际JointState，实际命令以dispatch payload为准。",
+        "training_label_semantics": "只有dispatched_action中非null的精确payload可作为命令标签候选。",
+        "source_reference": "team_sorting.controller_manifest.MMK2_CONTROLLER_MANIFEST_V1; official MMK2 control MJCF",
+        "status": "runtime_verified"
+      },
+      {
+        "index": 15,
+        "name": "right_arm_joint_4",
+        "component": "right_arm",
+        "control_mode": "absolute_position",
+        "unit": "rad",
+        "safe_min": -2.6,
+        "safe_max": 2.6,
+        "runtime_min": -3.012,
+        "runtime_max": 3.012,
+        "official_topic_group": "right_arm",
+        "group_index": 3,
+        "joint_state_name": "right_arm_joint4",
+        "hold_semantics": "这是位置目标；0不是停止，未控制维度不得补零。保持诊断值来自新鲜实际JointState，实际命令以dispatch payload为准。",
+        "training_label_semantics": "只有dispatched_action中非null的精确payload可作为命令标签候选。",
+        "source_reference": "team_sorting.controller_manifest.MMK2_CONTROLLER_MANIFEST_V1; official MMK2 control MJCF",
+        "status": "runtime_verified"
+      },
+      {
+        "index": 16,
+        "name": "right_arm_joint_5",
+        "component": "right_arm",
+        "control_mode": "absolute_position",
+        "unit": "rad",
+        "safe_min": -1.859,
+        "safe_max": 1.859,
+        "runtime_min": -1.859,
+        "runtime_max": 1.859,
+        "official_topic_group": "right_arm",
+        "group_index": 4,
+        "joint_state_name": "right_arm_joint5",
+        "hold_semantics": "这是位置目标；0不是停止，未控制维度不得补零。保持诊断值来自新鲜实际JointState，实际命令以dispatch payload为准。",
+        "training_label_semantics": "只有dispatched_action中非null的精确payload可作为命令标签候选。",
+        "source_reference": "team_sorting.controller_manifest.MMK2_CONTROLLER_MANIFEST_V1; official MMK2 control MJCF",
+        "status": "runtime_verified"
+      },
+      {
+        "index": 17,
+        "name": "right_arm_joint_6",
+        "component": "right_arm",
+        "control_mode": "absolute_position",
+        "unit": "rad",
+        "safe_min": -2.6,
+        "safe_max": 2.6,
+        "runtime_min": -3.017,
+        "runtime_max": 3.017,
+        "official_topic_group": "right_arm",
+        "group_index": 5,
+        "joint_state_name": "right_arm_joint6",
+        "hold_semantics": "这是位置目标；0不是停止，未控制维度不得补零。保持诊断值来自新鲜实际JointState，实际命令以dispatch payload为准。",
+        "training_label_semantics": "只有dispatched_action中非null的精确payload可作为命令标签候选。",
+        "source_reference": "team_sorting.controller_manifest.MMK2_CONTROLLER_MANIFEST_V1; official MMK2 control MJCF",
+        "status": "runtime_verified"
+      },
+      {
+        "index": 18,
+        "name": "right_gripper",
+        "component": "right_arm",
+        "control_mode": "normalized_position",
+        "unit": "dimensionless",
+        "safe_min": 0,
+        "safe_max": 1,
+        "runtime_min": 0,
+        "runtime_max": 1,
+        "official_topic_group": "right_arm",
+        "group_index": 6,
+        "joint_state_name": "right_arm_eef_gripper_joint",
+        "hold_semantics": "这是位置目标；0不是停止，未控制维度不得补零。保持诊断值来自新鲜实际JointState，实际命令以dispatch payload为准。",
+        "training_label_semantics": "只有dispatched_action中非null的精确payload可作为命令标签候选。",
+        "source_reference": "team_sorting.controller_manifest.MMK2_CONTROLLER_MANIFEST_V1; official MMK2 control MJCF",
+        "status": "unresolved"
+      }
+    ]
+  },
+  "joint_state_contract": {
+    "schema_version": 1,
+    "dimension_count": 17,
+    "canonical_names_source": "team_sorting.interfaces.JOINT_NAMES",
+    "names": [
+      "slide_joint",
+      "head_yaw_joint",
+      "head_pitch_joint",
+      "left_arm_joint1",
+      "left_arm_joint2",
+      "left_arm_joint3",
+      "left_arm_joint4",
+      "left_arm_joint5",
+      "left_arm_joint6",
+      "left_arm_eef_gripper_joint",
+      "right_arm_joint1",
+      "right_arm_joint2",
+      "right_arm_joint3",
+      "right_arm_joint4",
+      "right_arm_joint5",
+      "right_arm_joint6",
+      "right_arm_eef_gripper_joint"
+    ],
+    "semantic_alignment": "JointState indices 0..16 correspond to Action indices 2..18 by semantics; ACTION_NAMES[2:] and JOINT_NAMES are distinct name arrays.",
+    "dimensions": [
+      {
+        "index": 0,
+        "name": "slide_joint",
+        "action_index": 2,
+        "action_name": "slide",
+        "position_unit": "m",
+        "effort_unit": null,
+        "effort_unit_status": "unresolved"
+      },
+      {
+        "index": 1,
+        "name": "head_yaw_joint",
+        "action_index": 3,
+        "action_name": "head_yaw",
+        "position_unit": "rad",
+        "effort_unit": null,
+        "effort_unit_status": "unresolved"
+      },
+      {
+        "index": 2,
+        "name": "head_pitch_joint",
+        "action_index": 4,
+        "action_name": "head_pitch",
+        "position_unit": "rad",
+        "effort_unit": null,
+        "effort_unit_status": "unresolved"
+      },
+      {
+        "index": 3,
+        "name": "left_arm_joint1",
+        "action_index": 5,
+        "action_name": "left_arm_joint_1",
+        "position_unit": "rad",
+        "effort_unit": null,
+        "effort_unit_status": "unresolved"
+      },
+      {
+        "index": 4,
+        "name": "left_arm_joint2",
+        "action_index": 6,
+        "action_name": "left_arm_joint_2",
+        "position_unit": "rad",
+        "effort_unit": null,
+        "effort_unit_status": "unresolved"
+      },
+      {
+        "index": 5,
+        "name": "left_arm_joint3",
+        "action_index": 7,
+        "action_name": "left_arm_joint_3",
+        "position_unit": "rad",
+        "effort_unit": null,
+        "effort_unit_status": "unresolved"
+      },
+      {
+        "index": 6,
+        "name": "left_arm_joint4",
+        "action_index": 8,
+        "action_name": "left_arm_joint_4",
+        "position_unit": "rad",
+        "effort_unit": null,
+        "effort_unit_status": "unresolved"
+      },
+      {
+        "index": 7,
+        "name": "left_arm_joint5",
+        "action_index": 9,
+        "action_name": "left_arm_joint_5",
+        "position_unit": "rad",
+        "effort_unit": null,
+        "effort_unit_status": "unresolved"
+      },
+      {
+        "index": 8,
+        "name": "left_arm_joint6",
+        "action_index": 10,
+        "action_name": "left_arm_joint_6",
+        "position_unit": "rad",
+        "effort_unit": null,
+        "effort_unit_status": "unresolved"
+      },
+      {
+        "index": 9,
+        "name": "left_arm_eef_gripper_joint",
+        "action_index": 11,
+        "action_name": "left_gripper",
+        "position_unit": "dimensionless",
+        "effort_unit": null,
+        "effort_unit_status": "unresolved"
+      },
+      {
+        "index": 10,
+        "name": "right_arm_joint1",
+        "action_index": 12,
+        "action_name": "right_arm_joint_1",
+        "position_unit": "rad",
+        "effort_unit": null,
+        "effort_unit_status": "unresolved"
+      },
+      {
+        "index": 11,
+        "name": "right_arm_joint2",
+        "action_index": 13,
+        "action_name": "right_arm_joint_2",
+        "position_unit": "rad",
+        "effort_unit": null,
+        "effort_unit_status": "unresolved"
+      },
+      {
+        "index": 12,
+        "name": "right_arm_joint3",
+        "action_index": 14,
+        "action_name": "right_arm_joint_3",
+        "position_unit": "rad",
+        "effort_unit": null,
+        "effort_unit_status": "unresolved"
+      },
+      {
+        "index": 13,
+        "name": "right_arm_joint4",
+        "action_index": 15,
+        "action_name": "right_arm_joint_4",
+        "position_unit": "rad",
+        "effort_unit": null,
+        "effort_unit_status": "unresolved"
+      },
+      {
+        "index": 14,
+        "name": "right_arm_joint5",
+        "action_index": 16,
+        "action_name": "right_arm_joint_5",
+        "position_unit": "rad",
+        "effort_unit": null,
+        "effort_unit_status": "unresolved"
+      },
+      {
+        "index": 15,
+        "name": "right_arm_joint6",
+        "action_index": 17,
+        "action_name": "right_arm_joint_6",
+        "position_unit": "rad",
+        "effort_unit": null,
+        "effort_unit_status": "unresolved"
+      },
+      {
+        "index": 16,
+        "name": "right_arm_eef_gripper_joint",
+        "action_index": 18,
+        "action_name": "right_gripper",
+        "position_unit": "dimensionless",
+        "effort_unit": null,
+        "effort_unit_status": "unresolved"
+      }
+    ],
+    "empty_velocity_behavior": "current ROS adapter fills a 17-element zero tuple when source velocity is empty",
+    "empty_effort_behavior": "current ROS adapter fills a 17-element zero tuple when source effort is empty",
+    "missing_field_warning": "补零可能表示源字段缺失，不一定表示真实物理零值。"
+  },
+  "official_control_topics": {
+    "schema_version": 1,
+    "unique_arbiter": "team_sorting.action_mux.ActionMux",
+    "unique_production_boundary": "team_sorting.ros_nodes.OfficialCommandPublisher",
+    "direct_publish_by_team_modules_forbidden": true,
+    "groups": [
+      {
+        "group": "base",
+        "ros_topic": "/cmd_vel",
+        "ros_message_type": "geometry_msgs/msg/Twist",
+        "payload_width": 2,
+        "action_slice": [
+          0,
+          2
+        ],
+        "control_semantics": "velocity: linear.x, angular.z",
+        "unique_production_boundary": "OfficialCommandPublisher",
+        "observe_only_behavior": "publisher is not created and no call is attempted"
+      },
+      {
+        "group": "spine",
+        "ros_topic": "/spine_forward_position_controller/commands",
+        "ros_message_type": "std_msgs/msg/Float64MultiArray",
+        "payload_width": 1,
+        "action_slice": [
+          2,
+          3
+        ],
+        "control_semantics": "absolute position",
+        "unique_production_boundary": "OfficialCommandPublisher",
+        "observe_only_behavior": "publisher is not created and no call is attempted"
+      },
+      {
+        "group": "head",
+        "ros_topic": "/head_forward_position_controller/commands",
+        "ros_message_type": "std_msgs/msg/Float64MultiArray",
+        "payload_width": 2,
+        "action_slice": [
+          3,
+          5
+        ],
+        "control_semantics": "absolute position",
+        "unique_production_boundary": "OfficialCommandPublisher",
+        "observe_only_behavior": "publisher is not created and no call is attempted"
+      },
+      {
+        "group": "left_arm",
+        "ros_topic": "/left_arm_forward_position_controller/commands",
+        "ros_message_type": "std_msgs/msg/Float64MultiArray",
+        "payload_width": 7,
+        "action_slice": [
+          5,
+          12
+        ],
+        "control_semantics": "six absolute joint positions plus normalized gripper position",
+        "unique_production_boundary": "OfficialCommandPublisher",
+        "observe_only_behavior": "publisher is not created and no call is attempted"
+      },
+      {
+        "group": "right_arm",
+        "ros_topic": "/right_arm_forward_position_controller/commands",
+        "ros_message_type": "std_msgs/msg/Float64MultiArray",
+        "payload_width": 7,
+        "action_slice": [
+          12,
+          19
+        ],
+        "control_semantics": "six absolute joint positions plus normalized gripper position",
+        "unique_production_boundary": "OfficialCommandPublisher",
+        "observe_only_behavior": "publisher is not created and no call is attempted"
+      }
+    ]
+  },
+  "observation_contract": {
+    "schema_version": 1,
+    "observations": [
+      {
+        "canonical_name": "head_rgb",
+        "ros_topic": "/head_camera/color/image_raw",
+        "ros_type": "sensor_msgs/msg/Image",
+        "timestamp_source": "ROS header stamp",
+        "receive_timestamp_required": true,
+        "frame": "head_camera",
+        "expected_rate_hz": 24,
+        "expected_rate_source": "official Server invocation; source observation, not protocol guarantee",
+        "freshness_ms": 50,
+        "static_cache_allowed": false,
+        "missing_behavior": "reject sample and do not fabricate image",
+        "status": "source_verified"
+      },
+      {
+        "canonical_name": "aligned_depth",
+        "ros_topic": "/head_camera/aligned_depth_to_color/image_raw",
+        "ros_type": "sensor_msgs/msg/Image",
+        "timestamp_source": "ROS header stamp",
+        "receive_timestamp_required": true,
+        "frame": "head_camera",
+        "expected_rate_hz": 24,
+        "expected_rate_source": "official Server invocation; source observation, not protocol guarantee",
+        "freshness_ms": 50,
+        "static_cache_allowed": false,
+        "missing_behavior": "reject synchronized estimate",
+        "status": "source_verified"
+      },
+      {
+        "canonical_name": "head_camera_info",
+        "ros_topic": "/head_camera/color/camera_info",
+        "ros_type": "sensor_msgs/msg/CameraInfo",
+        "timestamp_source": "raw header is zero stamp",
+        "receive_timestamp_required": true,
+        "frame": "raw frame is empty; adapter binds the synchronized RGB context without rewriting raw fact",
+        "expected_rate_hz": 1,
+        "expected_rate_source": "official source timer; not protocol guarantee",
+        "freshness_ms": null,
+        "static_cache_allowed": true,
+        "missing_behavior": "no 3D estimate without valid intrinsics",
+        "status": "source_verified",
+        "raw_header_stamp": "zero",
+        "raw_header_frame_id": "",
+        "adapter_behavior": "bind receive/RGB context; do not claim raw header was populated"
+      },
+      {
+        "canonical_name": "odom",
+        "ros_topic": "/slamware_ros_sdk_server_node/odom",
+        "ros_type": "nav_msgs/msg/Odometry",
+        "timestamp_source": "ROS header stamp",
+        "receive_timestamp_required": true,
+        "frame": {
+          "raw": "/odom",
+          "normalized_at_ros_adapter": "odom"
+        },
+        "expected_rate_hz": 24,
+        "expected_rate_source": "official Server invocation; not protocol guarantee",
+        "freshness_ms": 150,
+        "static_cache_allowed": false,
+        "missing_behavior": "navigation/control fail closed",
+        "status": "source_verified"
+      },
+      {
+        "canonical_name": "tf_odom_base",
+        "ros_topic": "/tf",
+        "ros_type": "tf2_msgs/msg/TFMessage",
+        "timestamp_source": "ROS header stamp",
+        "receive_timestamp_required": true,
+        "frame": {
+          "parent": "odom",
+          "child": "base_link"
+        },
+        "expected_rate_hz": 24,
+        "expected_rate_source": "official Server invocation; not protocol guarantee",
+        "freshness_ms": 150,
+        "static_cache_allowed": false,
+        "missing_behavior": "frame-dependent work fails closed",
+        "status": "planned",
+        "recorder_v1_collection": "planned_required"
+      },
+      {
+        "canonical_name": "joint_state",
+        "ros_topic": "/joint_states",
+        "ros_type": "sensor_msgs/msg/JointState",
+        "timestamp_source": "ROS header stamp",
+        "receive_timestamp_required": true,
+        "frame": null,
+        "expected_rate_hz": 24,
+        "expected_rate_source": "official Server invocation; not protocol guarantee",
+        "freshness_ms": 150,
+        "static_cache_allowed": false,
+        "missing_behavior": "position-dependent control fails closed",
+        "status": "source_verified"
+      },
+      {
+        "canonical_name": "object_estimate_3d",
+        "ros_topic": "/team/object_estimates",
+        "ros_type": "vision_msgs/msg/Detection3DArray",
+        "timestamp_source": "generated sensor-context stamp",
+        "receive_timestamp_required": true,
+        "frame": "planning frame from config (currently odom)",
+        "expected_rate_hz": null,
+        "expected_rate_source": "team output; rate depends on synchronized perception",
+        "freshness_ms": null,
+        "static_cache_allowed": false,
+        "missing_behavior": "target-dependent behavior remains unavailable",
+        "status": "provisional"
+      },
+      {
+        "canonical_name": "instruction",
+        "ros_topic": "/material/instruction",
+        "ros_type": "std_msgs/msg/String",
+        "timestamp_source": "receive timestamp plus message semantics",
+        "receive_timestamp_required": true,
+        "frame": "world for task place points",
+        "expected_rate_hz": 2,
+        "expected_rate_source": "official Server timer/source; not protocol guarantee",
+        "freshness_ms": 1500,
+        "static_cache_allowed": false,
+        "missing_behavior": "no valid task",
+        "status": "source_verified"
+      },
+      {
+        "canonical_name": "competition_context",
+        "ros_topic": "/team/competition_context",
+        "ros_type": "std_msgs/msg/String",
+        "timestamp_source": "generated timestamp in strict JSON",
+        "receive_timestamp_required": true,
+        "frame": null,
+        "expected_rate_hz": null,
+        "expected_rate_source": "event-driven team adapter",
+        "freshness_ms": null,
+        "static_cache_allowed": true,
+        "missing_behavior": "identity-dependent recording fails closed",
+        "status": "frozen"
+      },
+      {
+        "canonical_name": "referee_taskinfo",
+        "ros_topic": "/referee/taskinfo",
+        "ros_type": "std_msgs/msg/String",
+        "timestamp_source": "receive timestamp",
+        "receive_timestamp_required": true,
+        "frame": null,
+        "expected_rate_hz": 2,
+        "expected_rate_source": "official referee timer/source; not protocol guarantee",
+        "freshness_ms": null,
+        "static_cache_allowed": true,
+        "missing_behavior": "do not infer task transition",
+        "status": "source_verified"
+      },
+      {
+        "canonical_name": "referee_gameinfo",
+        "ros_topic": "/referee/gameinfo",
+        "ros_type": "std_msgs/msg/String",
+        "timestamp_source": "receive timestamp",
+        "receive_timestamp_required": true,
+        "frame": null,
+        "expected_rate_hz": 2,
+        "expected_rate_source": "official referee timer/source; not protocol guarantee",
+        "freshness_ms": null,
+        "static_cache_allowed": true,
+        "missing_behavior": "do not infer game state",
+        "status": "source_verified"
+      },
+      {
+        "canonical_name": "referee_score",
+        "ros_topic": "/referee/score",
+        "ros_type": "std_msgs/msg/String",
+        "timestamp_source": "receive timestamp",
+        "receive_timestamp_required": true,
+        "frame": null,
+        "expected_rate_hz": 2,
+        "expected_rate_source": "official referee timer/source; not protocol guarantee",
+        "freshness_ms": null,
+        "static_cache_allowed": true,
+        "missing_behavior": "do not infer result",
+        "status": "source_verified"
+      },
+      {
+        "canonical_name": "fsm_status",
+        "ros_topic": "/team/fsm_status",
+        "ros_type": "std_msgs/msg/String",
+        "timestamp_source": "generated_timestamp_ns",
+        "receive_timestamp_required": true,
+        "frame": null,
+        "expected_rate_hz": 20,
+        "expected_rate_source": "team config control_rate_hz; not protocol guarantee",
+        "freshness_ms": null,
+        "static_cache_allowed": false,
+        "missing_behavior": "do not infer success",
+        "status": "provisional"
+      },
+      {
+        "canonical_name": "action_dispatch",
+        "ros_topic": "/team/action_dispatch",
+        "ros_type": "std_msgs/msg/String",
+        "timestamp_source": "generated_timestamp_ns shared with FinalAction",
+        "receive_timestamp_required": true,
+        "frame": null,
+        "expected_rate_hz": 20,
+        "expected_rate_source": "team config control_rate_hz; not protocol guarantee",
+        "freshness_ms": null,
+        "static_cache_allowed": false,
+        "missing_behavior": "no dispatch label may be inferred",
+        "status": "frozen"
+      },
+      {
+        "canonical_name": "execution_feedback",
+        "ros_topic": [
+          "/joint_states",
+          "/slamware_ros_sdk_server_node/odom"
+        ],
+        "ros_type": [
+          "sensor_msgs/msg/JointState",
+          "nav_msgs/msg/Odometry"
+        ],
+        "timestamp_source": "sensor ROS header stamps plus receive time",
+        "receive_timestamp_required": true,
+        "frame": "joint feedback and normalized odom",
+        "expected_rate_hz": null,
+        "expected_rate_source": "derived asynchronous feedback",
+        "freshness_ms": null,
+        "static_cache_allowed": false,
+        "missing_behavior": "execution remains unconfirmed",
+        "status": "provisional"
+      }
+    ]
+  },
+  "timestamp_contract": {
+    "schema_version": 1,
+    "nanosecond_validation": "must be a non-bool, non-negative integer",
+    "types": [
+      {
+        "name": "sensor_timestamp_ns",
+        "source": "ROS sensor header",
+        "unit": "ns",
+        "cross_process_comparable": true,
+        "observation_action_pairing": true,
+        "nullable": false,
+        "invalid_value_rule": "reject unless non-bool non-negative integer"
+      },
+      {
+        "name": "receive_timestamp_ns",
+        "source": "ROS clock at callback receipt",
+        "unit": "ns",
+        "cross_process_comparable": true,
+        "observation_action_pairing": true,
+        "nullable": false,
+        "invalid_value_rule": "reject unless non-bool non-negative integer"
+      },
+      {
+        "name": "receive_monotonic_ns",
+        "source": "time.monotonic_ns in receiving process",
+        "unit": "ns",
+        "cross_process_comparable": false,
+        "observation_action_pairing": false,
+        "nullable": false,
+        "invalid_value_rule": "reject unless non-bool non-negative integer; never compare persisted values across processes"
+      },
+      {
+        "name": "generated_timestamp_ns",
+        "source": "team component generation clock",
+        "unit": "ns",
+        "cross_process_comparable": true,
+        "observation_action_pairing": true,
+        "nullable": false,
+        "invalid_value_rule": "reject unless non-bool non-negative integer"
+      },
+      {
+        "name": "sim_elapsed_s",
+        "source": "official simulation elapsed time",
+        "unit": "s",
+        "cross_process_comparable": false,
+        "observation_action_pairing": false,
+        "nullable": true,
+        "invalid_value_rule": "finite non-negative real or null; never interchange with ROS nanoseconds"
+      }
+    ]
+  },
+  "frame_contract": {
+    "schema_version": 1,
+    "ros_boundary_normalization": "one leading slash may be stripped from frame identifiers at the ROS adapter boundary",
+    "odom_header_raw": "/odom",
+    "tf_parent_raw": "odom",
+    "normalized_odom_frame": "odom",
+    "rigid_transform_alias_conversion": false,
+    "world_to_odom_relationship": "unresolved",
+    "world_equals_odom": false,
+    "must_not_assume_world_equals_odom": true,
+    "task_place_point_frame": "world",
+    "planning_frame": "odom",
+    "unknown_or_unavailable_transform_behavior": "fail_closed"
+  },
+  "competition_identity_contract": {
+    "schema_version": 1,
+    "fields": {
+      "run_id": "team identity for one continuous Evaluation Run",
+      "task_set_fingerprint": "stable fingerprint of the complete official task set",
+      "task_id": "current Official Task identity",
+      "settled_attempt_count": "number of already settled attempts; it is not the current 1-based attempt number",
+      "finished": "whether the official run is finished"
+    },
+    "local_attempt_key": {
+      "components": [
+        "run_id",
+        "task_id",
+        "settled_attempt_count"
+      ],
+      "meaning": "team-local identity key",
+      "official_attempt_id": false
+    },
+    "entities": [
+      {
+        "name": "Evaluation Run",
+        "meaning": "one continuous official game lifecycle"
+      },
+      {
+        "name": "Official Task",
+        "meaning": "one task in the published task set"
+      },
+      {
+        "name": "Official Attempt",
+        "meaning": "one official attempt; no public start identity is confirmed"
+      },
+      {
+        "name": "Recorder Segment",
+        "meaning": "a local recording segment; not a Training Episode"
+      },
+      {
+        "name": "Training Episode",
+        "meaning": "an offline-QC-derived learning unit; not equal to Recorder Segment"
+      }
+    ],
+    "recorder_segment_is_training_episode": false
+  },
+  "action_recording_contract": {
+    "schema_version": 1,
+    "ambiguous_action_field_forbidden": true,
+    "layers": [
+      {
+        "name": "proposed_action",
+        "meaning": "raw module candidate"
+      },
+      {
+        "name": "selected_action",
+        "meaning": "FinalAction selected by ActionMux; insufficient alone as an actual-control label"
+      },
+      {
+        "name": "dispatched_action",
+        "meaning": "exact non-null payload used in a local OfficialCommandPublisher call; candidate command label"
+      },
+      {
+        "name": "publisher_call_attempted",
+        "meaning": "whether a local publisher call was attempted"
+      },
+      {
+        "name": "publisher_call_succeeded",
+        "meaning": "whether the local publisher call returned normally"
+      },
+      {
+        "name": "publisher_failure_reason",
+        "meaning": "bounded local failure reason"
+      },
+      {
+        "name": "execution_feedback",
+        "meaning": "later JointState/Odom feedback; not an action command"
+      }
+    ],
+    "publisher_success_disclaimer": "publisher_call_succeeded only proves a local call returned; it does not prove DDS delivery, Server receipt, controller acceptance, or robot execution.",
+    "observe_only_bc_eligibility": "observe-only data is not eligible for formal behavior-cloning control labels by default",
+    "training_eligibility": "derived only by offline QC"
+  },
+  "public_interfaces": {
+    "schema_version": 1,
+    "items": [
+      {
+        "name": "TaskSpec",
+        "module": "team_sorting.interfaces",
+        "status": "frozen",
+        "producer": [
+          "documented repository component"
+        ],
+        "consumer": [
+          "documented repository component"
+        ],
+        "ROS_boundary": "pure Python internal boundary",
+        "main_invariants": [
+          "strict dataclass validation",
+          "units, frames and timestamp semantics are not inferred"
+        ],
+        "version": 1
+      },
+      {
+        "name": "BaseState",
+        "module": "team_sorting.interfaces",
+        "status": "provisional",
+        "producer": [
+          "documented repository component"
+        ],
+        "consumer": [
+          "documented repository component"
+        ],
+        "ROS_boundary": "adapted through team_sorting.ros_nodes",
+        "main_invariants": [
+          "strict dataclass validation",
+          "units, frames and timestamp semantics are not inferred"
+        ],
+        "version": 1
+      },
+      {
+        "name": "RobotJointState",
+        "module": "team_sorting.interfaces",
+        "status": "provisional",
+        "producer": [
+          "documented repository component"
+        ],
+        "consumer": [
+          "documented repository component"
+        ],
+        "ROS_boundary": "adapted through team_sorting.ros_nodes",
+        "main_invariants": [
+          "strict dataclass validation",
+          "units, frames and timestamp semantics are not inferred"
+        ],
+        "version": 1
+      },
+      {
+        "name": "RGBFrame",
+        "module": "team_sorting.interfaces",
+        "status": "provisional",
+        "producer": [
+          "documented repository component"
+        ],
+        "consumer": [
+          "documented repository component"
+        ],
+        "ROS_boundary": "adapted through team_sorting.ros_nodes",
+        "main_invariants": [
+          "strict dataclass validation",
+          "units, frames and timestamp semantics are not inferred"
+        ],
+        "version": 1
+      },
+      {
+        "name": "DepthFrame",
+        "module": "team_sorting.interfaces",
+        "status": "provisional",
+        "producer": [
+          "documented repository component"
+        ],
+        "consumer": [
+          "documented repository component"
+        ],
+        "ROS_boundary": "adapted through team_sorting.ros_nodes",
+        "main_invariants": [
+          "strict dataclass validation",
+          "units, frames and timestamp semantics are not inferred"
+        ],
+        "version": 1
+      },
+      {
+        "name": "CameraIntrinsics",
+        "module": "team_sorting.interfaces",
+        "status": "provisional",
+        "producer": [
+          "documented repository component"
+        ],
+        "consumer": [
+          "documented repository component"
+        ],
+        "ROS_boundary": "adapted through team_sorting.ros_nodes",
+        "main_invariants": [
+          "strict dataclass validation",
+          "units, frames and timestamp semantics are not inferred"
+        ],
+        "version": 1
+      },
+      {
+        "name": "Detection2D",
+        "module": "team_sorting.interfaces",
+        "status": "provisional",
+        "producer": [
+          "documented repository component"
+        ],
+        "consumer": [
+          "documented repository component"
+        ],
+        "ROS_boundary": "pure Python internal boundary",
+        "main_invariants": [
+          "strict dataclass validation",
+          "units, frames and timestamp semantics are not inferred"
+        ],
+        "version": 1
+      },
+      {
+        "name": "ObjectEstimate3D",
+        "module": "team_sorting.interfaces",
+        "status": "frozen",
+        "producer": [
+          "documented repository component"
+        ],
+        "consumer": [
+          "documented repository component"
+        ],
+        "ROS_boundary": "pure Python internal boundary",
+        "main_invariants": [
+          "strict dataclass validation",
+          "units, frames and timestamp semantics are not inferred"
+        ],
+        "version": 1
+      },
+      {
+        "name": "RigidTransform3D",
+        "module": "team_sorting.interfaces",
+        "status": "frozen",
+        "producer": [
+          "documented repository component"
+        ],
+        "consumer": [
+          "documented repository component"
+        ],
+        "ROS_boundary": "pure Python internal boundary",
+        "main_invariants": [
+          "strict dataclass validation",
+          "units, frames and timestamp semantics are not inferred"
+        ],
+        "version": 1
+      },
+      {
+        "name": "SensorSnapshot",
+        "module": "team_sorting.interfaces",
+        "status": "provisional",
+        "producer": [
+          "documented repository component"
+        ],
+        "consumer": [
+          "documented repository component"
+        ],
+        "ROS_boundary": "pure Python internal boundary",
+        "main_invariants": [
+          "strict dataclass validation",
+          "units, frames and timestamp semantics are not inferred"
+        ],
+        "version": 1
+      },
+      {
+        "name": "Pose3D",
+        "module": "team_sorting.interfaces",
+        "status": "frozen",
+        "producer": [
+          "documented repository component"
+        ],
+        "consumer": [
+          "documented repository component"
+        ],
+        "ROS_boundary": "pure Python internal boundary",
+        "main_invariants": [
+          "strict dataclass validation",
+          "units, frames and timestamp semantics are not inferred"
+        ],
+        "version": 1
+      },
+      {
+        "name": "GraspContext",
+        "module": "team_sorting.interfaces",
+        "status": "frozen",
+        "producer": [
+          "documented repository component"
+        ],
+        "consumer": [
+          "documented repository component"
+        ],
+        "ROS_boundary": "pure Python internal boundary",
+        "main_invariants": [
+          "strict dataclass validation",
+          "units, frames and timestamp semantics are not inferred"
+        ],
+        "version": 1
+      },
+      {
+        "name": "NavGoal",
+        "module": "team_sorting.interfaces",
+        "status": "provisional",
+        "producer": [
+          "documented repository component"
+        ],
+        "consumer": [
+          "documented repository component"
+        ],
+        "ROS_boundary": "pure Python internal boundary",
+        "main_invariants": [
+          "strict dataclass validation",
+          "units, frames and timestamp semantics are not inferred"
+        ],
+        "version": 1
+      },
+      {
+        "name": "BaseCommand",
+        "module": "team_sorting.interfaces",
+        "status": "provisional",
+        "producer": [
+          "documented repository component"
+        ],
+        "consumer": [
+          "documented repository component"
+        ],
+        "ROS_boundary": "pure Python internal boundary",
+        "main_invariants": [
+          "strict dataclass validation",
+          "units, frames and timestamp semantics are not inferred"
+        ],
+        "version": 1
+      },
+      {
+        "name": "NavigationStatus",
+        "module": "team_sorting.interfaces",
+        "status": "provisional",
+        "producer": [
+          "documented repository component"
+        ],
+        "consumer": [
+          "documented repository component"
+        ],
+        "ROS_boundary": "pure Python internal boundary",
+        "main_invariants": [
+          "strict dataclass validation",
+          "units, frames and timestamp semantics are not inferred"
+        ],
+        "version": 1
+      },
+      {
+        "name": "GraspTarget",
+        "module": "team_sorting.interfaces",
+        "status": "provisional",
+        "producer": [
+          "documented repository component"
+        ],
+        "consumer": [
+          "documented repository component"
+        ],
+        "ROS_boundary": "pure Python internal boundary",
+        "main_invariants": [
+          "strict dataclass validation",
+          "units, frames and timestamp semantics are not inferred"
+        ],
+        "version": 1
+      },
+      {
+        "name": "PlaceTarget",
+        "module": "team_sorting.interfaces",
+        "status": "provisional",
+        "producer": [
+          "documented repository component"
+        ],
+        "consumer": [
+          "documented repository component"
+        ],
+        "ROS_boundary": "pure Python internal boundary",
+        "main_invariants": [
+          "strict dataclass validation",
+          "units, frames and timestamp semantics are not inferred"
+        ],
+        "version": 1
+      },
+      {
+        "name": "IKResult",
+        "module": "team_sorting.interfaces",
+        "status": "provisional",
+        "producer": [
+          "documented repository component"
+        ],
+        "consumer": [
+          "documented repository component"
+        ],
+        "ROS_boundary": "pure Python internal boundary",
+        "main_invariants": [
+          "strict dataclass validation",
+          "units, frames and timestamp semantics are not inferred"
+        ],
+        "version": 1
+      },
+      {
+        "name": "JointWaypoint",
+        "module": "team_sorting.interfaces",
+        "status": "frozen",
+        "producer": [
+          "documented repository component"
+        ],
+        "consumer": [
+          "documented repository component"
+        ],
+        "ROS_boundary": "pure Python internal boundary",
+        "main_invariants": [
+          "strict dataclass validation",
+          "units, frames and timestamp semantics are not inferred"
+        ],
+        "version": 1
+      },
+      {
+        "name": "JointTrajectory",
+        "module": "team_sorting.interfaces",
+        "status": "frozen",
+        "producer": [
+          "documented repository component"
+        ],
+        "consumer": [
+          "documented repository component"
+        ],
+        "ROS_boundary": "pure Python internal boundary",
+        "main_invariants": [
+          "strict dataclass validation",
+          "units, frames and timestamp semantics are not inferred"
+        ],
+        "version": 1
+      },
+      {
+        "name": "ManipulationCommand",
+        "module": "team_sorting.interfaces",
+        "status": "provisional",
+        "producer": [
+          "documented repository component"
+        ],
+        "consumer": [
+          "documented repository component"
+        ],
+        "ROS_boundary": "pure Python internal boundary",
+        "main_invariants": [
+          "strict dataclass validation",
+          "units, frames and timestamp semantics are not inferred"
+        ],
+        "version": 1
+      },
+      {
+        "name": "ManipulationStatus",
+        "module": "team_sorting.interfaces",
+        "status": "provisional",
+        "producer": [
+          "documented repository component"
+        ],
+        "consumer": [
+          "documented repository component"
+        ],
+        "ROS_boundary": "pure Python internal boundary",
+        "main_invariants": [
+          "strict dataclass validation",
+          "units, frames and timestamp semantics are not inferred"
+        ],
+        "version": 1
+      },
+      {
+        "name": "FSMStatus",
+        "module": "team_sorting.interfaces",
+        "status": "provisional",
+        "producer": [
+          "documented repository component"
+        ],
+        "consumer": [
+          "documented repository component"
+        ],
+        "ROS_boundary": "adapted through team_sorting.ros_nodes",
+        "main_invariants": [
+          "strict dataclass validation",
+          "units, frames and timestamp semantics are not inferred"
+        ],
+        "version": 1
+      },
+      {
+        "name": "FinalAction",
+        "module": "team_sorting.interfaces",
+        "status": "frozen",
+        "producer": [
+          "documented repository component"
+        ],
+        "consumer": [
+          "documented repository component"
+        ],
+        "ROS_boundary": "adapted through team_sorting.ros_nodes",
+        "main_invariants": [
+          "strict dataclass validation",
+          "units, frames and timestamp semantics are not inferred"
+        ],
+        "version": 1
+      },
+      {
+        "name": "ActionMuxDecision",
+        "module": "team_sorting.interfaces",
+        "status": "frozen",
+        "producer": [
+          "documented repository component"
+        ],
+        "consumer": [
+          "documented repository component"
+        ],
+        "ROS_boundary": "pure Python internal boundary",
+        "main_invariants": [
+          "strict dataclass validation",
+          "units, frames and timestamp semantics are not inferred"
+        ],
+        "version": 1
+      },
+      {
+        "name": "ActionDispatchRecord",
+        "module": "team_sorting.interfaces",
+        "status": "frozen",
+        "producer": [
+          "documented repository component"
+        ],
+        "consumer": [
+          "documented repository component"
+        ],
+        "ROS_boundary": "adapted through team_sorting.ros_nodes",
+        "main_invariants": [
+          "strict dataclass validation",
+          "units, frames and timestamp semantics are not inferred"
+        ],
+        "version": 1
+      },
+      {
+        "name": "CompetitionContext",
+        "module": "team_sorting.competition_context",
+        "status": "frozen",
+        "producer": [
+          "documented repository component"
+        ],
+        "consumer": [
+          "documented repository component"
+        ],
+        "ROS_boundary": "adapted through team_sorting.ros_nodes",
+        "main_invariants": [
+          "strict dataclass validation",
+          "units, frames and timestamp semantics are not inferred"
+        ],
+        "version": 1
+      },
+      {
+        "name": "ExternalCandidate",
+        "module": "team_sorting.external_candidate",
+        "status": "restricted",
+        "producer": [
+          "documented repository component"
+        ],
+        "consumer": [
+          "documented repository component"
+        ],
+        "ROS_boundary": "pure Python internal boundary",
+        "main_invariants": [
+          "strict dataclass validation",
+          "units, frames and timestamp semantics are not inferred"
+        ],
+        "version": 1
+      },
+      {
+        "name": "RecordedActionFrame",
+        "module": "team_sorting.recording_contracts",
+        "status": "frozen",
+        "producer": [
+          "documented repository component"
+        ],
+        "consumer": [
+          "documented repository component"
+        ],
+        "ROS_boundary": "pure Python internal boundary",
+        "main_invariants": [
+          "strict dataclass validation",
+          "units, frames and timestamp semantics are not inferred"
+        ],
+        "version": 1
+      },
+      {
+        "name": "ActionPairingIssue",
+        "module": "team_sorting.recording_contracts",
+        "status": "frozen",
+        "producer": [
+          "documented repository component"
+        ],
+        "consumer": [
+          "documented repository component"
+        ],
+        "ROS_boundary": "pure Python internal boundary",
+        "main_invariants": [
+          "strict dataclass validation",
+          "units, frames and timestamp semantics are not inferred"
+        ],
+        "version": 1
+      }
+    ]
+  },
+  "unresolved": [
+    {
+      "key": "gripper_open_close_direction",
+      "status": "unresolved",
+      "why_unresolved": "MJCF only proves [0,1] ctrlrange, not physical direction",
+      "blocking_roles": [
+        "arm",
+        "data"
+      ],
+      "required_test": "observe commanded values and aperture/contact in official simulation",
+      "must_not_assume": "0=open or 1=open"
+    },
+    {
+      "key": "valid_gripping_value",
+      "status": "unresolved",
+      "why_unresolved": "no verified value proves stable grasp",
+      "blocking_roles": [
+        "arm",
+        "data"
+      ],
+      "required_test": "run grasp retention test across object classes",
+      "must_not_assume": "any endpoint guarantees gripping"
+    },
+    {
+      "key": "official_cmd_vel_accepted_limits",
+      "status": "unresolved",
+      "why_unresolved": "official callback has no published velocity input limits",
+      "blocking_roles": [
+        "base",
+        "safety"
+      ],
+      "required_test": "online sweep with watchdog and motion measurements",
+      "must_not_assume": "team safe limit is official accepted limit"
+    },
+    {
+      "key": "server_command_watchdog",
+      "status": "unresolved",
+      "why_unresolved": "no timeout contract is exposed",
+      "blocking_roles": [
+        "systems",
+        "safety"
+      ],
+      "required_test": "online stop-publishing timeout test",
+      "must_not_assume": "last command persistence or timeout"
+    },
+    {
+      "key": "controller_target_persistence_across_client_restart",
+      "status": "unresolved",
+      "why_unresolved": "restart/reset latching is unverified",
+      "blocking_roles": [
+        "systems",
+        "control"
+      ],
+      "required_test": "restart Client without Server reset and inspect targets",
+      "must_not_assume": "targets reset or persist"
+    },
+    {
+      "key": "server_receive_acknowledgement",
+      "status": "unresolved",
+      "why_unresolved": "publisher return has no Server acknowledgement",
+      "blocking_roles": [
+        "systems",
+        "data"
+      ],
+      "required_test": "add/observe authoritative Server-side receipt evidence",
+      "must_not_assume": "local publish return means receipt"
+    },
+    {
+      "key": "execution_confirmation_tolerance",
+      "status": "unresolved",
+      "why_unresolved": "no accepted pose/velocity tolerance is specified",
+      "blocking_roles": [
+        "control",
+        "data"
+      ],
+      "required_test": "calibrate feedback tolerance and settling window",
+      "must_not_assume": "publisher success means execution"
+    },
+    {
+      "key": "world_to_odom_relationship",
+      "status": "unresolved",
+      "why_unresolved": "no authoritative transform/equality contract exists",
+      "blocking_roles": [
+        "navigation",
+        "perception"
+      ],
+      "required_test": "capture TF and compare official task world coordinates",
+      "must_not_assume": "world equals odom"
+    },
+    {
+      "key": "mmk2_fk_output_frame",
+      "status": "unresolved",
+      "why_unresolved": "official FK adapter output frame is not online verified",
+      "blocking_roles": [
+        "perception",
+        "arm"
+      ],
+      "required_test": "compare FK output against online TF and known poses",
+      "must_not_assume": "FK output is odom or world"
+    },
+    {
+      "key": "joint_state_effort_units",
+      "status": "unresolved",
+      "why_unresolved": "official source assigns sensor_force but provides no ROS unit contract",
+      "blocking_roles": [
+        "control",
+        "data"
+      ],
+      "required_test": "trace sensor definitions and validate runtime values",
+      "must_not_assume": "effort is torque or force in a guessed unit"
+    },
+    {
+      "key": "official_attempt_start_identity",
+      "status": "unresolved",
+      "why_unresolved": "public referee fields expose settled count, not a confirmed attempt id/start event",
+      "blocking_roles": [
+        "systems",
+        "data"
+      ],
+      "required_test": "online trace taskinfo/gameinfo/score transitions",
+      "must_not_assume": "settled count is current 1-based attempt"
+    }
+  ]
+}

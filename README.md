@@ -10,6 +10,10 @@
 > 当前定位是“可导入、可测试、边界清晰的客户端骨架”，不是已经能完成比赛的成品。
 > 真实相机/YOLO/MMK2FK 联调、导航、抓放规划、机械臂执行和比赛闭环仍未完成。
 
+### Stage 2.2 Interface v1
+
+公共接口的机器可读冻结入口是 [`config/contracts/interface_v1.json`](config/contracts/interface_v1.json)，中文说明见 [`docs/interface_v1.md`](docs/interface_v1.md)。当前冻结的是名称、顺序、单位、身份及证据边界；`provisional`/`restricted` 项和 UNRESOLVED 在线事实仍保持显式，Interface对齐不代表算法或比赛闭环完成。
+
 ### Stage 2A External Candidate Consumer
 
 当前代码包含对 adapter 提交

@@ -12,6 +12,10 @@ setup(
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
         ("share/" + package_name, ["package.xml"]),
         ("share/" + package_name + "/config", ["config/config.yaml"]),
+        (
+            "share/" + package_name + "/config/contracts",
+            ["config/contracts/interface_v1.json"],
+        ),
         ("share/" + package_name + "/launch", ["launch/team.launch.xml"]),
     ],
     install_requires=["setuptools", "PyYAML"],
