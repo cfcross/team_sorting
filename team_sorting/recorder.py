@@ -38,6 +38,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import tempfile
 import time
 from threading import RLock
@@ -787,13 +788,15 @@ class EpisodeRecorder:
         self,
         topics: Sequence[str],
         output_name: str = "rosbag",
+        qos_overrides_path: Optional[str | Path] = None,
     ) -> tuple[str, ...]:
         """生成但不执行 ``ros2 bag record`` 命令。
 
         参数：需要原样记录的话题列表和输出子目录名。返回：可交给 ``subprocess`` 的
         参数元组；消息保持自身单位/坐标系。失败：Episode 未开始、ros2 不在 PATH、话题
         为空、重复、像命令选项或输出名不安全时抛出异常；话题顺序保持不变。本方法不
-        执行命令，也不实现 ``rosbag2_py``。
+        执行命令，也不实现 ``rosbag2_py``。提供QoS文件时必须是绝对路径、安全的非空
+        普通文件；符号链接和依赖当前工作目录的相对路径均被拒绝。
         """
 
         episode_dir = self._active_directory().resolve()
@@ -805,7 +808,32 @@ class EpisodeRecorder:
             raise FileExistsError(f"rosbag 输出路径已存在，拒绝覆盖：{output}")
         if shutil.which("ros2") is None:
             raise RuntimeError("未找到 ros2 命令，无法启动 ros2 bag；请先 source ROS2 环境")
-        return ("ros2", "bag", "record", "-o", str(output), *validated_topics)
+        qos_arguments: tuple[str, ...] = ()
+        if qos_overrides_path is not None:
+            qos_path = Path(qos_overrides_path)
+            if not qos_path.is_absolute():
+                raise ValueError("rosbag QoS override路径必须是绝对路径")
+            try:
+                metadata = os.lstat(qos_path)
+                if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+                    raise ValueError("rosbag QoS override必须是非符号链接普通文件")
+                if metadata.st_size <= 0:
+                    raise ValueError("rosbag QoS override文件不能为空")
+                with qos_path.open("rb") as stream:
+                    if not stream.read(1):
+                        raise ValueError("rosbag QoS override文件不能为空")
+            except OSError as exc:
+                raise ValueError(f"rosbag QoS override文件不可读：{qos_path}: {exc}") from exc
+            qos_arguments = ("--qos-profile-overrides-path", str(qos_path))
+        return (
+            "ros2",
+            "bag",
+            "record",
+            "-o",
+            str(output),
+            *qos_arguments,
+            *validated_topics,
+        )
 
     @staticmethod
     def make_episode_id(prefix: str = "episode") -> str:

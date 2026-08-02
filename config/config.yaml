@@ -250,6 +250,9 @@ recorder:
     sigint_timeout_sec: 30.0
     terminate_timeout_sec: 5.0
     kill_timeout_sec: 2.0
+  # 相对实际config.yaml所在目录解析；缺失、空文件、symlink或内容不匹配时拒绝启动bag。
+  rosbag:
+    qos_overrides_path: "rosbag_qos_overrides.yaml"
   # 相对路径由节点进程的当前工作目录解析；安装/launch环境最终落点必须运行确认。
   root_dir: "./team_sorting_dataset"
   # legacy EpisodeRecorder单元测试仍使用此字段；schema v1 runtime生成独立segment ID。
@@ -277,6 +280,8 @@ recorder:
     - "/referee/taskinfo"                            # 裁判任务信息
     - "/referee/gameinfo"                            # 裁判比赛状态
     - "/referee/score"                               # 裁判分数
+    - "/tf"                                          # odom -> base_link等动态TF原文
+    - "/tf_static"                                   # 可用时保留静态TF；无Publisher不阻止录制
 
 # 把官方JointState.name映射到团队JOINT_NAMES；键和值都必须是字符串。
 # 空映射表示名称必须已经逐项完全一致，应在正式环境用ros2 topic echo /joint_states确认，

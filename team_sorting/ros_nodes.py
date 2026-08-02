@@ -134,7 +134,11 @@ from .navigation import Bounds3D, classify_slot_type
 from .perception_2d import Detection2DStabilizer, OfficialYoloAdapter
 from .perception_3d import CameraTransformProvider, Perception3DEstimator
 from .recording_contracts import ActionPairingConfig
-from .recorder_runtime import RecorderRuntimeConfig, RecorderRuntimeManager
+from .recorder_runtime import (
+    RecorderRuntimeConfig,
+    RecorderRuntimeManager,
+    resolve_rosbag_qos_overrides_path,
+)
 
 
 class TimestampedCache:
@@ -1726,9 +1730,20 @@ def _create_recorder_node(ros: SimpleNamespace) -> type:
                 raise RuntimeError(f"Recorder action pairing配置无效：{exc}") from exc
             bag_shutdown = recorder_config["bag_shutdown"]
             control = _validated_control_config(config)
+            config_path = _resolve_config_path()
+            record_rosbag = recorder_config.get("record_rosbag", True)
+            qos_overrides_path: Optional[Path] = None
+            if record_rosbag is True:
+                rosbag_config = recorder_config.get("rosbag")
+                if not isinstance(rosbag_config, Mapping):
+                    raise RuntimeError("record_rosbag=true时recorder.rosbag配置必须是映射")
+                qos_overrides_path = resolve_rosbag_qos_overrides_path(
+                    config_path,
+                    rosbag_config.get("qos_overrides_path"),
+                )
             runtime_config = RecorderRuntimeConfig(
                 root_dir=Path(recorder_config["root_dir"]),
-                record_rosbag=recorder_config.get("record_rosbag", True),
+                record_rosbag=record_rosbag,
                 rosbag_topics=tuple(
                     str(topic) for topic in recorder_config["rosbag_topics"]
                 ),
@@ -1744,7 +1759,8 @@ def _create_recorder_node(ros: SimpleNamespace) -> type:
                 ),
                 observe_only=control["observe_only"],
                 official_publish_enabled=_official_publish_enabled(control),
-                config_path=_resolve_config_path(),
+                rosbag_qos_overrides_path=qos_overrides_path,
+                config_path=config_path,
             )
             self._runtime = RecorderRuntimeManager(
                 runtime_config,

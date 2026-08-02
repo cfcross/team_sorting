@@ -18,8 +18,9 @@
 
 B3数据、TF/QoS、raw/derived边界、采集profile和训练资格的独立机器契约见
 [`config/contracts/data_tf_policy_v1.json`](config/contracts/data_tf_policy_v1.json)，中文投影见
-[`docs/data_tf_policy_v1.md`](docs/data_tf_policy_v1.md)。B3A只冻结策略，不修改当前Recorder
-话题，不实现TF录制、压缩、降频、Indexer/QC或训练样本生成。
+[`docs/data_tf_policy_v1.md`](docs/data_tf_policy_v1.md)。B3B第一步已把`/tf`和`/tf_static`
+加入raw rosbag，并使用安装资源中的显式QoS override；压缩、降频、Indexer/QC和训练样本
+生成仍未实现。
 
 ### Stage 2A External Candidate Consumer
 
@@ -547,6 +548,7 @@ orphan 规则见
 | `recorder.bag_shutdown.sigint_timeout_sec` | `30.0` | bag 收到 SIGINT 后的有界等待 |
 | `recorder.bag_shutdown.terminate_timeout_sec` | `5.0` | SIGINT 超时后 terminate 的有界等待 |
 | `recorder.bag_shutdown.kill_timeout_sec` | `2.0` | terminate 超时后 kill 的最终有界等待 |
+| `recorder.rosbag.qos_overrides_path` | `rosbag_qos_overrides.yaml` | 相对实际config资源目录解析的显式TF订阅QoS；无效时fail closed |
 | `recorder.action_pairing.enabled` | `true` | 订阅并严格配对 FinalAction/Dispatch 内部遥测 |
 | `recorder.action_pairing.max_pending_per_side` | `256` | 每侧等待表容量 |
 | `recorder.action_pairing.max_completed_sequences` | `1024` | 近期终态 digest LRU 容量；精确终态区间账本另行阻止旧 sequence 重开 |
@@ -572,11 +574,19 @@ orphan 规则见
 /joint_states
 /team/object_estimates
 /team/fsm_status
+/team/competition_context
 /team/final_action
 /referee/taskinfo
 /referee/gameinfo
 /referee/score
+/tf
+/tf_static
 ```
+
+`/tf`使用best-effort/volatile/keep-last/depth 100；`/tf_static`使用
+reliable/transient-local/keep-last/depth 1，以支持Recorder晚启动后的静态TF历史接收。
+当前固定场景没有`/tf_static` Publisher时不阻止Recorder启动或Segment正常完成，消息数可为0；
+本步骤只记录原始TF，不做frame改写、`world == odom`假设或TF graph QC。
 
 `slot_bounds.table` 和 `slot_bounds.shelf` 当前故意使用反向边界，分类会安全返回
 `UNKNOWN`；联调前需要在确认 planning frame 后填写真实区域。不要默认 `world == odom`。

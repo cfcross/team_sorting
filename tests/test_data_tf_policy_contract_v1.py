@@ -554,12 +554,12 @@ def test_setup_installs_new_contract_and_document() -> None:
     assert setup_text.count('"share/" + package_name + "/config/contracts"') == 1
 
 
-def test_readme_links_policy_without_claiming_runtime_implementation() -> None:
+def test_readme_links_policy_and_limits_b3b_runtime_claims() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     assert "config/contracts/data_tf_policy_v1.json" in readme
     assert "docs/data_tf_policy_v1.md" in readme
-    assert "B3A只冻结策略" in readme
-    assert "不实现TF录制、压缩、降频、Indexer/QC或训练样本生成" in readme
+    assert "B3B第一步已把`/tf`和`/tf_static`" in readme
+    assert "压缩、降频、Indexer/QC和训练样本" in readme
 
 
 def test_existing_frozen_contract_files_remain_exact() -> None:
@@ -567,10 +567,10 @@ def test_existing_frozen_contract_files_remain_exact() -> None:
     assert hashlib.sha256(RECORDER_PATH.read_bytes()).hexdigest() == EXPECTED_RECORDER_SHA256
 
 
-def test_b3a_does_not_add_tf_or_compression_to_runtime_config() -> None:
+def test_b3b_adds_only_tf_without_compression_to_runtime_config() -> None:
     config = (ROOT / "config" / "config.yaml").read_text(encoding="utf-8")
     recorder = (ROOT / "team_sorting" / "recorder.py").read_text(encoding="utf-8")
-    assert '    - "/tf"' not in config
-    assert '    - "/tf_static"' not in config
+    assert config.count('    - "/tf"') == 1
+    assert config.count('    - "/tf_static"') == 1
     assert "--compression-mode" not in recorder
     assert "--compression-format" not in recorder

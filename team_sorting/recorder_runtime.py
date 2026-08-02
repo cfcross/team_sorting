@@ -28,6 +28,8 @@ from threading import RLock
 from typing import Any, Callable, Mapping, Optional, Sequence
 from uuid import uuid4
 
+import yaml
+
 from .competition_context import CompetitionContext, task_set_fingerprint
 from .fsm import InstructionParser
 from .interface_contract import interface_contract_path
@@ -58,6 +60,20 @@ _JSONL_NAMES = (
     "fsm_status.jsonl",
     "competition_contexts.jsonl",
 )
+_EXPECTED_ROSBAG_QOS = {
+    "/tf": {
+        "reliability": "best_effort",
+        "durability": "volatile",
+        "history": "keep_last",
+        "depth": 100,
+    },
+    "/tf_static": {
+        "reliability": "reliable",
+        "durability": "transient_local",
+        "history": "keep_last",
+        "depth": 1,
+    },
+}
 
 PROVENANCE_ENV = {
     "project_commit": "TEAM_SORTING_PROJECT_COMMIT",
@@ -90,6 +106,7 @@ class RecorderRuntimeConfig:
     bag_kill_timeout_sec: float
     observe_only: bool
     official_publish_enabled: bool
+    rosbag_qos_overrides_path: Optional[Path] = None
     bag_startup_timeout_sec: float = 10.0
     bag_startup_poll_interval_sec: float = 0.02
     config_path: Optional[Path] = None
@@ -118,6 +135,15 @@ class RecorderRuntimeConfig:
             object.__setattr__(self, name, float(value))
         if self.config_path is not None:
             object.__setattr__(self, "config_path", Path(self.config_path))
+        qos_path = self.rosbag_qos_overrides_path
+        if self.record_rosbag and qos_path is None:
+            raise ValueError("record_rosbag=true时必须显式提供rosbag QoS override文件")
+        if qos_path is not None:
+            object.__setattr__(
+                self,
+                "rosbag_qos_overrides_path",
+                validate_rosbag_qos_overrides_path(Path(qos_path)),
+            )
 
 
 @dataclass
@@ -455,6 +481,78 @@ def _safe_component(value: object, label: str) -> str:
     if _SAFE_COMPONENT.fullmatch(value) is None:
         raise ValueError(f"{label}只能包含字母、数字、点、下划线和连字符")
     return value
+
+
+def validate_rosbag_qos_overrides_path(path: Path) -> Path:
+    """Validate the dedicated TF rosbag QoS file without following its final entry."""
+
+    candidate = Path(path)
+    if not candidate.is_absolute():
+        raise ValueError("rosbag QoS override路径必须是绝对路径，不能依赖cwd")
+    try:
+        metadata = os.lstat(candidate)
+    except OSError as exc:
+        raise ValueError(f"rosbag QoS override文件缺失或不可访问：{candidate}: {exc}") from exc
+    if stat.S_ISLNK(metadata.st_mode):
+        raise ValueError(f"rosbag QoS override路径不得是符号链接：{candidate}")
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ValueError(f"rosbag QoS override路径必须是普通文件：{candidate}")
+    if metadata.st_size <= 0:
+        raise ValueError(f"rosbag QoS override文件不能为空：{candidate}")
+
+    class _UniqueKeyLoader(yaml.SafeLoader):
+        pass
+
+    def construct_mapping(loader: yaml.SafeLoader, node: yaml.MappingNode) -> dict[Any, Any]:
+        result: dict[Any, Any] = {}
+        for key_node, value_node in node.value:
+            key = loader.construct_object(key_node, deep=True)
+            if key in result:
+                raise ValueError(f"rosbag QoS override包含重复key：{key!r}")
+            result[key] = loader.construct_object(value_node, deep=True)
+        return result
+
+    _UniqueKeyLoader.add_constructor(
+        yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+        construct_mapping,
+    )
+    try:
+        text = candidate.read_text(encoding="utf-8")
+        payload = yaml.load(text, Loader=_UniqueKeyLoader)
+    except (OSError, UnicodeError, yaml.YAMLError, ValueError) as exc:
+        raise ValueError(f"rosbag QoS override文件不可读或YAML非法：{candidate}: {exc}") from exc
+    if not isinstance(payload, Mapping):
+        raise ValueError("rosbag QoS override顶层必须是映射")
+    if set(payload) != set(_EXPECTED_ROSBAG_QOS):
+        raise ValueError(
+            "rosbag QoS override必须且只能定义/tf与/tf_static"
+        )
+    for topic, expected in _EXPECTED_ROSBAG_QOS.items():
+        profile = payload[topic]
+        if not isinstance(profile, Mapping) or set(profile) != set(expected):
+            raise ValueError(f"rosbag QoS override {topic} 字段不完整或包含未知字段")
+        for field_name, expected_value in expected.items():
+            actual = profile[field_name]
+            if type(actual) is not type(expected_value) or actual != expected_value:
+                raise ValueError(
+                    f"rosbag QoS override {topic}.{field_name}必须为{expected_value!r}，"
+                    f"实际={actual!r}"
+                )
+    return candidate.resolve(strict=True)
+
+
+def resolve_rosbag_qos_overrides_path(
+    config_path: Path, configured_path: object
+) -> Path:
+    """Resolve one package resource beside the active config, never against cwd."""
+
+    if not isinstance(configured_path, str):
+        raise ValueError("recorder.rosbag.qos_overrides_path必须是字符串")
+    resource_name = _safe_component(
+        configured_path.strip(), "recorder.rosbag.qos_overrides_path"
+    )
+    config_file = Path(config_path).resolve(strict=True)
+    return validate_rosbag_qos_overrides_path(config_file.parent / resource_name)
 
 
 def _resolved_under(root: Path, path: Path, label: str) -> Path:
@@ -1372,7 +1470,10 @@ class RecorderRuntimeManager:
         active.data["_pending_bag_started"] = None
         if not self.config.record_rosbag:
             return
-        command = active.recorder.build_rosbag_command(self.config.rosbag_topics)
+        command = active.recorder.build_rosbag_command(
+            self.config.rosbag_topics,
+            qos_overrides_path=self.config.rosbag_qos_overrides_path,
+        )
         try:
             process = self._process_factory(command)
             active.process = process

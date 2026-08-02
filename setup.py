@@ -13,7 +13,10 @@ setup(
     data_files=[
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
         ("share/" + package_name, ["package.xml"]),
-        ("share/" + package_name + "/config", ["config/config.yaml"]),
+        (
+            "share/" + package_name + "/config",
+            ["config/config.yaml", "config/rosbag_qos_overrides.yaml"],
+        ),
         (
             "share/" + package_name + "/config/contracts",
             [

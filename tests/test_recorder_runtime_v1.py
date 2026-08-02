@@ -37,6 +37,7 @@ from team_sorting.recorder import EpisodeRecorder
 from team_sorting.recorder_contract import load_recorder_contract
 from team_sorting.interface_contract import interface_contract_path
 from team_sorting.recorder_contract import recorder_contract_sha256
+from team_sorting.data_tf_policy_contract import load_data_tf_policy_contract
 from team_sorting.recorder_runtime import (
     RecorderRuntimeConfig,
     RecorderRuntimeManager,
@@ -45,6 +46,8 @@ from team_sorting.recorder_runtime import (
     append_jsonl,
     atomic_write_json,
     create_marker,
+    resolve_rosbag_qos_overrides_path,
+    validate_rosbag_qos_overrides_path,
 )
 from team_sorting.recording_contracts import ActionPairingConfig
 from team_sorting.ros_nodes import (
@@ -53,6 +56,52 @@ from team_sorting.ros_nodes import (
     _official_publish_enabled,
     _validated_control_config,
 )
+
+
+ROOT = Path(__file__).resolve().parents[1]
+QOS_PATH = ROOT / "config" / "rosbag_qos_overrides.yaml"
+DEFAULT_ROSBAG_TOPICS = tuple(
+    yaml.safe_load((ROOT / "config" / "config.yaml").read_text(encoding="utf-8"))[
+        "recorder"
+    ]["rosbag_topics"]
+)
+
+
+class _RecorderNodeBase:
+    def __init__(self, name: str) -> None:
+        self.enabled = False
+
+    def declare_parameter(self, name: str, value: object) -> None:
+        self.enabled = value
+
+    def get_parameter(self, name: str) -> SimpleNamespace:
+        return SimpleNamespace(value=self.enabled)
+
+    def get_clock(self) -> SimpleNamespace:
+        return SimpleNamespace(now=lambda: SimpleNamespace(nanoseconds=1))
+
+    def create_subscription(self, *args: Any) -> object:
+        return object()
+
+    def create_timer(self, *args: Any) -> object:
+        return SimpleNamespace(cancel=lambda: None)
+
+    def get_logger(self) -> SimpleNamespace:
+        return SimpleNamespace(error=lambda message: None, warning=lambda message: None)
+
+    def destroy_node(self) -> None:
+        return None
+
+
+def _recorder_node_config(root: Path) -> dict[str, Any]:
+    config = yaml.safe_load((ROOT / "config" / "config.yaml").read_text(encoding="utf-8"))
+    config["recorder"]["enabled"] = True
+    config["recorder"]["root_dir"] = str(root)
+    return config
+
+
+def _recorder_ros() -> SimpleNamespace:
+    return SimpleNamespace(Node=_RecorderNodeBase, String=object, Int32=object)
 
 
 def _pairing(enabled: bool = False) -> ActionPairingConfig:
@@ -70,13 +119,14 @@ def _config(root: Path, **overrides: Any) -> RecorderRuntimeConfig:
     values: dict[str, Any] = {
         "root_dir": root,
         "record_rosbag": False,
-        "rosbag_topics": ("/camera", "/team/final_action"),
+        "rosbag_topics": DEFAULT_ROSBAG_TOPICS,
         "recovery_scan_enabled": True,
         "bag_sigint_timeout_sec": 1.0,
         "bag_terminate_timeout_sec": 1.0,
         "bag_kill_timeout_sec": 1.0,
         "observe_only": True,
         "official_publish_enabled": False,
+        "rosbag_qos_overrides_path": QOS_PATH,
     }
     values.update(overrides)
     return RecorderRuntimeConfig(**values)
@@ -260,6 +310,120 @@ def test_runtime_config_rejects_observe_only_with_effective_publish_enabled(
         _config(tmp_path, observe_only=True, official_publish_enabled=True)
 
 
+def test_default_recorder_topics_include_unique_tf_topics_matching_policy() -> None:
+    assert len(DEFAULT_ROSBAG_TOPICS) == len(set(DEFAULT_ROSBAG_TOPICS)) == 15
+    assert DEFAULT_ROSBAG_TOPICS[-2:] == ("/tf", "/tf_static")
+    policy = load_data_tf_policy_contract()
+    entries = (
+        *policy["topic_policy"]["current_raw_baseline"],
+        *policy["topic_policy"]["b3_target_topics"],
+    )
+    types = {entry["name"]: entry["message_type"] for entry in entries}
+    assert types["/tf"] == "tf2_msgs/msg/TFMessage"
+    assert types["/tf_static"] == "tf2_msgs/msg/TFMessage"
+
+
+def test_source_qos_resource_resolution_is_cwd_independent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    resolved = resolve_rosbag_qos_overrides_path(
+        ROOT / "config" / "config.yaml", "rosbag_qos_overrides.yaml"
+    )
+    assert resolved == QOS_PATH.resolve()
+
+
+def test_installed_prefix_qos_resource_resolution(tmp_path: Path) -> None:
+    config_dir = tmp_path / "prefix/local/share/team_sorting/config"
+    config_dir.mkdir(parents=True)
+    config_path = config_dir / "config.yaml"
+    config_path.write_text("recorder: {}\n", encoding="utf-8")
+    qos_path = config_dir / "rosbag_qos_overrides.yaml"
+    qos_path.write_bytes(QOS_PATH.read_bytes())
+    assert resolve_rosbag_qos_overrides_path(
+        config_path, "rosbag_qos_overrides.yaml"
+    ) == qos_path.resolve()
+
+
+def test_setup_installs_rosbag_qos_resource() -> None:
+    setup_text = (ROOT / "setup.py").read_text(encoding="utf-8")
+    assert '"config/rosbag_qos_overrides.yaml"' in setup_text
+    assert setup_text.count('"share/" + package_name + "/config"') == 1
+
+
+def test_recording_requires_explicit_qos_resource(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="必须显式提供"):
+        _config(tmp_path, record_rosbag=True, rosbag_qos_overrides_path=None)
+
+
+@pytest.mark.parametrize("kind", ["missing", "empty", "directory", "symlink"])
+def test_qos_resource_unsafe_or_missing_file_fails_closed(
+    kind: str, tmp_path: Path
+) -> None:
+    path = tmp_path / "qos.yaml"
+    if kind == "empty":
+        path.write_bytes(b"")
+    elif kind == "directory":
+        path.mkdir()
+    elif kind == "symlink":
+        target = tmp_path / "target.yaml"
+        target.write_bytes(QOS_PATH.read_bytes())
+        path.symlink_to(target)
+    with pytest.raises(ValueError):
+        validate_rosbag_qos_overrides_path(path)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "match"),
+    [
+        (lambda p: p["/tf"].__setitem__("reliability", "reliable"), "/tf.reliability"),
+        (lambda p: p["/tf_static"].__setitem__("durability", "volatile"), "/tf_static.durability"),
+        (lambda p: p["/tf"].__setitem__("history", "keep_all"), "/tf.history"),
+        (lambda p: p["/tf"].__setitem__("depth", True), "/tf.depth"),
+        (lambda p: p.__setitem__("/extra", {}), "只能定义"),
+    ],
+)
+def test_qos_resource_wrong_schema_or_policy_fails_closed(
+    mutation: Any, match: str, tmp_path: Path
+) -> None:
+    payload = yaml.safe_load(QOS_PATH.read_text(encoding="utf-8"))
+    mutation(payload)
+    path = tmp_path / "qos.yaml"
+    path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match=match):
+        validate_rosbag_qos_overrides_path(path)
+
+
+def test_qos_resource_malformed_yaml_and_duplicate_keys_fail_closed(
+    tmp_path: Path,
+) -> None:
+    malformed = tmp_path / "malformed.yaml"
+    malformed.write_text("/tf: [\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="YAML非法"):
+        validate_rosbag_qos_overrides_path(malformed)
+    duplicate = tmp_path / "duplicate.yaml"
+    duplicate.write_text(QOS_PATH.read_text(encoding="utf-8") + "\n/tf: {}\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="重复key"):
+        validate_rosbag_qos_overrides_path(duplicate)
+
+
+def test_qos_resource_unreadable_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "qos.yaml"
+    path.write_bytes(QOS_PATH.read_bytes())
+    original = Path.read_text
+
+    def deny(candidate: Path, *args: Any, **kwargs: Any) -> str:
+        if candidate == path:
+            raise PermissionError("denied")
+        return original(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", deny)
+    with pytest.raises(ValueError, match="不可读"):
+        validate_rosbag_qos_overrides_path(path)
+
+
 @pytest.mark.parametrize(
     ("observe_only", "enable_official_publish", "expected"),
     [
@@ -361,6 +525,98 @@ def test_recorder_node_uses_team_client_effective_publish_gate(
     manifest = _json(tmp_path / "runs" / "run-a" / "manifest.json")
     assert manifest["official_publish_enabled"] is expected
     node._runtime.close(20)
+
+
+def test_recorder_node_without_rosbag_does_not_require_rosbag_section(
+    tmp_path: Path,
+) -> None:
+    config = _recorder_node_config(tmp_path)
+    config["recorder"]["record_rosbag"] = False
+    config["recorder"].pop("rosbag")
+    ros = _recorder_ros()
+
+    node = _create_recorder_node(ros)(config, ros)
+
+    assert node._runtime.config.record_rosbag is False
+    assert node._runtime.config.rosbag_qos_overrides_path is None
+    node.destroy_node()
+
+
+def test_recorder_node_without_rosbag_never_resolves_missing_qos(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _recorder_node_config(tmp_path)
+    config["recorder"]["record_rosbag"] = False
+    config["recorder"]["rosbag"]["qos_overrides_path"] = "missing.yaml"
+
+    def forbidden(*args: Any, **kwargs: Any) -> Path:
+        raise AssertionError("record_rosbag=false不得解析QoS文件")
+
+    monkeypatch.setattr("team_sorting.ros_nodes.resolve_rosbag_qos_overrides_path", forbidden)
+    ros = _recorder_ros()
+    node = _create_recorder_node(ros)(config, ros)
+    assert node._runtime.config.rosbag_qos_overrides_path is None
+    node.destroy_node()
+
+
+@pytest.mark.parametrize(
+    ("mutation", "match"),
+    [
+        (lambda recorder: recorder.pop("rosbag"), "recorder.rosbag配置必须是映射"),
+        (lambda recorder: recorder["rosbag"].pop("qos_overrides_path"), "必须是字符串"),
+        (
+            lambda recorder: recorder["rosbag"].__setitem__(
+                "qos_overrides_path", "missing.yaml"
+            ),
+            "缺失或不可访问",
+        ),
+    ],
+)
+def test_recorder_node_with_rosbag_rejects_missing_qos_configuration(
+    mutation: Any, match: str, tmp_path: Path
+) -> None:
+    config = _recorder_node_config(tmp_path)
+    config["recorder"]["record_rosbag"] = True
+    mutation(config["recorder"])
+    ros = _recorder_ros()
+    with pytest.raises((RuntimeError, ValueError), match=match):
+        _create_recorder_node(ros)(config, ros)
+
+
+def test_recorder_node_resolves_qos_beside_copied_active_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_dir = tmp_path / "installed/share/team_sorting/config"
+    config_dir.mkdir(parents=True)
+    config_path = config_dir / "config.yaml"
+    qos_path = config_dir / "rosbag_qos_overrides.yaml"
+    config_path.write_bytes((ROOT / "config" / "config.yaml").read_bytes())
+    qos_path.write_bytes(QOS_PATH.read_bytes())
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config["recorder"]["enabled"] = True
+    config["recorder"]["root_dir"] = str(tmp_path / "dataset")
+    captured: list[RecorderRuntimeConfig] = []
+
+    class Runtime:
+        def __init__(self, runtime_config: RecorderRuntimeConfig, *args: Any, **kwargs: Any) -> None:
+            self.config = runtime_config
+            captured.append(runtime_config)
+
+        def start(self, now_ros_ns: int) -> Path:
+            return tmp_path / "segment"
+
+        def close(self, now_ros_ns: int, reason: str = "node_shutdown") -> None:
+            return None
+
+    monkeypatch.setenv("TEAM_SORTING_CONFIG", str(config_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("team_sorting.ros_nodes.RecorderRuntimeManager", Runtime)
+    ros = _recorder_ros()
+    node = _create_recorder_node(ros)(config, ros)
+    assert captured[0].record_rosbag is True
+    assert captured[0].rosbag_qos_overrides_path == qos_path.resolve()
+    assert captured[0].config_path == config_path
+    node.destroy_node()
 
 
 @pytest.mark.parametrize(
@@ -1661,6 +1917,51 @@ def test_bag_shutdown_escalation(
     assert [event["event_type"] for event in events].count("bag_stopped") == 1
 
 
+def test_tf_static_zero_messages_does_not_block_ready_or_complete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("team_sorting.recorder.shutil.which", lambda name: "/usr/bin/ros2")
+    commands: list[tuple[str, ...]] = []
+
+    class Process(_FakeProcess):
+        def wait(self, timeout: float) -> int:
+            result = super().wait(timeout)
+            assert self.output_path is not None
+            (self.output_path / "metadata.yaml").write_text(
+                "rosbag2_bagfile_information:\n"
+                "  topics_with_message_count:\n"
+                "    - topic_metadata: {name: /tf, type: tf2_msgs/msg/TFMessage}\n"
+                "      message_count: 24\n"
+                "    - topic_metadata: {name: /tf_static, type: tf2_msgs/msg/TFMessage}\n"
+                "      message_count: 0\n",
+                encoding="utf-8",
+            )
+            return result
+
+    process = Process([0])
+
+    def factory(command: Any) -> _FakeProcess:
+        commands.append(tuple(command))
+        return process.bind(command)
+
+    manager = RecorderRuntimeManager(
+        _config(tmp_path, record_rosbag=True),
+        _pairing(),
+        process_factory=factory,
+    )
+    segment = manager.start(1)
+    manager.close(2)
+    command = commands[0]
+    qos_index = command.index("--qos-profile-overrides-path")
+    assert command[qos_index + 1] == str(QOS_PATH.resolve())
+    assert command[qos_index + 2 :] == DEFAULT_ROSBAG_TOPICS
+    assert (segment / "COMPLETE").is_file()
+    assert not (segment / "ACTIVE").exists()
+    metadata = (segment / "rosbag" / "metadata.yaml").read_text(encoding="utf-8")
+    assert "name: /tf_static" in metadata
+    assert "message_count: 0" in metadata
+
+
 def test_bag_immediate_exit_fails_start_and_leaves_active_evidence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1742,8 +2043,10 @@ def test_rollover_stops_old_bag_before_starting_unique_new_bag(
     assert order[:3] == ["start:1", "stop:1", "start:2"]
     assert len(commands) == 2
     assert commands[0][4] != commands[1][4]
-    assert "/tf" not in commands[0]
-    assert "/tf_static" not in commands[0]
+    assert "/tf" in commands[0]
+    assert "/tf_static" in commands[0]
+    qos_index = commands[0].index("--qos-profile-overrides-path")
+    assert commands[0][qos_index + 1] == str(QOS_PATH.resolve())
     assert "/team/action_dispatch" not in commands[0]
 
 
