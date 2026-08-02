@@ -568,10 +568,13 @@ ros2 launch team_sorting team.launch.xml record_data:=true
 ### 官方 offline Client 容器开发入口
 
 `scripts/run_official_offline_client.sh` 将当前项目挂载到
-`/workspace/baseline`，在 `material_sorting:offline-client` 内 source ROS 2
-Humble。命名卷 `team_sorting_offline_client_colcon_v1` 默认挂载到
-`/opt/team_sorting_colcon`，其中的 build/install/log 可跨 `--rm` 容器复用，源码仍
-来自 `/workspace/baseline`，并使用 `--symlink-install` 做增量开发构建。它固定使用 host network、
+`/workspace/baseline:ro`。`material_sorting:offline-client` 是 ROS 2 Humble 运行时镜像，
+不包含 colcon；正式入口不会安装 colcon，也不会联网下载构建依赖，而是把必要源码复制到
+持久 runtime 命名卷的可写 `src/`，再以 `--no-index --no-deps --no-build-isolation`
+执行完全离线 pip 安装。默认卷 `team_sorting_offline_client_runtime_v1` 挂载到
+`/opt/team_sorting_runtime`，实际安装前缀是
+`/opt/team_sorting_runtime/prefix/local`；这是该镜像中 pip `--prefix` 自动增加的
+`local` 层，不能把 `/opt/team_sorting_runtime/prefix` 直接当作 ROS 前缀。脚本固定使用 host network、
 `ROS_DOMAIN_ID=99`、`rmw_cyclonedds_cpp`，默认配置仍为 observe-only，不启动或修改
 官方 Server，也不联网下载模型。宿主机 `MATERIAL_SORTING_OFFICIAL_ROOT` 是必填目录，
 脚本会在 Docker 启动前验证官方 Server 关键文件。`TEAM_SORTING_CLIENT_GPUS` 默认
@@ -585,9 +588,21 @@ TEAM_SORTING_CLIENT_GPUS=all \
 DRY_RUN=1 ./scripts/run_official_offline_client.sh
 ```
 
-可用 `TEAM_SORTING_COLCON_CACHE_VOLUME` 覆盖缓存卷名。需要排除旧构建缓存时设置
-`TEAM_SORTING_CLEAN_BUILD=1`；它只删除命名卷内的 build/install/log，不删除
-`/workspace/baseline` 源码。容器内部在 source ROS 和 colcon setup 时保留
+可用 `TEAM_SORTING_RUNTIME_VOLUME` 覆盖 runtime 卷名。脚本以 setup/package 元数据、
+`resource/`、Python 包、launch 和 config 的路径与内容计算稳定 SHA256：源码未变化且
+安装副本完整时直接 cache hit，不重复构建 wheel 或执行 pip install；源码变化时更新
+卷内可写副本并重新离线安装。`TEAM_SORTING_CLEAN_BUILD=1` 会清理 runtime 卷内的
+`src/`、`prefix/`、`pip-cache/` 和 `source.sha256` 后强制重建，不删除只读的
+`/workspace/baseline`。旧 `TEAM_SORTING_COLCON_CACHE_VOLUME` 仅作弃用迁移兼容。
+
+启动前脚本把 `prefix/local` 放在 `AMENT_PREFIX_PATH`、`PATH` 和 `PYTHONPATH` 最前，
+过滤继承环境中直接指向宿主源码的 PYTHONPATH 项，并在 `/tmp` 验证 Python 导入路径、
+`ros2 pkg prefix`、三个节点入口、launch 和 config 均来自持久安装副本。该镜像中的
+pip wheel 会把 console scripts 安装到 `prefix/local/bin`；脚本会验证这些源入口并在
+`prefix/local/lib/team_sorting` 创建符号链接，以提供 ROS 2 要求的标准包 libexec 布局。
+旧 runtime 卷即使源码指纹未变，也会在 cache hit 前自动补建并验证这些链接。比赛现场不应
+联网安装依赖；离线 pip 安装及静态真实性检查成功，也不等于 ROS 话题通信、QoS、传感器
+消息或 observe-only 发布边界已经通过在线验证。容器内部 source ROS setup 时保留
 `errexit`/`pipefail`，但不启用会与 ROS setup 冲突的 Bash `nounset`。
 
 TeamClient 将完整三任务集合与 `/referee/taskinfo`、`/referee/gameinfo`、

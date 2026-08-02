@@ -907,7 +907,9 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 changed = self._coordinator.update_tasks(tasks, now_ns)
                 if changed:
                     self.get_logger().info("收到新的完整三任务集合，已创建新的本地run身份")
-                self._refresh_competition_context(now_ns)
+                self._refresh_competition_context(
+                    now_ns, refresh_instruction_liveness=True
+                )
             except ValueError as exc:
                 self.get_logger().error(f"任务解析失败：{exc}")
 
@@ -935,7 +937,9 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 self.get_logger().error(f"裁判score解析失败：{exc}")
             self._refresh_competition_context(now_ns)
 
-        def _refresh_competition_context(self, now_ns: int) -> None:
+        def _refresh_competition_context(
+            self, now_ns: int, *, refresh_instruction_liveness: bool = False
+        ) -> None:
             context = self._coordinator.context()
             message = self._ros.String()
             message.data = context.to_json()
@@ -943,6 +947,14 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             self._active_context = context
             if not context.valid or context.finished or context.active_task is None:
                 return
+            active_instruction = json.dumps(
+                context.to_dict()["active_task"], ensure_ascii=False,
+                sort_keys=True, separators=(",", ":"), allow_nan=False,
+            )
+            if refresh_instruction_liveness:
+                self._external_candidate.update_instruction(
+                    active_instruction, context.current_task_id, now_ns
+                )
             if not self._system_ready_submitted:
                 return
             if not self._coordinator.active_task_changed(context):
@@ -974,13 +986,10 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             self._fsm.handle_event(FSMEvent.SYSTEM_READY, now_ns)
             self._fsm.submit_task(context.active_task, now_ns)
             self._last_activated_context = context
-            active_instruction = json.dumps(
-                context.to_dict()["active_task"], ensure_ascii=False,
-                sort_keys=True, separators=(",", ":"), allow_nan=False,
-            )
-            self._external_candidate.update_instruction(
-                active_instruction, context.current_task_id, now_ns
-            )
+            if not refresh_instruction_liveness:
+                self._external_candidate.update_instruction(
+                    active_instruction, context.current_task_id, now_ns
+                )
 
         def _on_external_candidate(self, message: Any) -> None:
             """Validate and reserve one candidate; never creates or publishes an action."""

@@ -123,6 +123,7 @@ class _Node:
         self.timers: list[_Timer] = []
         self.destroy_count = 0
         self.additional_publishers: dict[str, int] = {}
+        self.now_ns = NOW
 
     def create_publisher(self, _type: object, topic: str, _depth: int) -> _Publisher:
         publisher = _Publisher(topic, self.context, self.events)
@@ -144,7 +145,7 @@ class _Node:
         return self.logger
 
     def get_clock(self) -> SimpleNamespace:
-        return SimpleNamespace(now=lambda: SimpleNamespace(nanoseconds=NOW))
+        return SimpleNamespace(now=lambda: SimpleNamespace(nanoseconds=self.now_ns))
 
     def count_publishers(self, topic: str) -> int:
         return int(topic in self.publishers) + self.additional_publishers.get(topic, 0)
@@ -323,6 +324,39 @@ def test_settled_attempts_rearm_only_the_local_single_task_fsm() -> None:
     assert sum("attempt_transition" in message for message in logs) == 2
     assert any("不代表Server、机器人或物品复位" in message for message in logs)
     assert not any("Server reset" in message for message in logs)
+
+
+def test_repeated_official_instruction_refreshes_liveness_without_rearming_fsm() -> None:
+    ros = _ros()
+    config = _config()
+    config["external_candidate"]["enabled"] = True
+    node = _create_team_client_node(ros)(config, ros)
+    node._system_ready_submitted = True
+    raw_instruction = json.dumps(OFFICIAL_TASKS)
+    node._on_instruction(_message(raw_instruction))
+    _feed_official_context(node, task=1, attempt=0)
+
+    run_id = node._active_context.run_id
+    task_set_fingerprint = node._active_context.task_set_fingerprint
+    task_identity = node._external_candidate.current_task_identity
+    generation = node._external_candidate.bound_generation
+    first_fsm = node._fsm
+
+    for elapsed_ms in (500, 1000, 1500, 2000):
+        node.now_ns = NOW + elapsed_ms * 1_000_000
+        node._on_instruction(_message(raw_instruction))
+        assert node._external_candidate.instruction_received_ns == node.now_ns
+        assert node._external_candidate.watchdog(node.now_ns) is None
+
+    assert node._active_context.run_id == run_id
+    assert node._active_context.task_set_fingerprint == task_set_fingerprint
+    assert node._external_candidate.current_task_identity == task_identity
+    assert node._external_candidate.bound_generation == generation
+    assert node._fsm is first_fsm
+    logs = [message for _level, message in node.logger.messages]
+    assert sum("新的本地run身份" in message for message in logs) == 1
+    assert sum("task_transition" in message for message in logs) == 1
+    assert not any("attempt_transition" in message for message in logs)
 
 
 def test_official_publish_order_recovers_once_without_task1_fallback() -> None:
