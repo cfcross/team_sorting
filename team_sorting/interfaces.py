@@ -199,6 +199,30 @@ def _strict_bool(value: object, name: str) -> bool:
     return value
 
 
+def _require_finite_real(
+    value: object, name: str, *, nonnegative: bool = False
+) -> None:
+    if type(value) is bool or not isinstance(value, Real):
+        raise ValueError(f"{name} 必须是 numbers.Real 且不能是 bool")
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"{name} 必须是有限数")
+    if nonnegative and number < 0.0:
+        raise ValueError(f"{name} 必须大于等于 0")
+
+
+def _require_string(value: object, name: str, *, nonempty: bool = False) -> None:
+    if not isinstance(value, str):
+        raise ValueError(f"{name} 必须是字符串")
+    if nonempty and not value.strip():
+        raise ValueError(f"{name} 不得为空或只包含空白")
+
+
+def _require_enum(value: object, enum_type: type[Enum], name: str) -> None:
+    if not isinstance(value, enum_type):
+        raise ValueError(f"{name} 必须是 {enum_type.__name__} 成员")
+
+
 def _strict_finite_vector(
     values: object, length: int, name: str
 ) -> tuple[float, ...]:
@@ -387,6 +411,25 @@ class BaseState:
     valid: bool = True
     failure_reason: str = ""
 
+    def __post_init__(self) -> None:
+        _strict_finite_vector(self.position_xyz, 3, "BaseState.position_xyz")
+        orientation = _strict_finite_vector(
+            self.orientation_xyzw, 4, "BaseState.orientation_xyzw"
+        )
+        if math.hypot(*orientation) == 0.0:
+            raise ValueError("BaseState.orientation_xyzw 四元数范数必须大于 0")
+        _require_finite_real(self.yaw, "BaseState.yaw")
+        _strict_finite_vector(
+            self.linear_velocity_xyz, 3, "BaseState.linear_velocity_xyz"
+        )
+        _strict_finite_vector(
+            self.angular_velocity_xyz, 3, "BaseState.angular_velocity_xyz"
+        )
+        _require_string(self.frame_id, "BaseState.frame_id", nonempty=True)
+        _strict_nonnegative_ns(self.timestamp_ns, "BaseState.timestamp_ns")
+        _strict_bool(self.valid, "BaseState.valid")
+        _require_string(self.failure_reason, "BaseState.failure_reason")
+
 
 @dataclass(frozen=True)
 class RobotJointState:
@@ -421,11 +464,26 @@ class RobotJointState:
     joint_names: tuple[str, ...] = JOINT_NAMES
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "position", ensure_finite_vector(self.position, 17, "关节位置"))
-        object.__setattr__(self, "velocity", ensure_finite_vector(self.velocity, 17, "关节速度"))
-        object.__setattr__(self, "effort", ensure_finite_vector(self.effort, 17, "关节 effort"))
-        if tuple(self.joint_names) != JOINT_NAMES:
+        object.__setattr__(
+            self, "position", _strict_finite_vector(self.position, 17, "RobotJointState.position")
+        )
+        object.__setattr__(
+            self, "velocity", _strict_finite_vector(self.velocity, 17, "RobotJointState.velocity")
+        )
+        object.__setattr__(
+            self, "effort", _strict_finite_vector(self.effort, 17, "RobotJointState.effort")
+        )
+        try:
+            names = tuple(self.joint_names)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("RobotJointState.joint_names 必须使用团队统一顺序") from exc
+        if names != JOINT_NAMES:
             raise ValueError("RobotJointState.joint_names 必须使用团队统一顺序")
+        _strict_nonnegative_ns(self.timestamp_ns, "RobotJointState.timestamp_ns")
+        _strict_bool(self.valid, "RobotJointState.valid")
+        _require_string(self.failure_reason, "RobotJointState.failure_reason")
+        if not self.valid and not self.failure_reason.strip():
+            raise ValueError("无效 RobotJointState 必须提供 failure_reason")
 
 
 # 感知接口
@@ -1100,6 +1158,21 @@ class NavGoal:
     valid: bool = True
     failure_reason: str = ""
 
+    def __post_init__(self) -> None:
+        _require_string(self.goal_id, "NavGoal.goal_id", nonempty=True)
+        _require_string(self.goal_type, "NavGoal.goal_type", nonempty=True)
+        _strict_finite_vector(self.pose_xyyaw, 3, "NavGoal.pose_xyyaw")
+        _require_string(self.frame_id, "NavGoal.frame_id", nonempty=True)
+        _require_finite_real(
+            self.position_tolerance, "NavGoal.position_tolerance", nonnegative=True
+        )
+        _require_finite_real(
+            self.yaw_tolerance, "NavGoal.yaw_tolerance", nonnegative=True
+        )
+        _strict_nonnegative_ns(self.deadline_ns, "NavGoal.deadline_ns")
+        _strict_bool(self.valid, "NavGoal.valid")
+        _require_string(self.failure_reason, "NavGoal.failure_reason")
+
 
 @dataclass(frozen=True)
 class BaseCommand:
@@ -1128,6 +1201,18 @@ class BaseCommand:
     valid_until_ns: int
     valid: bool = True
     failure_reason: str = ""
+
+    def __post_init__(self) -> None:
+        _require_finite_real(self.v, "BaseCommand.v")
+        _require_finite_real(self.w, "BaseCommand.w")
+        _strict_nonnegative_ns(self.timestamp_ns, "BaseCommand.timestamp_ns")
+        _strict_nonnegative_ns(self.valid_until_ns, "BaseCommand.valid_until_ns")
+        if self.valid_until_ns < self.timestamp_ns:
+            raise ValueError("BaseCommand.valid_until_ns 不得早于 timestamp_ns")
+        _strict_bool(self.valid, "BaseCommand.valid")
+        _require_string(self.failure_reason, "BaseCommand.failure_reason")
+        if not self.valid and not self.failure_reason.strip():
+            raise ValueError("无效 BaseCommand 必须提供 failure_reason")
 
 
 @dataclass(frozen=True)
@@ -1160,6 +1245,26 @@ class NavigationStatus:
     success: bool
     failure_reason: str
     timestamp_ns: int
+
+    def __post_init__(self) -> None:
+        _require_string(self.goal_id, "NavigationStatus.goal_id")
+        _require_string(self.state, "NavigationStatus.state", nonempty=True)
+        allowed_states = {
+            "aligning_final_yaw", "aligning_to_goal", "arrived", "failed", "moving", "timeout"
+        }
+        if self.state not in allowed_states:
+            raise ValueError(f"NavigationStatus.state 不受支持：{self.state}")
+        _require_finite_real(
+            self.distance_error, "NavigationStatus.distance_error", nonnegative=True
+        )
+        _require_finite_real(self.yaw_error, "NavigationStatus.yaw_error")
+        _strict_bool(self.success, "NavigationStatus.success")
+        if self.success != (self.state == "arrived"):
+            raise ValueError("NavigationStatus.success 必须且只能对应 arrived")
+        _require_string(self.failure_reason, "NavigationStatus.failure_reason")
+        if self.state in {"failed", "timeout"} and not self.failure_reason.strip():
+            raise ValueError("failed/timeout NavigationStatus 必须提供 failure_reason")
+        _strict_nonnegative_ns(self.timestamp_ns, "NavigationStatus.timestamp_ns")
 
 
 # 机械臂规划接口（续）
@@ -1318,6 +1423,27 @@ class IKResult:
     right_joint_target: Optional[tuple[float, ...]]
     success: bool
     failure_reason: str = ""
+
+    def __post_init__(self) -> None:
+        _require_finite_real(self.target_slide, "IKResult.target_slide")
+        for field_name in ("left_joint_target", "right_joint_target"):
+            target = getattr(self, field_name)
+            if target is not None:
+                object.__setattr__(
+                    self,
+                    field_name,
+                    _strict_finite_vector(target, 6, f"IKResult.{field_name}"),
+                )
+        _strict_bool(self.success, "IKResult.success")
+        _require_string(self.failure_reason, "IKResult.failure_reason")
+        targets = (self.left_joint_target, self.right_joint_target)
+        if self.success and all(target is None for target in targets):
+            raise ValueError("成功 IKResult 必须包含至少一侧6维关节目标")
+        if not self.success:
+            if any(target is not None for target in targets):
+                raise ValueError("失败 IKResult 不得携带可执行关节目标")
+            if not self.failure_reason.strip():
+                raise ValueError("失败 IKResult 必须提供 failure_reason")
 
 
 @dataclass(frozen=True)
@@ -1580,9 +1706,28 @@ class ManipulationCommand:
     failure_reason: str = ""
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "joint_target", ensure_finite_vector(self.joint_target, 17, "机械臂命令"))
-        if len(self.controlled_mask) != 17:
+        object.__setattr__(
+            self,
+            "joint_target",
+            _strict_finite_vector(self.joint_target, 17, "ManipulationCommand.joint_target"),
+        )
+        try:
+            mask = tuple(self.controlled_mask)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("ManipulationCommand.controlled_mask 必须包含 17 项严格 bool") from exc
+        if len(mask) != 17:
             raise ValueError("机械臂 controlled_mask 必须包含 17 项")
+        if any(type(value) is not bool for value in mask):
+            raise ValueError("ManipulationCommand.controlled_mask 每项必须是严格 bool")
+        _require_enum(self.local_phase, LocalPhase, "ManipulationCommand.local_phase")
+        _strict_nonnegative_ns(self.timestamp_ns, "ManipulationCommand.timestamp_ns")
+        _strict_nonnegative_ns(self.valid_until_ns, "ManipulationCommand.valid_until_ns")
+        if self.valid_until_ns < self.timestamp_ns:
+            raise ValueError("ManipulationCommand.valid_until_ns 不得早于 timestamp_ns")
+        _strict_bool(self.valid, "ManipulationCommand.valid")
+        _require_string(self.failure_reason, "ManipulationCommand.failure_reason")
+        if not self.valid and not self.failure_reason.strip():
+            raise ValueError("无效 ManipulationCommand 必须提供 failure_reason")
 
 
 @dataclass(frozen=True)
@@ -1616,6 +1761,29 @@ class ManipulationStatus:
     success: bool
     failure_reason: str
     timestamp_ns: int
+
+    def __post_init__(self) -> None:
+        _require_enum(self.local_phase, LocalPhase, "ManipulationStatus.local_phase")
+        _require_string(self.state, "ManipulationStatus.state", nonempty=True)
+        allowed_states = {
+            "FAILED", "LOADED", "MOTION_COMPLETED_PLACE_VERIFICATION_PENDING",
+            "NO_TRAJECTORY", "REJECTED", "RUNNING", "VERIFICATION_PENDING",
+        }
+        if self.state not in allowed_states:
+            raise ValueError(f"ManipulationStatus.state 不受支持：{self.state}")
+        _require_finite_real(self.progress, "ManipulationStatus.progress", nonnegative=True)
+        if float(self.progress) > 1.0:
+            raise ValueError("ManipulationStatus.progress 必须位于 [0,1]")
+        if type(self.max_joint_error) is bool or not isinstance(self.max_joint_error, Real):
+            raise ValueError("ManipulationStatus.max_joint_error 必须是实数且不能是 bool")
+        error = float(self.max_joint_error)
+        if math.isnan(error) or error == float("-inf") or error < 0.0:
+            raise ValueError("ManipulationStatus.max_joint_error 必须是非负有限数或 +Inf 哨兵")
+        _strict_bool(self.success, "ManipulationStatus.success")
+        if self.success:
+            raise ValueError("当前 ManipulationStatus 状态集合尚无已验证成功状态")
+        _require_string(self.failure_reason, "ManipulationStatus.failure_reason")
+        _strict_nonnegative_ns(self.timestamp_ns, "ManipulationStatus.timestamp_ns")
 
 
 @dataclass(frozen=True)
@@ -1690,6 +1858,19 @@ class FSMStatus:
     failure_reason: str
     timestamp_ns: int
 
+    def __post_init__(self) -> None:
+        if type(self.task_id) is not int or self.task_id < -1:
+            raise ValueError("FSMStatus.task_id 必须是大于等于 -1 的整数且不能是 bool")
+        _require_enum(self.global_phase, GlobalPhase, "FSMStatus.global_phase")
+        _require_enum(self.local_phase, LocalPhase, "FSMStatus.local_phase")
+        if type(self.retry_count) is not int or self.retry_count < 0:
+            raise ValueError("FSMStatus.retry_count 必须是非负整数且不能是 bool")
+        _strict_bool(self.success, "FSMStatus.success")
+        if self.success != (self.global_phase is GlobalPhase.DONE):
+            raise ValueError("FSMStatus.success 必须且只能对应 GlobalPhase.DONE")
+        _require_string(self.failure_reason, "FSMStatus.failure_reason")
+        _strict_nonnegative_ns(self.timestamp_ns, "FSMStatus.timestamp_ns")
+
 
 @dataclass(frozen=True)
 class FinalAction:
@@ -1727,7 +1908,19 @@ class FinalAction:
     failure_reason: str = ""
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "values", ensure_finite_vector(self.values, 19, "FinalAction"))
+        object.__setattr__(
+            self, "values", _strict_finite_vector(self.values, 19, "FinalAction.values")
+        )
+        if type(self.sequence) is not int or self.sequence < 0:
+            raise ValueError("FinalAction.sequence 必须是非负整数且不能是 bool")
+        _strict_nonnegative_ns(self.timestamp_ns, "FinalAction.timestamp_ns")
+        _require_enum(self.global_phase, GlobalPhase, "FinalAction.global_phase")
+        _require_enum(self.local_phase, LocalPhase, "FinalAction.local_phase")
+        _strict_bool(self.valid, "FinalAction.valid")
+        _strict_bool(self.clipped, "FinalAction.clipped")
+        _require_string(self.failure_reason, "FinalAction.failure_reason")
+        if not self.valid and not self.failure_reason.strip():
+            raise ValueError("无效 FinalAction 必须提供 failure_reason")
 
 
 class CandidateDisposition(str, Enum):
@@ -2427,17 +2620,17 @@ def final_action_from_json(raw: str) -> FinalAction:
 
     try:
         payload = json.loads(raw)
-        if payload.get("schema_version") != 1:
+        if type(payload.get("schema_version")) is not int or payload["schema_version"] != 1:
             raise ValueError("不支持的 FinalAction schema_version")
         return FinalAction(
             values=tuple(payload["action"]),
-            sequence=int(payload["sequence"]),
-            timestamp_ns=int(payload["timestamp_ns"]),
+            sequence=payload["sequence"],
+            timestamp_ns=payload["timestamp_ns"],
             global_phase=GlobalPhase(payload["global_phase"]),
             local_phase=LocalPhase(payload["local_phase"]),
-            valid=bool(payload["valid"]),
-            clipped=bool(payload["clipped"]),
-            failure_reason=str(payload.get("failure_reason", "")),
+            valid=payload["valid"],
+            clipped=payload["clipped"],
+            failure_reason=payload.get("failure_reason", ""),
         )
     except (KeyError, TypeError, json.JSONDecodeError, ValueError) as exc:
         raise ValueError(f"FinalAction JSON 无效：{exc}") from exc
@@ -2476,16 +2669,16 @@ def fsm_status_from_json(raw: str) -> FSMStatus:
 
     try:
         payload = json.loads(raw)
-        if payload.get("schema_version") != 1:
+        if type(payload.get("schema_version")) is not int or payload["schema_version"] != 1:
             raise ValueError("不支持的 FSMStatus schema_version")
         return FSMStatus(
-            task_id=int(payload["task_id"]),
+            task_id=payload["task_id"],
             global_phase=GlobalPhase(payload["global_phase"]),
             local_phase=LocalPhase(payload["local_phase"]),
-            retry_count=int(payload["retry_count"]),
-            success=bool(payload["success"]),
-            failure_reason=str(payload.get("failure_reason", "")),
-            timestamp_ns=int(payload["timestamp_ns"]),
+            retry_count=payload["retry_count"],
+            success=payload["success"],
+            failure_reason=payload.get("failure_reason", ""),
+            timestamp_ns=payload["timestamp_ns"],
         )
     except (KeyError, TypeError, json.JSONDecodeError, ValueError) as exc:
         raise ValueError(f"FSMStatus JSON 无效：{exc}") from exc

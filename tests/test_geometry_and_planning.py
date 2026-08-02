@@ -439,6 +439,20 @@ def _nav_goal(
     return NavGoal("goal", "pick", (x, y, yaw), frame, 0.05, 0.1, deadline, valid)
 
 
+def _unchecked_nav_goal(x: object, y: float, yaw: float) -> NavGoal:
+    """构造边界之外的损坏对象，仅用于验证导航控制器的防御纵深。"""
+
+    goal = object.__new__(NavGoal)
+    for name, value in (
+        ("goal_id", "goal"), ("goal_type", "pick"),
+        ("pose_xyyaw", (x, y, yaw)), ("frame_id", "odom"),
+        ("position_tolerance", 0.05), ("yaw_tolerance", 0.1),
+        ("deadline_ns", 2_000_000_000), ("valid", True), ("failure_reason", ""),
+    ):
+        object.__setattr__(goal, name, value)
+    return goal
+
+
 def test_navigation_pick_goal_stands_off_and_faces_object() -> None:
     controller = NavigationController()
     target = ObjectEstimate3D("pink", (2.0, 0.0, 0.8), 0.9, "odom", 1_000_000_000)
@@ -584,7 +598,7 @@ def test_navigation_update_safely_stops_on_timeout_invalid_and_stale_odom() -> N
         (_nav_base(), _nav_goal(1.0, 0.0, 0.0, deadline=999_999_999)),
         (_nav_base(valid=False), _nav_goal(1.0, 0.0, 0.0)),
         (_nav_base(stamp=800_000_000), _nav_goal(1.0, 0.0, 0.0)),
-        (_nav_base(), _nav_goal(math.nan, 0.0, 0.0)),
+        (_nav_base(), _unchecked_nav_goal(math.nan, 0.0, 0.0)),
         (_nav_base(), _nav_goal(1.0, 0.0, 0.0, frame="world")),
     )
     for base, goal in cases:
