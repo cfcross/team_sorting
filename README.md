@@ -14,6 +14,13 @@
 
 公共接口的机器可读冻结入口是 [`config/contracts/interface_v1.json`](config/contracts/interface_v1.json)，中文说明见 [`docs/interface_v1.md`](docs/interface_v1.md)。当前冻结的是名称、顺序、单位、身份及证据边界；`provisional`/`restricted` 项和 UNRESOLVED 在线事实仍保持显式，Interface对齐不代表算法或比赛闭环完成。
 
+### Stage 2.3 Data/TF Policy v1
+
+B3数据、TF/QoS、raw/derived边界、采集profile和训练资格的独立机器契约见
+[`config/contracts/data_tf_policy_v1.json`](config/contracts/data_tf_policy_v1.json)，中文投影见
+[`docs/data_tf_policy_v1.md`](docs/data_tf_policy_v1.md)。B3A只冻结策略，不修改当前Recorder
+话题，不实现TF录制、压缩、降频、Indexer/QC或训练样本生成。
+
 ### Stage 2A External Candidate Consumer
 
 当前代码包含对 adapter 提交

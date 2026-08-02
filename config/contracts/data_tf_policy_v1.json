@@ -1,0 +1,585 @@
+{
+  "schema_name": "team_sorting.data_tf_policy",
+  "schema_version": 1,
+  "policy_id": "data_tf_policy_v1",
+  "implementation_status": "contract_only",
+  "interface_contract": {
+    "path": "config/contracts/interface_v1.json",
+    "schema_name": "team_sorting.interface",
+    "schema_version": 1,
+    "frozen_sha256": "a86548b2a43581af70b8d585d523a06bb97a8d96e1fe52950097b12d061fdaea"
+  },
+  "recorder_contract": {
+    "path": "config/contracts/recorder_schema_v1.json",
+    "schema_name": "team_sorting.recorder",
+    "schema_version": 1,
+    "frozen_sha256": "e7965c34a38c11d551d9943d8d614c05bc8e28e186432ad5ff4d0eed243225cf"
+  },
+  "raw_derived_policy": {
+    "raw_in_place_modification": "forbidden",
+    "raw_artifacts_read_only": [
+      "segment",
+      "manifest",
+      "events",
+      "jsonl",
+      "rosbag"
+    ],
+    "derived_root_template": "derived/indexer_v1/<deterministic_build_id>/",
+    "derived_outputs": [
+      "index_build.json",
+      "dataset_index.jsonl",
+      "segment_qc.json",
+      "run_qc.json",
+      "sample_index.jsonl",
+      "training_manifest.jsonl"
+    ],
+    "required_provenance_fields": [
+      "source_relative_path",
+      "source_sha256",
+      "tool_name",
+      "tool_version",
+      "tool_commit",
+      "config_sha256",
+      "deterministic_build_id"
+    ],
+    "host_absolute_path_is_identity": false,
+    "semantic_reproducibility_required": true,
+    "automatic_raw_deletion": "forbidden",
+    "raw_delete_or_archive_policy": "separate_explicit_human_approved_operation"
+  },
+  "topic_policy": {
+    "current_raw_baseline": [
+      {
+        "name": "/material/instruction",
+        "message_type": "std_msgs/msg/String",
+        "role": "instruction",
+        "baseline_status": "currently_recorded",
+        "default_retention": "retain_raw"
+      },
+      {
+        "name": "/head_camera/color/image_raw",
+        "message_type": "sensor_msgs/msg/Image",
+        "role": "rgb_image",
+        "baseline_status": "currently_recorded",
+        "default_retention": "retain_raw"
+      },
+      {
+        "name": "/head_camera/aligned_depth_to_color/image_raw",
+        "message_type": "sensor_msgs/msg/Image",
+        "role": "aligned_depth_image",
+        "baseline_status": "currently_recorded",
+        "default_retention": "retain_raw_lossless"
+      },
+      {
+        "name": "/head_camera/color/camera_info",
+        "message_type": "sensor_msgs/msg/CameraInfo",
+        "role": "camera_calibration",
+        "baseline_status": "currently_recorded",
+        "default_retention": "retain_raw"
+      },
+      {
+        "name": "/slamware_ros_sdk_server_node/odom",
+        "message_type": "nav_msgs/msg/Odometry",
+        "role": "base_state",
+        "baseline_status": "currently_recorded",
+        "default_retention": "retain_raw"
+      },
+      {
+        "name": "/joint_states",
+        "message_type": "sensor_msgs/msg/JointState",
+        "role": "joint_state",
+        "baseline_status": "currently_recorded",
+        "default_retention": "retain_raw"
+      },
+      {
+        "name": "/team/object_estimates",
+        "message_type": "vision_msgs/msg/Detection3DArray",
+        "role": "derived_perception",
+        "baseline_status": "currently_recorded",
+        "default_retention": "retain_raw_online_output"
+      },
+      {
+        "name": "/team/fsm_status",
+        "message_type": "std_msgs/msg/String",
+        "role": "fsm_state",
+        "baseline_status": "currently_recorded",
+        "default_retention": "retain_raw"
+      },
+      {
+        "name": "/team/competition_context",
+        "message_type": "std_msgs/msg/String",
+        "role": "competition_context",
+        "baseline_status": "currently_recorded",
+        "default_retention": "retain_raw"
+      },
+      {
+        "name": "/team/final_action",
+        "message_type": "std_msgs/msg/String",
+        "role": "selected_action",
+        "baseline_status": "currently_recorded",
+        "default_retention": "retain_raw_diagnostic"
+      },
+      {
+        "name": "/referee/taskinfo",
+        "message_type": "std_msgs/msg/String",
+        "role": "referee_task",
+        "baseline_status": "currently_recorded",
+        "default_retention": "retain_raw"
+      },
+      {
+        "name": "/referee/gameinfo",
+        "message_type": "std_msgs/msg/String",
+        "role": "referee_game",
+        "baseline_status": "currently_recorded",
+        "default_retention": "retain_raw"
+      },
+      {
+        "name": "/referee/score",
+        "message_type": "std_msgs/msg/Int32",
+        "role": "referee_score",
+        "baseline_status": "currently_recorded",
+        "default_retention": "retain_raw"
+      }
+    ],
+    "b3_target_topics": [
+      {
+        "name": "/tf",
+        "message_type": "tf2_msgs/msg/TFMessage",
+        "role": "dynamic_transform",
+        "baseline_status": "b3_target_not_yet_recorded",
+        "default_retention": "retain_raw"
+      },
+      {
+        "name": "/tf_static",
+        "message_type": "tf2_msgs/msg/TFMessage",
+        "role": "static_transform",
+        "baseline_status": "b3_target_not_yet_recorded",
+        "default_retention": "retain_raw_when_published"
+      }
+    ],
+    "action_dispatch_authority": {
+      "topic": "/team/action_dispatch",
+      "artifact": "action_dispatches.jsonl",
+      "artifact_is_authoritative": true,
+      "rosbag_duplication_required_in_b3a": false
+    },
+    "action_layer_distinction": [
+      "proposed_action",
+      "selected_action",
+      "dispatched_action",
+      "publisher_call_succeeded",
+      "execution_feedback"
+    ]
+  },
+  "tf_policy": {
+    "dynamic": {
+      "topic": "/tf",
+      "message_type": "tf2_msgs/msg/TFMessage",
+      "role": "dynamic_transform",
+      "subscription_qos": {
+        "reliability": "best_effort",
+        "durability": "volatile",
+        "history": "keep_last",
+        "depth": 100
+      },
+      "observed_publisher_reliability": "reliable",
+      "observed_relationship": "odom_to_base_link"
+    },
+    "static": {
+      "topic": "/tf_static",
+      "message_type": "tf2_msgs/msg/TFMessage",
+      "role": "static_transform",
+      "late_join_required": true,
+      "subscription_qos": {
+        "reliability": "reliable",
+        "durability": "transient_local",
+        "history": "keep_last",
+        "depth": 1
+      },
+      "current_fixed_scene_publisher_present": false,
+      "publisher_absence_is_global_fatal": false,
+      "profile_required_edge_finding": "tf_static_required_edge_missing"
+    },
+    "known_dynamic_relationship": {
+      "parent_frame": "odom",
+      "child_frame": "base_link",
+      "status": "observed"
+    },
+    "world_odom_relationship": {
+      "status": "unknown",
+      "equivalent": false,
+      "assumption_forbidden": true
+    },
+    "raw_frame_id_rewrite": "forbidden"
+  },
+  "frame_policy": {
+    "normalization": {
+      "raw_field": "raw_frame_id",
+      "normalized_field": "normalized_frame_id",
+      "normalization_rule": "strip_leading_slashes",
+      "preserve_raw_and_normalized": true,
+      "empty_frame_guess_without_evidence": "forbidden"
+    },
+    "camera_info_empty_frame": {
+      "raw_frame_id": "",
+      "effective_frame_binding_allowed": true,
+      "effective_frame_id": "head_camera",
+      "binding_source": "synchronized_rgb_depth",
+      "raw_message_rewrite": "forbidden"
+    },
+    "odom_frame": {
+      "historical_raw_frame_id": "/odom",
+      "normalized_frame_id": "odom"
+    },
+    "tf_odom_frame": {
+      "raw_frame_id": "odom",
+      "normalized_frame_id": "odom"
+    },
+    "traceability_required": true
+  },
+  "profiles": [
+    {
+      "profile_id": "debug_audit",
+      "purpose": "故障审计、完整回放和raw容量基线",
+      "validation_status": "validated_raw_baseline",
+      "benchmark_required": false,
+      "required_topics": [
+        "/material/instruction",
+        "/head_camera/color/image_raw",
+        "/head_camera/aligned_depth_to_color/image_raw",
+        "/head_camera/color/camera_info",
+        "/slamware_ros_sdk_server_node/odom",
+        "/joint_states",
+        "/team/object_estimates",
+        "/team/fsm_status",
+        "/team/competition_context",
+        "/team/final_action",
+        "/referee/taskinfo",
+        "/referee/gameinfo",
+        "/referee/score",
+        "/tf"
+      ],
+      "optional_topics": [
+        "/tf_static"
+      ],
+      "target_rates_hz": {
+        "rgb": 24.0,
+        "depth": 24.0,
+        "joint_state_min": 20.0,
+        "joint_state_max": 24.0,
+        "odom_min": 20.0,
+        "odom_max": 24.0,
+        "tf_dynamic_min": 20.0,
+        "tf_dynamic_max": 24.0
+      },
+      "image_storage": {
+        "online_codec": "none",
+        "retain_raw": true,
+        "derived_candidate_codec": "none",
+        "codec_parameters_must_be_versioned": true
+      },
+      "depth_storage": {
+        "online_codec": "none",
+        "retain_raw": true,
+        "lossy_allowed": false,
+        "derived_candidate_codec": "none"
+      },
+      "tf_policy": {
+        "record_dynamic": true,
+        "record_static_when_published": true,
+        "required_static_edges": []
+      },
+      "compression_policy": {
+        "storage_id": "sqlite3",
+        "rosbag_compression": "none",
+        "zstd_default_enabled": false
+      },
+      "raw_retention_policy": {
+        "mode": "audit_baseline",
+        "automatic_delete": false,
+        "long_term_bulk_suitable": false
+      },
+      "training_allowed": false,
+      "expected_use": [
+        "fault_audit",
+        "capacity_baseline",
+        "frame_validation"
+      ],
+      "prohibited_use": [
+        "long_term_bulk_retention",
+        "automatic_formal_bc_labeling"
+      ]
+    },
+    {
+      "profile_id": "formal_collection_candidate",
+      "purpose": "正式数据采集候选和离线训练派生",
+      "validation_status": "provisional",
+      "benchmark_required": true,
+      "required_topics": [
+        "/material/instruction",
+        "/head_camera/color/image_raw",
+        "/head_camera/aligned_depth_to_color/image_raw",
+        "/head_camera/color/camera_info",
+        "/slamware_ros_sdk_server_node/odom",
+        "/joint_states",
+        "/team/object_estimates",
+        "/team/fsm_status",
+        "/team/competition_context",
+        "/team/final_action",
+        "/referee/taskinfo",
+        "/referee/gameinfo",
+        "/referee/score",
+        "/tf"
+      ],
+      "optional_topics": [
+        "/tf_static"
+      ],
+      "target_rates_hz": {
+        "rgb": 12.0,
+        "depth": 12.0,
+        "joint_state_min": 20.0,
+        "joint_state_max": 24.0,
+        "odom_min": 20.0,
+        "odom_max": 24.0,
+        "tf_dynamic_min": 20.0,
+        "tf_dynamic_max": 24.0,
+        "derived_training": 10.0
+      },
+      "image_storage": {
+        "online_codec": "none",
+        "retain_raw": true,
+        "derived_candidate_codec": "jpeg_versioned",
+        "codec_parameters_must_be_versioned": true
+      },
+      "depth_storage": {
+        "online_codec": "none",
+        "retain_raw": true,
+        "lossy_allowed": false,
+        "derived_candidate_codec": "png16_lossless"
+      },
+      "tf_policy": {
+        "record_dynamic": true,
+        "record_static_when_published": true,
+        "required_static_edges": []
+      },
+      "compression_policy": {
+        "storage_id": "sqlite3",
+        "rosbag_compression": "none",
+        "zstd_default_enabled": false
+      },
+      "raw_retention_policy": {
+        "mode": "explicit_operator_managed",
+        "automatic_delete": false,
+        "long_term_bulk_suitable": false
+      },
+      "training_allowed": true,
+      "expected_use": [
+        "post_qc_training_derivation",
+        "formal_collection_benchmark"
+      ],
+      "prohibited_use": [
+        "claiming_12hz_is_optimal",
+        "claiming_10hz_is_optimal",
+        "training_without_qc"
+      ]
+    },
+    {
+      "profile_id": "fast_regression",
+      "purpose": "生命周期、TF、Indexer和QC冒烟测试",
+      "validation_status": "provisional",
+      "benchmark_required": true,
+      "required_topics": [
+        "/material/instruction",
+        "/head_camera/color/image_raw",
+        "/head_camera/aligned_depth_to_color/image_raw",
+        "/head_camera/color/camera_info",
+        "/slamware_ros_sdk_server_node/odom",
+        "/joint_states",
+        "/team/object_estimates",
+        "/team/fsm_status",
+        "/team/competition_context",
+        "/team/final_action",
+        "/referee/taskinfo",
+        "/referee/gameinfo",
+        "/referee/score",
+        "/tf"
+      ],
+      "optional_topics": [
+        "/tf_static"
+      ],
+      "target_rates_hz": {
+        "rgb": 2.0,
+        "depth": 2.0,
+        "joint_state": 10.0,
+        "odom": 10.0,
+        "tf_dynamic": 10.0
+      },
+      "image_storage": {
+        "online_codec": "none",
+        "retain_raw": true,
+        "derived_candidate_codec": "none",
+        "codec_parameters_must_be_versioned": true
+      },
+      "depth_storage": {
+        "online_codec": "none",
+        "retain_raw": true,
+        "lossy_allowed": false,
+        "derived_candidate_codec": "none"
+      },
+      "tf_policy": {
+        "record_dynamic": true,
+        "record_static_when_published": true,
+        "required_static_edges": []
+      },
+      "compression_policy": {
+        "storage_id": "sqlite3",
+        "rosbag_compression": "none",
+        "zstd_default_enabled": false
+      },
+      "raw_retention_policy": {
+        "mode": "short_regression",
+        "automatic_delete": false,
+        "long_term_bulk_suitable": false
+      },
+      "training_allowed": false,
+      "expected_use": [
+        "lifecycle_smoke",
+        "tf_smoke",
+        "indexer_smoke",
+        "qc_smoke"
+      ],
+      "prohibited_use": [
+        "model_training",
+        "formal_collection_quality_claim"
+      ]
+    }
+  ],
+  "storage_policy": {
+    "current_online_defaults": {
+      "storage_id": "sqlite3",
+      "rosbag_compression": "none",
+      "online_rgb_codec": "none",
+      "online_depth_codec": "none"
+    },
+    "zstd": {
+      "environment_plugin_present": true,
+      "competition_client_benchmark_status": "not_validated_under_load",
+      "default_enabled": false,
+      "required_benchmarks": [
+        "cpu_usage",
+        "message_loss",
+        "shutdown_latency",
+        "temporary_disk_space",
+        "fail_closed_behavior"
+      ]
+    },
+    "derived_codecs": {
+      "rgb_candidate": "jpeg_versioned",
+      "rgb_parameters_must_be_versioned": true,
+      "depth_candidate": "png16_lossless",
+      "depth_lossy_forbidden": true
+    },
+    "downsampling": {
+      "implemented_in_b3a": false,
+      "profile_rates_are_policy_targets_only": true,
+      "preserve_original_ros_timestamp": true,
+      "preserve_source_message_identity": true,
+      "unrecorded_every_n_rule": "forbidden"
+    }
+  },
+  "action_label_policy": {
+    "layers": [
+      "proposed_action",
+      "selected_action",
+      "dispatched_action",
+      "publisher_call_succeeded",
+      "execution_feedback"
+    ],
+    "selected_action_source": "FinalAction",
+    "selected_action_alone_is_formal_bc_label": false,
+    "publisher_call_succeeded_semantics": "local_publisher_call_return_only",
+    "publisher_success_proves_dds_controller_or_execution": false,
+    "observe_only": {
+      "allowed_uses": [
+        "perception",
+        "state",
+        "lifecycle",
+        "diagnostics"
+      ],
+      "formal_bc_allowed": false
+    },
+    "formal_bc_requirements": {
+      "observe_only_must_be_false": true,
+      "exact_dispatched_action_required": true,
+      "action_contract_match_required": true,
+      "valid_context_required": true,
+      "finished_must_be_false": true,
+      "safety_gate_semantics_required": true,
+      "subsequent_execution_feedback_required": true
+    },
+    "r0_smoke": {
+      "controlled_single_trajectory_allowed": true,
+      "strict_annotation_required": true,
+      "implies_formal_bc_qualification": false
+    }
+  },
+  "qc_policy": {
+    "severity": [
+      "fatal",
+      "error",
+      "warning",
+      "info"
+    ],
+    "eligibility": [
+      "eligible",
+      "conditionally_eligible",
+      "ineligible"
+    ],
+    "finding_codes": [
+      "active_marker_remaining",
+      "complete_marker_missing",
+      "rosbag_metadata_missing",
+      "rosbag_metadata_empty",
+      "rosbag_exit_nonzero",
+      "recovery_finding_present",
+      "json_invalid",
+      "jsonl_midstream_corruption",
+      "sqlite_integrity_failed",
+      "run_id_mixed",
+      "competition_context_missing",
+      "competition_context_invalid",
+      "required_topic_missing",
+      "timestamp_regression",
+      "rgb_depth_alignment_failed",
+      "camera_info_missing",
+      "joint_state_dimension_invalid",
+      "odom_frame_invalid",
+      "tf_dynamic_missing",
+      "tf_static_required_edge_missing",
+      "tf_graph_disconnected",
+      "selected_action_missing",
+      "dispatched_action_missing",
+      "selected_dispatched_mismatch",
+      "observe_only_not_formal_bc",
+      "execution_feedback_missing"
+    ],
+    "global_rules": {
+      "tf_static_publisher_absent_is_global_fatal": false,
+      "missing_profile_required_static_edge_code": "tf_static_required_edge_missing",
+      "observe_only_formal_bc_eligibility": "ineligible"
+    }
+  },
+  "implementation_boundaries": {
+    "b3a_changes_recorder_runtime": false,
+    "b3a_adds_tf_to_runtime_topics": false,
+    "b3a_implements_compression": false,
+    "b3a_implements_downsampling": false,
+    "b3a_implements_indexer_or_qc": false,
+    "b3a_generates_training_samples": false,
+    "next_phases": {
+      "b3b": "Recorder话题、TF QoS和存储能力",
+      "b3c": "只读Indexer与QC执行器",
+      "b3d": "训练样本索引与eligibility"
+    }
+  }
+}

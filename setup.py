@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from setuptools import find_packages, setup
 
 
@@ -15,9 +17,15 @@ setup(
         (
             "share/" + package_name + "/config/contracts",
             [
+                "config/contracts/data_tf_policy_v1.json",
                 "config/contracts/interface_v1.json",
                 "config/contracts/recorder_schema_v1.json",
             ],
+        ),
+        *(
+            [("share/" + package_name + "/docs", ["docs/data_tf_policy_v1.md"])]
+            if (Path(__file__).resolve().parent / "docs/data_tf_policy_v1.md").is_file()
+            else []
         ),
         ("share/" + package_name + "/launch", ["launch/team.launch.xml"]),
     ],
