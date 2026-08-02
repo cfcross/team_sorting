@@ -245,6 +245,8 @@ recorder:
   recovery_scan_enabled: true
   # 每个segment使用独立bag；关闭依次执行SIGINT、terminate和最终kill，全部等待均有界。
   bag_shutdown:
+    startup_timeout_sec: 10.0
+    startup_poll_interval_sec: 0.02
     sigint_timeout_sec: 30.0
     terminate_timeout_sec: 5.0
     kill_timeout_sec: 2.0

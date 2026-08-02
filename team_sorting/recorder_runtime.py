@@ -90,6 +90,8 @@ class RecorderRuntimeConfig:
     bag_kill_timeout_sec: float
     observe_only: bool
     official_publish_enabled: bool
+    bag_startup_timeout_sec: float = 10.0
+    bag_startup_poll_interval_sec: float = 0.02
     config_path: Optional[Path] = None
 
     def __post_init__(self) -> None:
@@ -107,6 +109,8 @@ class RecorderRuntimeConfig:
             "bag_sigint_timeout_sec",
             "bag_terminate_timeout_sec",
             "bag_kill_timeout_sec",
+            "bag_startup_timeout_sec",
+            "bag_startup_poll_interval_sec",
         ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
@@ -128,6 +132,8 @@ class _ActiveSegment:
     event_sequence: int = 0
     process: Optional[Any] = None
     bag_failure: str = ""
+    bag_ready: bool = False
+    bag_startup_failed: bool = False
     shutdown_event_written: bool = False
     recorder_finished: bool = False
     recorder_finished_event_written: bool = False
@@ -473,6 +479,9 @@ class RecorderRuntimeManager:
         environment: Optional[Mapping[str, str]] = None,
         wall_now: Callable[[], str] = _utc_now,
         monotonic_now_ns: Callable[[], int] = time.monotonic_ns,
+        steady_now: Callable[[], float] = time.monotonic,
+        startup_wait: Callable[[float], None] = time.sleep,
+        bag_ready_probe: Optional[Callable[[Path], bool]] = None,
         pid: Optional[int] = None,
     ) -> None:
         if not isinstance(config, RecorderRuntimeConfig):
@@ -497,6 +506,9 @@ class RecorderRuntimeManager:
         }
         self._wall_now = wall_now
         self._monotonic_now_ns = monotonic_now_ns
+        self._steady_now = steady_now
+        self._startup_wait = startup_wait
+        self._bag_ready_probe = bag_ready_probe or self._default_bag_ready_probe
         self._pid = os.getpid() if pid is None else pid
         if type(self._pid) is not int or self._pid <= 0:
             raise ValueError("pid必须是正整数且不能是bool")
@@ -1292,6 +1304,7 @@ class RecorderRuntimeManager:
             pairing_error = exc
             active.data["warning_counters"]["pairing_close_failure"] = 1
         self._stop_bag(active, now_ros_ns)
+        self._validate_bag_completion(active)
         if pairing_error is not None:
             raise RuntimeError(
                 f"关闭action pairer失败；rosbag已执行有界停止：{pairing_error}"
@@ -1384,8 +1397,9 @@ class RecorderRuntimeManager:
         active = self._active
         if active is None:
             return
-        pending = active.data.pop("_pending_bag_started", None)
+        pending = active.data.get("_pending_bag_started")
         if pending is not None:
+            self._await_bag_ready(active)
             self._write_event(
                 "bag_started",
                 now_ros_ns,
@@ -1394,6 +1408,59 @@ class RecorderRuntimeManager:
                 source={"kind": "rosbag_process", "derived": False},
                 source_event_ids=(),
             )
+            active.data.pop("_pending_bag_started", None)
+
+    @staticmethod
+    def _default_bag_ready_probe(output_path: Path) -> bool:
+        """Treat rosbag as ready only after its storage writer creates a file."""
+
+        try:
+            metadata = os.lstat(output_path)
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+                return False
+            return any(
+                not entry.is_symlink() and entry.is_file()
+                for entry in output_path.iterdir()
+                if entry.name != "metadata.yaml"
+            )
+        except OSError:
+            return False
+
+    def _await_bag_ready(self, active: _ActiveSegment) -> None:
+        if not self.config.record_rosbag or active.bag_ready:
+            return
+        process = active.process
+        if process is None:
+            raise RuntimeError("rosbag ready确认失败：子进程不存在")
+        output_path = active.directory / "rosbag"
+        deadline = self._steady_now() + self.config.bag_startup_timeout_sec
+        while True:
+            exit_code = process.poll()
+            if exit_code is not None:
+                active.process = None
+                active.recorder.mark_rosbag_finished(int(exit_code))
+                active.data["bag_exit_code"] = int(exit_code)
+                active.data["warning_counters"]["bag_start_failure"] = 1
+                active.bag_failure = (
+                    "ros2 bag record在ready确认前退出，"
+                    f"exit_code={int(exit_code)}"
+                )
+                raise RuntimeError(active.bag_failure)
+            if self._bag_ready_probe(output_path):
+                active.bag_ready = True
+                return
+            remaining = deadline - self._steady_now()
+            if remaining <= 0:
+                active.bag_startup_failed = True
+                active.data["warning_counters"]["bag_startup_timeout"] = 1
+                active.bag_failure = (
+                    "ros2 bag record启动超时：未观察到已初始化的存储文件，"
+                    f"timeout_sec={self.config.bag_startup_timeout_sec}"
+                )
+                raise RuntimeError(active.bag_failure)
+            self._startup_wait(
+                min(self.config.bag_startup_poll_interval_sec, remaining)
+            )
 
     def _stop_bag(self, active: _ActiveSegment, now_ros_ns: int) -> None:
         process = active.process
@@ -1401,15 +1468,36 @@ class RecorderRuntimeManager:
             return
         exit_code = process.poll()
         escalation = "none"
+        if exit_code is not None:
+            active.data["warning_counters"]["bag_early_exit"] = (
+                active.data["warning_counters"].get("bag_early_exit", 0) + 1
+            )
+            active.bag_failure = (
+                "ros2 bag record在停止请求前已经退出，"
+                f"exit_code={int(exit_code)}"
+            )
         if exit_code is None:
-            process.send_signal(signal.SIGINT)
-            escalation = "sigint"
-            try:
-                exit_code = process.wait(timeout=self.config.bag_sigint_timeout_sec)
-            except subprocess.TimeoutExpired:
+            if not active.bag_ready and not active.bag_startup_failed:
+                self._await_bag_ready(active)
+            if active.bag_startup_failed:
                 process.terminate()
-                escalation = "terminate"
-                active.data["warning_counters"]["bag_sigint_timeout"] = 1
+                escalation = "terminate_startup_failed"
+            else:
+                process.send_signal(signal.SIGINT)
+                escalation = "sigint"
+            try:
+                exit_code = process.wait(
+                    timeout=(
+                        self.config.bag_terminate_timeout_sec
+                        if active.bag_startup_failed
+                        else self.config.bag_sigint_timeout_sec
+                    )
+                )
+            except subprocess.TimeoutExpired:
+                if not active.bag_startup_failed:
+                    process.terminate()
+                    escalation = "terminate"
+                    active.data["warning_counters"]["bag_sigint_timeout"] = 1
                 try:
                     exit_code = process.wait(
                         timeout=self.config.bag_terminate_timeout_sec
@@ -1436,6 +1524,45 @@ class RecorderRuntimeManager:
             },
             source={"kind": "rosbag_process", "derived": False},
         )
+
+    def _validate_bag_completion(self, active: _ActiveSegment) -> None:
+        if not self.config.record_rosbag:
+            return
+        exit_code = active.data.get("bag_exit_code")
+        bag_path = active.directory / "rosbag"
+        metadata_path = bag_path / "metadata.yaml"
+        bag_directory_valid = False
+        metadata_valid = False
+        try:
+            bag_metadata = os.lstat(bag_path)
+            bag_directory_valid = stat.S_ISDIR(
+                bag_metadata.st_mode
+            ) and not stat.S_ISLNK(bag_metadata.st_mode)
+            if bag_directory_valid:
+                metadata = os.lstat(metadata_path)
+                metadata_valid = (
+                    stat.S_ISREG(metadata.st_mode)
+                    and not stat.S_ISLNK(metadata.st_mode)
+                    and metadata.st_size > 0
+                )
+        except OSError:
+            pass
+        failures: list[str] = []
+        if type(exit_code) is not int or exit_code != 0:
+            failures.append(f"bag_exit_code必须为0，实际={exit_code!r}")
+        if not bag_directory_valid:
+            failures.append(f"rosbag目录缺失或不是安全普通目录：{bag_path}")
+        if not metadata_valid:
+            failures.append(f"metadata.yaml缺失或不是安全普通文件：{metadata_path}")
+        if active.bag_failure:
+            failures.append(f"rosbag生命周期已记录真实失败：{active.bag_failure}")
+        if failures:
+            active.data["warning_counters"]["bag_completion_invalid"] = 1
+            active.bag_failure = "；".join(failures)
+            raise RuntimeError(
+                "rosbag完整性检查失败，保留ACTIVE且拒绝创建COMPLETE："
+                + active.bag_failure
+            )
 
     def _initial_segment_data(
         self,

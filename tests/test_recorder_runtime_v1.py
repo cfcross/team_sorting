@@ -242,6 +242,10 @@ def _action_and_dispatch(
         ("bag_terminate_timeout_sec", "1"),
         ("bag_kill_timeout_sec", -0.5),
         ("bag_kill_timeout_sec", False),
+        ("bag_startup_timeout_sec", 0),
+        ("bag_startup_timeout_sec", True),
+        ("bag_startup_poll_interval_sec", 0.0),
+        ("bag_startup_poll_interval_sec", "0.1"),
     ],
 )
 def test_runtime_config_fails_closed(field: str, value: object, tmp_path: Path) -> None:
@@ -1587,6 +1591,14 @@ class _FakeProcess:
         self.waits = list(waits)
         self.initial_poll = initial_poll
         self.signals: list[object] = []
+        self.output_path: Path | None = None
+
+    def bind(self, command: Any) -> "_FakeProcess":
+        self.output_path = Path(command[4])
+        if self.initial_poll is None:
+            self.output_path.mkdir(parents=True, exist_ok=True)
+            (self.output_path / "rosbag_0.db3").write_bytes(b"sqlite")
+        return self
 
     def poll(self) -> object:
         return self.initial_poll
@@ -1604,14 +1616,20 @@ class _FakeProcess:
         value = self.waits.pop(0)
         if value == "timeout":
             raise subprocess.TimeoutExpired("bag", timeout)
-        return int(value)
+        result = int(value)
+        if result == 0 and self.output_path is not None:
+            self.output_path.mkdir(parents=True, exist_ok=True)
+            (self.output_path / "metadata.yaml").write_text(
+                "rosbag2_bagfile_information: {}\n", encoding="utf-8"
+            )
+        return result
 
 
 def _bag_manager(tmp_path: Path, process: _FakeProcess) -> RecorderRuntimeManager:
     return RecorderRuntimeManager(
         _config(tmp_path, record_rosbag=True),
         _pairing(),
-        process_factory=lambda command: process,
+        process_factory=lambda command: process.bind(command),
         wall_now=lambda: "2026-01-02T03:04:05Z",
         monotonic_now_ns=iter(range(1000, 100000)).__next__,
         pid=123,
@@ -1643,20 +1661,21 @@ def test_bag_shutdown_escalation(
     assert [event["event_type"] for event in events].count("bag_stopped") == 1
 
 
-def test_bag_immediate_exit_fails_start_and_leaves_closed_evidence(
+def test_bag_immediate_exit_fails_start_and_leaves_active_evidence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr("team_sorting.recorder.shutil.which", lambda name: "/usr/bin/ros2")
     process = _FakeProcess([], initial_poll=2)
     manager = _bag_manager(tmp_path, process)
-    with pytest.raises(RuntimeError, match="立即退出"):
+    with pytest.raises(RuntimeError, match="rosbag完整性检查失败"):
         manager.start(1)
     assert manager.state is RecorderRuntimeState.FAILED
     segments = list((tmp_path / "bootstrap").iterdir())
     assert len(segments) == 1
-    assert (segments[0] / "COMPLETE").exists()
-    assert not (segments[0] / "ACTIVE").exists()
-    assert _json(segments[0] / "segment.json")["clean_shutdown"] is False
+    assert not (segments[0] / "COMPLETE").exists()
+    assert (segments[0] / "ACTIVE").exists()
+    assert _json(segments[0] / "segment.json")["clean_shutdown"] is None
+    assert _json(segments[0] / "metadata.json")["rosbag_exit_code"] == 2
 
 
 def test_pairer_close_failure_still_stops_owned_bag(
@@ -1713,7 +1732,7 @@ def test_rollover_stops_old_bag_before_starting_unique_new_bag(
         commands.append(frozen)
         label = str(len(commands))
         order.append(f"start:{label}")
-        return Process(label)
+        return Process(label).bind(command)  # type: ignore[return-value]
 
     manager = RecorderRuntimeManager(
         _config(tmp_path, record_rosbag=True), _pairing(), process_factory=factory
@@ -1728,6 +1747,119 @@ def test_rollover_stops_old_bag_before_starting_unique_new_bag(
     assert "/team/action_dispatch" not in commands[0]
 
 
+def test_fast_context_rollover_waits_for_bootstrap_bag_ready_and_completes_both(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("team_sorting.recorder.shutil.which", lambda name: "/usr/bin/ros2")
+    processes: list[_FakeProcess] = []
+    probes = iter((False, False, True, True))
+    waits: list[float] = []
+    steady = iter((0.0, 0.1, 0.2, 1.0)).__next__
+
+    def factory(command: Any) -> _FakeProcess:
+        process = _FakeProcess([0]).bind(command)
+        processes.append(process)
+        return process
+
+    manager = RecorderRuntimeManager(
+        replace(
+            _config(tmp_path, record_rosbag=True),
+            bag_startup_timeout_sec=1.0,
+            bag_startup_poll_interval_sec=0.25,
+        ),
+        _pairing(),
+        process_factory=factory,
+        bag_ready_probe=lambda _path: next(probes),
+        steady_now=steady,
+        startup_wait=waits.append,
+    )
+    bootstrap = manager.start(1)
+    assert waits == [0.25, 0.25]
+    assert manager._active is not None and manager._active.bag_ready is True
+
+    manager.record_competition_context(_context(), 2, 3)
+    assert manager.state is RecorderRuntimeState.RUN_ACTIVE
+    assert len(processes) == 2
+    assert processes[0].signals == [signal.SIGINT]
+    assert (bootstrap / "COMPLETE").is_file()
+    assert not (bootstrap / "ACTIVE").exists()
+    assert (bootstrap / "rosbag" / "metadata.yaml").is_file()
+    assert _json(bootstrap / "metadata.json")["rosbag_exit_code"] == 0
+
+    run_segment = manager.current_segment_dir
+    assert run_segment is not None
+    manager.close(4)
+    assert (run_segment / "COMPLETE").is_file()
+    assert not (run_segment / "ACTIVE").exists()
+    assert (run_segment / "rosbag" / "metadata.yaml").is_file()
+    assert _json(run_segment / "metadata.json")["rosbag_exit_code"] == 0
+
+
+@pytest.mark.parametrize("failure", ["nonzero_exit", "metadata_missing"])
+def test_rosbag_completion_failure_never_creates_complete_marker(
+    failure: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("team_sorting.recorder.shutil.which", lambda name: "/usr/bin/ros2")
+
+    class Process(_FakeProcess):
+        def wait(self, timeout: float) -> int:
+            result = super().wait(timeout)
+            if failure == "metadata_missing" and self.output_path is not None:
+                (self.output_path / "metadata.yaml").unlink()
+            return result
+
+    process = Process([-2 if failure == "nonzero_exit" else 0])
+    manager = RecorderRuntimeManager(
+        _config(tmp_path, record_rosbag=True),
+        _pairing(),
+        process_factory=lambda command: process.bind(command),
+    )
+    segment = manager.start(1)
+    with pytest.raises(RuntimeError, match="rosbag完整性检查失败"):
+        manager.close(2)
+    assert manager.state is RecorderRuntimeState.FAILED
+    assert (segment / "ACTIVE").is_file()
+    assert not (segment / "COMPLETE").exists()
+    assert _json(segment / "metadata.json")["rosbag_exit_code"] == (
+        -2 if failure == "nonzero_exit" else 0
+    )
+
+
+def test_rosbag_exit_during_ready_handshake_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("team_sorting.recorder.shutil.which", lambda name: "/usr/bin/ros2")
+
+    class Process(_FakeProcess):
+        def __init__(self) -> None:
+            super().__init__([])
+            self.polls = iter((None, None, 7))
+
+        def poll(self) -> object:
+            return next(self.polls)
+
+    process = Process()
+    manager = RecorderRuntimeManager(
+        replace(
+            _config(tmp_path, record_rosbag=True),
+            bag_startup_timeout_sec=1.0,
+            bag_startup_poll_interval_sec=0.1,
+        ),
+        _pairing(),
+        process_factory=lambda command: process.bind(command),
+        bag_ready_probe=lambda _path: False,
+        steady_now=iter((0.0, 0.1)).__next__,
+        startup_wait=lambda _seconds: None,
+    )
+    with pytest.raises(RuntimeError, match="ready确认前退出"):
+        manager.start(1)
+    segment = next((tmp_path / "bootstrap").iterdir())
+    assert manager.state is RecorderRuntimeState.FAILED
+    assert (segment / "ACTIVE").is_file()
+    assert not (segment / "COMPLETE").exists()
+    assert _json(segment / "metadata.json")["rosbag_exit_code"] == 7
+
+
 def _failing_nth_bag_factory(fail_at: int) -> tuple[Any, list[_FakeProcess]]:
     processes: list[_FakeProcess] = []
 
@@ -1738,7 +1870,7 @@ def _failing_nth_bag_factory(fail_at: int) -> tuple[Any, list[_FakeProcess]]:
             initial_poll=2 if index == fail_at else None,
         )
         processes.append(process)
-        return process
+        return process.bind(command)
 
     return factory, processes
 
@@ -1752,23 +1884,23 @@ def test_first_run_bag_failure_is_sealed_tracked_and_runtime_unwritable(
         _config(tmp_path, record_rosbag=True), _pairing(), process_factory=factory
     )
     manager.start(1)
-    with pytest.raises(RuntimeError, match="立即退出"):
+    with pytest.raises(RuntimeError, match="rosbag完整性检查失败"):
         manager.record_competition_context(_context(), 10, 11)
     assert manager.state is RecorderRuntimeState.FAILED
-    assert manager.current_segment_dir is None
+    assert manager.current_segment_dir is not None
     with pytest.raises(RuntimeError, match="没有可写segment"):
         manager.record_referee_message("/referee/score", 0, 12)
     manifest = _json(tmp_path / "runs" / "run-a" / "manifest.json")
     assert len(manifest["recorder_segment_ids"]) == 1
     failed = tmp_path / "runs" / "run-a" / "segments" / manifest["recorder_segment_ids"][0]
-    assert (failed / "COMPLETE").exists()
-    assert not (failed / "ACTIVE").exists()
+    assert not (failed / "COMPLETE").exists()
+    assert (failed / "ACTIVE").exists()
     segment = _json(failed / "segment.json")
-    assert segment["clean_shutdown"] is False
-    assert segment["shutdown_reason"] == "segment_open_failed"
-    manager.close(13)
-    manager.close(14)
-    assert manager.state is RecorderRuntimeState.CLOSED
+    assert segment["clean_shutdown"] is None
+    assert segment["shutdown_reason"] is None
+    with pytest.raises(RuntimeError, match="rosbag完整性检查失败"):
+        manager.close(13)
+    assert manager.state is RecorderRuntimeState.FAILED
 
 
 def test_bootstrap_context_raw_failure_seals_and_disables_runtime(
@@ -1870,7 +2002,7 @@ def test_first_run_bag_started_event_failure_stops_bag_and_fails_closed(
     def factory(command: Any) -> _FakeProcess:
         process = _FakeProcess([0])
         processes.append(process)
-        return process
+        return process.bind(command)
 
     manager = RecorderRuntimeManager(
         _config(tmp_path, record_rosbag=True), _pairing(), process_factory=factory
@@ -2110,16 +2242,17 @@ def test_new_run_bag_failure_never_leaves_half_active_segment(
     )
     manager.start(1)
     manager.record_competition_context(_context(), 10, 11)
-    with pytest.raises(RuntimeError, match="立即退出"):
+    with pytest.raises(RuntimeError, match="rosbag完整性检查失败"):
         manager.record_competition_context(
             _context(run_id="run-b", fingerprint="fingerprint-b"), 20, 21
         )
     assert manager.state is RecorderRuntimeState.FAILED
-    assert manager.current_segment_dir is None
+    assert manager.current_segment_dir is not None
     manifest = _json(tmp_path / "runs" / "run-b" / "manifest.json")
     failed = tmp_path / "runs" / "run-b" / "segments" / manifest["recorder_segment_ids"][0]
-    assert (failed / "COMPLETE").exists()
-    assert _json(failed / "segment.json")["clean_shutdown"] is False
+    assert not (failed / "COMPLETE").exists()
+    assert (failed / "ACTIVE").exists()
+    assert _json(failed / "segment.json")["clean_shutdown"] is None
 
 
 def test_post_finished_bootstrap_bag_failure_enters_failed_state(
@@ -2132,15 +2265,16 @@ def test_post_finished_bootstrap_bag_failure_enters_failed_state(
     )
     manager.start(1)
     manager.record_competition_context(_context(), 10, 11)
-    with pytest.raises(RuntimeError, match="立即退出"):
+    with pytest.raises(RuntimeError, match="rosbag完整性检查失败"):
         manager.record_competition_context(_context(finished=True), 20, 21)
     assert manager.state is RecorderRuntimeState.FAILED
-    assert manager.current_segment_dir is None
+    assert manager.current_segment_dir is not None
     failed_bootstrap = max(
         (tmp_path / "bootstrap").iterdir(), key=lambda path: path.stat().st_mtime_ns
     )
-    assert (failed_bootstrap / "COMPLETE").exists()
-    assert _json(failed_bootstrap / "segment.json")["clean_shutdown"] is False
+    assert not (failed_bootstrap / "COMPLETE").exists()
+    assert (failed_bootstrap / "ACTIVE").exists()
+    assert _json(failed_bootstrap / "segment.json")["clean_shutdown"] is None
 
 
 def test_existing_run_manifest_fingerprint_conflict_fails_closed(tmp_path: Path) -> None:

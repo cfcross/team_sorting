@@ -1736,6 +1736,12 @@ def _create_recorder_node(ros: SimpleNamespace) -> type:
                 bag_sigint_timeout_sec=bag_shutdown["sigint_timeout_sec"],
                 bag_terminate_timeout_sec=bag_shutdown["terminate_timeout_sec"],
                 bag_kill_timeout_sec=bag_shutdown["kill_timeout_sec"],
+                bag_startup_timeout_sec=bag_shutdown.get(
+                    "startup_timeout_sec", 10.0
+                ),
+                bag_startup_poll_interval_sec=bag_shutdown.get(
+                    "startup_poll_interval_sec", 0.02
+                ),
                 observe_only=control["observe_only"],
                 official_publish_enabled=_official_publish_enabled(control),
                 config_path=_resolve_config_path(),
