@@ -17,6 +17,7 @@ def _run(tmp_path: Path, **overrides: str) -> subprocess.CompletedProcess[str]:
         "TEAM_SORTING_RUNTIME_VOLUME",
         "TEAM_SORTING_COLCON_CACHE_VOLUME",
         "TEAM_SORTING_CLEAN_BUILD",
+        "ROS_LOCALHOST_ONLY",
     ):
         env.pop(name, None)
     env.update({"DRY_RUN": "1", **overrides})
@@ -76,6 +77,33 @@ def test_default_dry_run_is_offline_runtime_install_and_observe_only(tmp_path):
     assert "--no-build-isolation" in output
     assert "observe_only=true" in output
     assert "colcon build" not in output
+
+
+def test_ros_localhost_only_defaults_to_one_in_summary_and_docker_command(tmp_path):
+    result = _run(
+        tmp_path,
+        MATERIAL_SORTING_OFFICIAL_ROOT=str(_official_root(tmp_path)),
+    )
+    assert result.returncode == 0
+    assert "\nROS_LOCALHOST_ONLY=1\n" in result.stdout
+    command_line = next(
+        line for line in result.stdout.splitlines() if line.startswith("Command:")
+    )
+    assert "-e ROS_LOCALHOST_ONLY=1" in command_line
+
+
+def test_ros_localhost_only_explicit_zero_overrides_default(tmp_path):
+    result = _run(
+        tmp_path,
+        MATERIAL_SORTING_OFFICIAL_ROOT=str(_official_root(tmp_path)),
+        ROS_LOCALHOST_ONLY="0",
+    )
+    assert result.returncode == 0
+    assert "\nROS_LOCALHOST_ONLY=0\n" in result.stdout
+    command_line = next(
+        line for line in result.stdout.splitlines() if line.startswith("Command:")
+    )
+    assert "-e ROS_LOCALHOST_ONLY=0" in command_line
 
 
 def test_none_or_empty_gpu_setting_omits_docker_gpus_argument(tmp_path):

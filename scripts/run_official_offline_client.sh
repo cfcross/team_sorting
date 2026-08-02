@@ -9,6 +9,7 @@ CLIENT_GPUS="${TEAM_SORTING_CLIENT_GPUS-all}"
 CLEAN_BUILD="${TEAM_SORTING_CLEAN_BUILD:-0}"
 YOLO_CHECKPOINT="${MATERIAL_SORTING_YOLO_CHECKPOINT:-}"
 MJCF_PATH="${TEAM_SORTING_MJCF:-}"
+ROS_LOCALHOST_ONLY_VALUE="${ROS_LOCALHOST_ONLY:-1}"
 
 if [[ -n "${TEAM_SORTING_RUNTIME_VOLUME+x}" ]]; then
     RUNTIME_VOLUME="${TEAM_SORTING_RUNTIME_VOLUME}"
@@ -55,6 +56,7 @@ validate_optional_path TEAM_SORTING_MJCF "${MJCF_PATH}"
 command=(docker run --rm -it --network host
     -e ROS_DOMAIN_ID=99
     -e RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+    -e "ROS_LOCALHOST_ONLY=${ROS_LOCALHOST_ONLY_VALUE}"
     -e MATERIAL_SORTING_OFFICIAL_ROOT=/workspace/official
     -e "TEAM_SORTING_CLEAN_BUILD=${CLEAN_BUILD}"
     -v "${PROJECT_ROOT}:/workspace/baseline:ro"
@@ -249,9 +251,10 @@ for executable in perception_node team_client_node dataset_recorder_node; do
     exit 1
   fi
 done
-printf "baseline=%s (read-only)\nofficial=%s (read-only)\nruntime=%s\nros_prefix=%s\npip_cache=%s\nobserve_only=true\n" \
+printf "baseline=%s (read-only)\nofficial=%s (read-only)\nruntime=%s\nros_prefix=%s\npip_cache=%s\nROS_LOCALHOST_ONLY=%s\nobserve_only=true\n" \
   /workspace/baseline "${MATERIAL_SORTING_OFFICIAL_ROOT}" \
-  "${TEAM_SORTING_RUNTIME_ROOT}" "${TEAM_SORTING_ROS_PREFIX}" "${PIP_CACHE_DIR}"
+  "${TEAM_SORTING_RUNTIME_ROOT}" "${TEAM_SORTING_ROS_PREFIX}" "${PIP_CACHE_DIR}" \
+  "${ROS_LOCALHOST_ONLY}"
 ros2 launch team_sorting team.launch.xml')
 
 if [[ "${DRY_RUN}" == "1" ]]; then
@@ -264,6 +267,7 @@ printf 'Client image: %s\nClient image ID: %s\n' "${IMAGE_NAME}" "${IMAGE_ID}"
 printf 'Project mount: %s -> /workspace/baseline (read-only)\n' "${PROJECT_ROOT}"
 printf 'Official mount: %s -> /workspace/official (read-only)\n' "${OFFICIAL_ROOT}"
 printf 'ROS_DOMAIN_ID=99\nRMW_IMPLEMENTATION=rmw_cyclonedds_cpp\n'
+printf 'ROS_LOCALHOST_ONLY=%s\n' "${ROS_LOCALHOST_ONLY_VALUE}"
 printf 'GPU behavior: %s\n' "${GPU_BEHAVIOR}"
 printf 'Runtime volume: %s -> /opt/team_sorting_runtime\n' "${RUNTIME_VOLUME}"
 printf 'Runtime src: /opt/team_sorting_runtime/src\n'
