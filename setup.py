@@ -14,7 +14,10 @@ setup(
         ("share/" + package_name + "/config", ["config/config.yaml"]),
         (
             "share/" + package_name + "/config/contracts",
-            ["config/contracts/interface_v1.json"],
+            [
+                "config/contracts/interface_v1.json",
+                "config/contracts/recorder_schema_v1.json",
+            ],
         ),
         ("share/" + package_name + "/launch", ["launch/team.launch.xml"]),
     ],

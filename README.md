@@ -407,6 +407,13 @@ TTL（time to live，有效期）规定一条候选命令最多能存活多久�
 
 ## 10. VLA 数据记录
 
+Recorder的数据身份、逻辑布局、manifest/segment/event字段、关闭恢复、provenance、legacy
+兼容和演进规则由
+[`config/contracts/recorder_schema_v1.json`](config/contracts/recorder_schema_v1.json)
+冻结，中文说明见
+[`docs/recorder_schema_v1.md`](docs/recorder_schema_v1.md)。当前B1仅提供契约、加载器和
+安装支持；其中标记为B2/B3或Commit C的运行时与离线能力尚未实现。
+
 Recorder 节点从启动到停止连续保存一个原始 Run，不按官方 Task 或已结算 attempt 拆分
 rosbag，也不把这个文件边界冒充为正式训练 Episode。官方三任务及每任务最多三次已结算
 attempt 的比赛生命周期已经明确；`competition_contexts.jsonl` 和 metadata 中的索引用于

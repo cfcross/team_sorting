@@ -1,0 +1,1414 @@
+{
+  "schema_name": "team_sorting.recorder",
+  "schema_version": 1,
+  "schema_status": "frozen",
+  "implementation_phase": "contract_only",
+  "interface_schema": {
+    "schema_name": "team_sorting.interface",
+    "schema_version": 1,
+    "compatibility": "Recorder v1 action terminology, lifecycle identity and frame rules are constrained by Interface v1",
+    "sha256_recording_rule": "each future run manifest records the exact loaded Interface contract SHA-256"
+  },
+  "identity_contract": {
+    "run_identity_scope": "team_local",
+    "run_id_semantics": "run_id is a team-local UUID produced by CompetitionRunCoordinator, not a stable official Server evaluation identity",
+    "client_restart_semantics": "a Client restart can produce a different run_id even while the same physical official game continues",
+    "task_set_merge_rule": "two run_id values must never be merged solely because task_set_fingerprint matches",
+    "run_continuity_across_client_restart": "unresolved",
+    "canonical_fields": [
+      "run_id",
+      "task_set_fingerprint",
+      "task_id",
+      "settled_attempt_count",
+      "local_attempt_key",
+      "recorder_segment_id"
+    ],
+    "local_attempt_key": {
+      "components": [
+        "run_id",
+        "task_id",
+        "settled_attempt_count"
+      ],
+      "scope": "team_local",
+      "official_attempt_id": false,
+      "settled_attempt_count_semantics": "number of already settled attempts; not the current 1-based attempt number"
+    },
+    "logical_entities": [
+      {
+        "name": "Team-local Run",
+        "semantics": "one locally identified run fragment bound to one run_id"
+      },
+      {
+        "name": "Official Task",
+        "semantics": "one task selected by public CompetitionContext"
+      },
+      {
+        "name": "Official Attempt",
+        "semantics": "official attempt whose public start identity remains unresolved"
+      },
+      {
+        "name": "Recorder Segment",
+        "semantics": "one local raw recording process segment; not an Official Attempt and not a Training Episode"
+      },
+      {
+        "name": "Training Episode",
+        "semantics": "learning unit derived by Commit C offline Indexer and QC"
+      }
+    ],
+    "recorder_segment_equals_official_attempt": false,
+    "recorder_segment_equals_training_episode": false,
+    "task_transition_implies_physical_reset": false,
+    "settled_attempt_transition_implies_server_or_robot_reset": false,
+    "online_recorder_may_create_official_attempt_id": false
+  },
+  "layout_contract": {
+    "layout_version": 1,
+    "implementation_status": "planned_b2",
+    "canonical_roles": {
+      "dataset_root": "owner-selected root containing all Recorder artifacts",
+      "bootstrap": "segments created before a valid run_id is available",
+      "runs": "run-bound manifests, events and segments",
+      "recovery": "recovery reports or derived repaired views that never overwrite raw artifacts",
+      "legacy": "logical compatibility role for existing flat directories; relocation is not required"
+    },
+    "canonical_tree": [
+      "dataset_root/bootstrap/<recorder_segment_id>/",
+      "dataset_root/runs/<run_id>/manifest.json",
+      "dataset_root/runs/<run_id>/events.jsonl",
+      "dataset_root/runs/<run_id>/segments/<recorder_segment_id>/",
+      "dataset_root/recovery/",
+      "dataset_root/legacy/"
+    ],
+    "segment_kinds": [
+      "bootstrap",
+      "run_bound"
+    ],
+    "bootstrap_segment": {
+      "parent_run_id": null,
+      "retroactive_binding_forbidden": true,
+      "semantics": "raw segment that has never been bound to a valid run_id"
+    },
+    "run_bound_segment": {
+      "parent_run_id_rule": "must be a non-empty run_id known when the segment is created",
+      "parent_run_id_mutability": "immutable"
+    },
+    "cross_filesystem_move_for_binding": "forbidden",
+    "overwrite_existing_directory": "forbidden",
+    "b1_runtime_layout_implemented": false,
+    "runtime_transition_owner": "Commit B2"
+  },
+  "field_descriptor_contract": {
+    "required_keys": [
+      "type",
+      "required",
+      "nullable",
+      "mutability",
+      "source",
+      "semantics"
+    ],
+    "mutability_values": [
+      "immutable",
+      "append_only",
+      "end_only",
+      "mutable_with_audit"
+    ],
+    "nullable_rule": "every nullable field defines null_semantics and unavailable_representation",
+    "unknown_value_envelope": {
+      "fields": [
+        "value",
+        "status",
+        "reason",
+        "source"
+      ],
+      "allowed_status": [
+        "available",
+        "unavailable",
+        "redacted"
+      ],
+      "unknown_value": null,
+      "empty_string_for_unknown_forbidden": true
+    }
+  },
+  "run_manifest_schema": {
+    "record_schema_name": "team_sorting.recorder.run_manifest",
+    "record_schema_version": 1,
+    "implementation_status": "planned_b2",
+    "fields": {
+      "schema_name": {
+        "type": "string",
+        "required": true,
+        "nullable": false,
+        "mutability": "immutable",
+        "source": "recorder_contract",
+        "semantics": "fixed run manifest schema name",
+        "allowed_values": [
+          "team_sorting.recorder.run_manifest"
+        ],
+        "introduced_in": 1
+      },
+      "schema_version": {
+        "type": "integer",
+        "required": true,
+        "nullable": false,
+        "mutability": "immutable",
+        "source": "recorder_contract",
+        "semantics": "run manifest major schema version",
+        "allowed_values": [
+          1
+        ],
+        "introduced_in": 1
+      },
+      "recorder_schema_sha256": {
+        "type": "sha256",
+        "required": true,
+        "nullable": false,
+        "mutability": "immutable",
+        "source": "Recorder contract loader",
+        "semantics": "SHA-256 of the exact Recorder contract used for this run",
+        "format": "64 lowercase hexadecimal characters",
+        "introduced_in": 1
+      },
+      "interface_schema_name": {
+        "type": "string",
+        "required": true,
+        "nullable": false,
+        "mutability": "immutable",
+        "source": "loaded Interface contract",
+        "semantics": "fixed Interface schema identity",
+        "allowed_values": [
+          "team_sorting.interface"
+        ],
+        "introduced_in": 1
+      },
+      "interface_schema_version": {
+        "type": "integer",
+        "required": true,
+        "nullable": false,
+        "mutability": "immutable",
+        "source": "loaded Interface contract",
+        "semantics": "Interface major version governing this recording",
+        "allowed_values": [
+          1
+        ],
+        "introduced_in": 1
+      },
+      "interface_schema_sha256": {
+        "type": "sha256",
+        "required": true,
+        "nullable": false,
+        "mutability": "immutable",
+        "source": "Interface contract loader",
+        "semantics": "SHA-256 of the exact Interface contract used for this run",
+        "format": "64 lowercase hexadecimal characters",
+        "introduced_in": 1
+      },
+      "run_id": {
+        "type": "string",
+        "required": true,
+        "nullable": false,
+        "mutability": "immutable",
+        "source": "valid CompetitionContext.run_id",
+        "semantics": "team-local run identity; not an official Server evaluation identity",
+        "references": "identity_contract.run_id_semantics",
+        "introduced_in": 1
+      },
+      "run_identity_scope": {
+        "type": "string",
+        "required": true,
+        "nullable": false,
+        "mutability": "immutable",
+        "source": "recorder_contract",
+        "semantics": "scope of run_id",
+        "allowed_values": [
+          "team_local"
+        ],
+        "introduced_in": 1
+      },
+      "task_set_fingerprint": {
+        "type": "string",
+        "required": true,
+        "nullable": false,
+        "mutability": "immutable",
+        "source": "valid CompetitionContext.task_set_fingerprint",
+        "semantics": "fingerprint of the complete task set; never sufficient to merge distinct run_id values",
+        "introduced_in": 1
+      },
+      "project_commit": {
+        "type": "unknown_value<string>",
+        "required": true,
+        "nullable": false,
+        "mutability": "mutable_with_audit",
+        "source": "launcher_injected",
+        "semantics": "project Git commit, or a structured unavailable value when source metadata is absent",
+        "introduced_in": 1
+      },
+      "project_branch": {
+        "type": "unknown_value<string>",
+        "required": true,
+        "nullable": false,
+        "mutability": "mutable_with_audit",
+        "source": "launcher_injected",
+        "semantics": "project branch, or a structured unavailable value",
+        "introduced_in": 1
+      },
+      "dirty_worktree": {
+        "type": "unknown_value<boolean>",
+        "required": true,
+        "nullable": false,
+        "mutability": "mutable_with_audit",
+        "source": "launcher_injected",
+        "semantics": "whether the source worktree was dirty, or a structured unavailable value",
+        "introduced_in": 1
+      },
+      "config_sha256": {
+        "type": "unknown_value<sha256>",
+        "required": true,
+        "nullable": false,
+        "mutability": "immutable",
+        "source": "auto_detected",
+        "semantics": "hash of the exact loaded configuration, or structured unavailable value",
+        "introduced_in": 1
+      },
+      "official_server_image_id": {
+        "type": "unknown_value<string>",
+        "required": true,
+        "nullable": false,
+        "mutability": "immutable",
+        "source": "launcher_injected",
+        "semantics": "official Server image identity; unavailable when not injected and never queried through Docker socket",
+        "introduced_in": 1
+      },
+      "official_client_image_id": {
+        "type": "unknown_value<string>",
+        "required": true,
+        "nullable": false,
+        "mutability": "immutable",
+        "source": "launcher_injected",
+        "semantics": "official Client image identity; unavailable when not injected and never queried through Docker socket",
+        "introduced_in": 1
+      },
+      "ros_domain_id": {
+        "type": "unknown_value<integer>",
+        "required": true,
+        "nullable": false,
+        "mutability": "immutable",
+        "source": "auto_detected",
+        "semantics": "ROS domain used by the Recorder process, or structured unavailable value",
+        "introduced_in": 1
+      },
+      "rmw_implementation": {
+        "type": "unknown_value<string>",
+        "required": true,
+        "nullable": false,
+        "mutability": "immutable",
+        "source": "auto_detected",
+        "semantics": "RMW implementation selected by the Recorder process, or structured unavailable value",
+        "introduced_in": 1
+      },
+      "observe_only": {
+        "type": "boolean",
+        "required": true,
+        "nullable": false,
+        "mutability": "immutable",
+        "source": "validated runtime configuration",
+        "semantics": "whether the Client is globally observe-only",
+        "introduced_in": 1
+      },
+      "official_publish_enabled": {
+        "type": "boolean",
+        "required": true,
+        "nullable": false,
+        "mutability": "immutable",
+        "source": "effective runtime publish gate",
+        "semantics": "whether creation and use of official publishers was authorized",
+        "introduced_in": 1
+      },
+      "start_ros_ns": {
+        "type": "integer",
+        "required": true,
+        "nullable": false,
+        "mutability": "immutable",
+        "source": "Recorder ROS clock",
+        "semantics": "nonnegative ROS timestamp at run-bound recording start",
+        "minimum": 0,
+        "introduced_in": 1
+      },
+      "end_ros_ns": {
+        "type": "integer_or_null",
+        "required": true,
+        "nullable": true,
+        "mutability": "end_only",
+        "source": "Recorder ROS clock",
+        "semantics": "nonnegative ROS timestamp at run recording end",
+        "minimum": 0,
+        "null_semantics": "run has not reached a recorded end",
+        "unavailable_representation": {
+          "value": null,
+          "status": "pending_end",
+          "reason_field": "shutdown_reason",
+          "source": "Recorder lifecycle"
+        },
+        "introduced_in": 1
+      },
+      "start_wall_utc": {
+        "type": "string",
+        "required": true,
+        "nullable": false,
+        "mutability": "immutable",
+        "source": "Recorder wall clock",
+        "semantics": "UTC wall time at run-bound recording start",
+        "format": "RFC3339 UTC",
+        "introduced_in": 1
+      },
+      "end_wall_utc": {
+        "type": "string_or_null",
+        "required": true,
+        "nullable": true,
+        "mutability": "end_only",
+        "source": "Recorder wall clock",
+        "semantics": "UTC wall time at run recording end",
+        "format": "RFC3339 UTC",
+        "null_semantics": "run has not reached a recorded end",
+        "unavailable_representation": {
+          "value": null,
+          "status": "pending_end",
+          "reason_field": "shutdown_reason",
+          "source": "Recorder lifecycle"
+        },
+        "introduced_in": 1
+      },
+      "recorder_segment_ids": {
+        "type": "array<string>",
+        "required": true,
+        "nullable": false,
+        "mutability": "append_only",
+        "source": "Recorder segment lifecycle",
+        "semantics": "ordered unique segment identities belonging to this run; entries may only be appended",
+        "introduced_in": 1
+      },
+      "clean_shutdown": {
+        "type": "boolean_or_null",
+        "required": true,
+        "nullable": true,
+        "mutability": "end_only",
+        "source": "shutdown marker state",
+        "semantics": "true only after the complete shutdown protocol; false when unclean state is detected",
+        "null_semantics": "shutdown outcome is not yet known",
+        "unavailable_representation": {
+          "value": null,
+          "status": "pending_end",
+          "reason_field": "shutdown_reason",
+          "source": "Recorder lifecycle"
+        },
+        "introduced_in": 1
+      },
+      "shutdown_reason": {
+        "type": "string_or_null",
+        "required": true,
+        "nullable": true,
+        "mutability": "end_only",
+        "source": "shutdown coordinator or recovery detector",
+        "semantics": "controlled reason for clean or detected unclean termination",
+        "null_semantics": "shutdown has not been requested or detected",
+        "unavailable_representation": {
+          "value": null,
+          "status": "pending_end",
+          "reason_field": "recovery_required",
+          "source": "Recorder lifecycle"
+        },
+        "introduced_in": 1
+      },
+      "recovery_required": {
+        "type": "boolean_or_null",
+        "required": true,
+        "nullable": true,
+        "mutability": "end_only",
+        "source": "shutdown coordinator or recovery detector",
+        "semantics": "whether an immutable recovery report or derived view is required",
+        "null_semantics": "shutdown outcome is not yet known",
+        "unavailable_representation": {
+          "value": null,
+          "status": "pending_end",
+          "reason_field": "shutdown_reason",
+          "source": "Recorder lifecycle"
+        },
+        "introduced_in": 1
+      },
+      "provenance_warnings": {
+        "type": "array<object>",
+        "required": true,
+        "nullable": false,
+        "mutability": "append_only",
+        "source": "provenance collector",
+        "semantics": "ordered machine-readable warnings for unavailable, redacted or conflicting provenance",
+        "introduced_in": 1
+      }
+    }
+  },
+  "recorder_segment_schema": {
+    "record_schema_name": "team_sorting.recorder.segment",
+    "record_schema_version": 1,
+    "implementation_status": "planned_b2",
+    "segment_kinds": [
+      "bootstrap",
+      "run_bound"
+    ],
+    "cross_field_rules": [
+      "bootstrap requires parent_run_id=null",
+      "run_bound requires a non-empty parent_run_id",
+      "parent_run_id is immutable after creation",
+      "pid is diagnostic only and never an identity",
+      "a Recorder Segment must never be named or interpreted as an episode"
+    ],
+    "fields": {
+      "recorder_segment_id": {
+        "type": "string",
+        "required": true,
+        "nullable": false,
+        "mutability": "immutable",
+        "source": "Recorder segment ID generator",
+        "semantics": "globally collision-resistant local segment identity",
+        "introduced_in": 1
+      },
+      "parent_run_id": {
+        "type": "string_or_null",
+        "required": true,
+        "nullable": true,
+        "mutability": "immutable",
+        "source": "valid CompetitionContext available at segment creation",
+        "semantics": "team-local parent run; null only for bootstrap",
+        "null_semantics": "segment_kind is bootstrap and no valid run was bound",
+        "unavailable_representation": {
+          "value": null,
+          "status": "not_bound",
+          "reason_field": "segment_kind",
+          "source": "Recorder segment lifecycle"
+        },
+        "introduced_in": 1
+      },
+      "segment_kind": {
+        "type": "string",
+        "required": true,
+        "nullable": false,
+        "mutability": "immutable",
+        "source": "Recorder segment lifecycle",
+        "semantics": "whether the segment was created before or after run binding",
+        "allowed_values": [
+          "bootstrap",
+          "run_bound"
+        ],
+        "introduced_in": 1
+      },
+      "segment_sequence": {
+        "type": "integer",
+        "required": true,
+        "nullable": false,
+        "mutability": "immutable",
+        "source": "Recorder run-local counter",
+        "semantics": "nonnegative order within a process/run scope",
+        "minimum": 0,
+        "introduced_in": 1
+      },
+      "process_start_wall_utc": {
+        "type": "string",
+        "required": true,
+        "nullable": false,
+        "mutability": "immutable",
+        "source": "Recorder process wall clock",
+        "semantics": "process start time in UTC",
+        "format": "RFC3339 UTC",
+        "introduced_in": 1
+      },
+      "process_end_wall_utc": {
+        "type": "string_or_null",
+        "required": true,
+        "nullable": true,
+        "mutability": "end_only",
+        "source": "Recorder process wall clock",
+        "semantics": "observed process end time",
+        "null_semantics": "process end was not observed",
+        "unavailable_representation": {
+          "value": null,
+          "status": "not_observed",
+          "reason_field": "shutdown_reason",
+          "source": "Recorder lifecycle"
+        },
+        "introduced_in": 1
+      },
+      "node_start_ros_ns": {
+        "type": "integer",
+        "required": true,
+        "nullable": false,
+        "mutability": "immutable",
+        "source": "Recorder node ROS clock",
+        "semantics": "nonnegative node start ROS time",
+        "minimum": 0,
+        "introduced_in": 1
+      },
+      "node_end_ros_ns": {
+        "type": "integer_or_null",
+        "required": true,
+        "nullable": true,
+        "mutability": "end_only",
+        "source": "Recorder node ROS clock",
+        "semantics": "nonnegative node end ROS time",
+        "minimum": 0,
+        "null_semantics": "node end was not observed",
+        "unavailable_representation": {
+          "value": null,
+          "status": "not_observed",
+          "reason_field": "shutdown_reason",
+          "source": "Recorder lifecycle"
+        },
+        "introduced_in": 1
+      },
+      "first_ros_timestamp_ns": {
+        "type": "integer_or_null",
+        "required": true,
+        "nullable": true,
+        "mutability": "mutable_with_audit",
+        "source": "first persisted ROS record",
+        "semantics": "minimum observed ROS timestamp, not wall or monotonic time",
+        "minimum": 0,
+        "null_semantics": "no timestamped ROS record has been persisted",
+        "unavailable_representation": {
+          "value": null,
+          "status": "no_messages",
+          "reason_field": "message_counters",
+          "source": "Recorder artifacts"
+        },
+        "introduced_in": 1
+      },
+      "last_ros_timestamp_ns": {
+        "type": "integer_or_null",
+        "required": true,
+        "nullable": true,
+        "mutability": "mutable_with_audit",
+        "source": "latest persisted ROS record",
+        "semantics": "maximum observed ROS timestamp under the documented rollback policy",
+        "minimum": 0,
+        "null_semantics": "no timestamped ROS record has been persisted",
+        "unavailable_representation": {
+          "value": null,
+          "status": "no_messages",
+          "reason_field": "message_counters",
+          "source": "Recorder artifacts"
+        },
+        "introduced_in": 1
+      },
+      "pid": {
+        "type": "integer",
+        "required": true,
+        "nullable": false,
+        "mutability": "immutable",
+        "source": "auto_detected",
+        "semantics": "diagnostic process ID; never a run, segment or writer identity",
+        "minimum": 1,
+        "introduced_in": 1
+      },
+      "container_identity": {
+        "type": "unknown_value<string>",
+        "required": true,
+        "nullable": false,
+        "mutability": "immutable",
+        "source": "launcher_injected",
+        "semantics": "optional disabled, redacted or injected container identity; Docker socket access is forbidden",
+        "introduced_in": 1
+      },
+      "clean_shutdown": {
+        "type": "boolean_or_null",
+        "required": true,
+        "nullable": true,
+        "mutability": "end_only",
+        "source": "marker protocol",
+        "semantics": "segment clean termination status",
+        "null_semantics": "segment is active or termination was not yet evaluated",
+        "unavailable_representation": {
+          "value": null,
+          "status": "pending_or_unknown",
+          "reason_field": "marker_state",
+          "source": "Recorder lifecycle"
+        },
+        "introduced_in": 1
+      },
+      "shutdown_reason": {
+        "type": "string_or_null",
+        "required": true,
+        "nullable": true,
+        "mutability": "end_only",
+        "source": "shutdown coordinator or recovery detector",
+        "semantics": "controlled segment termination reason",
+        "null_semantics": "shutdown has not been requested or detected",
+        "unavailable_representation": {
+          "value": null,
+          "status": "pending",
+          "reason_field": "marker_state",
+          "source": "Recorder lifecycle"
+        },
+        "introduced_in": 1
+      },
+      "bag_path": {
+        "type": "string_or_null",
+        "required": true,
+        "nullable": true,
+        "mutability": "immutable",
+        "source": "Recorder rosbag command",
+        "semantics": "segment-relative bag path when bag recording was requested",
+        "null_semantics": "bag recording was disabled or failed before a path was committed",
+        "unavailable_representation": {
+          "value": null,
+          "status": "not_created",
+          "reason_field": "warning_counters",
+          "source": "Recorder rosbag lifecycle"
+        },
+        "introduced_in": 1
+      },
+      "bag_storage_identifier": {
+        "type": "unknown_value<string>",
+        "required": true,
+        "nullable": false,
+        "mutability": "immutable",
+        "source": "rosbag metadata or launcher_injected",
+        "semantics": "rosbag2 storage plugin identifier, or structured unavailable value",
+        "introduced_in": 1
+      },
+      "bag_exit_code": {
+        "type": "integer_or_null",
+        "required": true,
+        "nullable": true,
+        "mutability": "end_only",
+        "source": "rosbag child process",
+        "semantics": "observed rosbag process exit code",
+        "null_semantics": "bag was not started or its exit was not observed",
+        "unavailable_representation": {
+          "value": null,
+          "status": "not_observed",
+          "reason_field": "bag_path",
+          "source": "Recorder rosbag lifecycle"
+        },
+        "introduced_in": 1
+      },
+      "jsonl_artifacts": {
+        "type": "array<object>",
+        "required": true,
+        "nullable": false,
+        "mutability": "append_only",
+        "source": "Recorder artifact lifecycle",
+        "semantics": "unique relative JSONL path, record schema and optional final hash for each artifact",
+        "introduced_in": 1
+      },
+      "message_counters": {
+        "type": "map<string,integer>",
+        "required": true,
+        "nullable": false,
+        "mutability": "mutable_with_audit",
+        "source": "Recorder callbacks",
+        "semantics": "diagnostic persisted callback counts; not proof of bag completeness",
+        "introduced_in": 1
+      },
+      "dropped_counters": {
+        "type": "map<string,integer>",
+        "required": true,
+        "nullable": false,
+        "mutability": "mutable_with_audit",
+        "source": "Recorder validation and persistence boundaries",
+        "semantics": "known dropped record counts grouped by controlled reason",
+        "introduced_in": 1
+      },
+      "pairing_counters": {
+        "type": "map<string,integer>",
+        "required": true,
+        "nullable": false,
+        "mutability": "mutable_with_audit",
+        "source": "ActionDispatchPairer outcomes",
+        "semantics": "paired, issue and orphan diagnostic counters",
+        "introduced_in": 1
+      },
+      "warning_counters": {
+        "type": "map<string,integer>",
+        "required": true,
+        "nullable": false,
+        "mutability": "mutable_with_audit",
+        "source": "Recorder diagnostics",
+        "semantics": "controlled warning counts without unbounded raw exception content",
+        "introduced_in": 1
+      },
+      "observed_task_ids": {
+        "type": "array<integer>",
+        "required": true,
+        "nullable": false,
+        "mutability": "append_only",
+        "source": "valid CompetitionContext",
+        "semantics": "ordered unique Official Task identities observed in this segment",
+        "introduced_in": 1
+      },
+      "observed_settled_attempt_counts": {
+        "type": "array<integer>",
+        "required": true,
+        "nullable": false,
+        "mutability": "append_only",
+        "source": "valid CompetitionContext",
+        "semantics": "ordered unique settled attempt counts; never current 1-based attempt numbers",
+        "introduced_in": 1
+      },
+      "context_valid_count": {
+        "type": "integer",
+        "required": true,
+        "nullable": false,
+        "mutability": "mutable_with_audit",
+        "source": "CompetitionContext callback",
+        "semantics": "number of persisted contexts with valid=true",
+        "minimum": 0,
+        "introduced_in": 1
+      },
+      "context_invalid_count": {
+        "type": "integer",
+        "required": true,
+        "nullable": false,
+        "mutability": "mutable_with_audit",
+        "source": "CompetitionContext callback",
+        "semantics": "number of persisted invalid contexts; invalid contexts never replace the last valid identity",
+        "minimum": 0,
+        "introduced_in": 1
+      },
+      "marker_state": {
+        "type": "string",
+        "required": true,
+        "nullable": false,
+        "mutability": "mutable_with_audit",
+        "source": "shutdown marker protocol",
+        "semantics": "current controlled shutdown state",
+        "allowed_values": [
+          "active",
+          "shutdown_requested",
+          "complete",
+          "unclean_detected",
+          "recovery_required"
+        ],
+        "introduced_in": 1
+      }
+    }
+  },
+  "event_schema": {
+    "record_schema_name": "team_sorting.recorder.event",
+    "record_schema_version": 1,
+    "implementation_status": "planned_b2",
+    "event_types": [
+      "recorder_started",
+      "run_bound",
+      "run_changed",
+      "task_transition",
+      "attempt_transition",
+      "instruction_updated",
+      "competition_context_updated",
+      "action_selected",
+      "dispatch_attempted",
+      "dispatch_succeeded",
+      "dispatch_failed",
+      "pairing_issue",
+      "sample_dropped",
+      "bag_started",
+      "bag_stopped",
+      "shutdown_requested",
+      "recorder_finished",
+      "unclean_shutdown_detected"
+    ],
+    "event_type_introduced_in": {
+      "recorder_started": 1,
+      "run_bound": 1,
+      "run_changed": 1,
+      "task_transition": 1,
+      "attempt_transition": 1,
+      "instruction_updated": 1,
+      "competition_context_updated": 1,
+      "action_selected": 1,
+      "dispatch_attempted": 1,
+      "dispatch_succeeded": 1,
+      "dispatch_failed": 1,
+      "pairing_issue": 1,
+      "sample_dropped": 1,
+      "bag_started": 1,
+      "bag_stopped": 1,
+      "shutdown_requested": 1,
+      "recorder_finished": 1,
+      "unclean_shutdown_detected": 1
+    },
+    "event_id_scope": "stable and unique within recorder_segment_id",
+    "derived_event_source_rule": "derived events must reference source_event_ids or a source message identity in payload",
+    "events_jsonl_currently_implemented": false,
+    "fields": {
+      "schema_name": {
+        "type": "string",
+        "required": true,
+        "nullable": false,
+        "mutability": "immutable",
+        "source": "recorder_contract",
+        "semantics": "fixed event record schema name",
+        "allowed_values": [
+          "team_sorting.recorder.event"
+        ],
+        "introduced_in": 1
+      },
+      "schema_version": {
+        "type": "integer",
+        "required": true,
+        "nullable": false,
+        "mutability": "immutable",
+        "source": "recorder_contract",
+        "semantics": "event record major schema version",
+        "allowed_values": [
+          1
+        ],
+        "introduced_in": 1
+      },
+      "event_id": {
+        "type": "string",
+        "required": true,
+        "nullable": false,
+        "mutability": "immutable",
+        "source": "Recorder segment-local sequence generator",
+        "semantics": "stable unique event identity within one recorder_segment_id",
+        "introduced_in": 1
+      },
+      "event_type": {
+        "type": "string",
+        "required": true,
+        "nullable": false,
+        "mutability": "immutable",
+        "source": "Recorder event producer",
+        "semantics": "controlled event classification",
+        "references": "event_schema.event_types",
+        "introduced_in": 1
+      },
+      "event_timestamp_ns": {
+        "type": "integer",
+        "required": true,
+        "nullable": false,
+        "mutability": "immutable",
+        "source": "source record timestamp or Recorder ROS clock",
+        "semantics": "nonnegative semantic event time in the documented source clock",
+        "minimum": 0,
+        "introduced_in": 1
+      },
+      "receive_timestamp_ns": {
+        "type": "integer",
+        "required": true,
+        "nullable": false,
+        "mutability": "immutable",
+        "source": "Recorder ROS clock at callback receipt",
+        "semantics": "nonnegative ROS receive timestamp",
+        "minimum": 0,
+        "introduced_in": 1
+      },
+      "receive_monotonic_ns": {
+        "type": "integer",
+        "required": true,
+        "nullable": false,
+        "mutability": "immutable",
+        "source": "Recorder process monotonic clock",
+        "semantics": "process-local wait and arrival diagnostic only; forbidden for cross-process ordering",
+        "minimum": 0,
+        "introduced_in": 1
+      },
+      "monotonic_scope": {
+        "type": "string",
+        "required": true,
+        "nullable": false,
+        "mutability": "immutable",
+        "source": "recorder_contract",
+        "semantics": "scope within which receive_monotonic_ns may be compared",
+        "allowed_values": [
+          "process_local"
+        ],
+        "introduced_in": 1
+      },
+      "run_id": {
+        "type": "string_or_null",
+        "required": true,
+        "nullable": true,
+        "mutability": "immutable",
+        "source": "last valid CompetitionContext",
+        "semantics": "team-local run identity at the event; null in bootstrap or when unbound",
+        "null_semantics": "no valid run identity was bound",
+        "unavailable_representation": {
+          "value": null,
+          "status": "unbound",
+          "reason_field": "invalid_reasons",
+          "source": "Recorder context binding"
+        },
+        "introduced_in": 1
+      },
+      "recorder_segment_id": {
+        "type": "string",
+        "required": true,
+        "nullable": false,
+        "mutability": "immutable",
+        "source": "active Recorder segment",
+        "semantics": "segment containing this event",
+        "introduced_in": 1
+      },
+      "task_id": {
+        "type": "integer_or_null",
+        "required": true,
+        "nullable": true,
+        "mutability": "immutable",
+        "source": "last valid CompetitionContext",
+        "semantics": "Official Task identity at the event",
+        "minimum": 1,
+        "null_semantics": "no valid active task was bound",
+        "unavailable_representation": {
+          "value": null,
+          "status": "unbound_or_finished",
+          "reason_field": "invalid_reasons",
+          "source": "Recorder context binding"
+        },
+        "introduced_in": 1
+      },
+      "settled_attempt_count": {
+        "type": "integer_or_null",
+        "required": true,
+        "nullable": true,
+        "mutability": "immutable",
+        "source": "last valid CompetitionContext",
+        "semantics": "already settled attempts, not a current 1-based attempt number",
+        "minimum": 0,
+        "null_semantics": "no valid run/task context was bound",
+        "unavailable_representation": {
+          "value": null,
+          "status": "unbound",
+          "reason_field": "invalid_reasons",
+          "source": "Recorder context binding"
+        },
+        "introduced_in": 1
+      },
+      "local_attempt_key": {
+        "type": "tuple_or_null",
+        "required": true,
+        "nullable": true,
+        "mutability": "immutable",
+        "source": "Recorder from last valid run_id, task_id and settled_attempt_count",
+        "semantics": "team-local tuple (run_id, task_id, settled_attempt_count), never an official attempt_id",
+        "null_semantics": "one or more key components are unavailable",
+        "unavailable_representation": {
+          "value": null,
+          "status": "incomplete_identity",
+          "reason_field": "invalid_reasons",
+          "source": "Recorder context binding"
+        },
+        "references": "identity_contract.local_attempt_key",
+        "introduced_in": 1
+      },
+      "payload": {
+        "type": "object",
+        "required": true,
+        "nullable": false,
+        "mutability": "immutable",
+        "source": "source message or Recorder-derived fact",
+        "semantics": "event-type-specific bounded machine-readable facts",
+        "introduced_in": 1
+      },
+      "source": {
+        "type": "object",
+        "required": true,
+        "nullable": false,
+        "mutability": "immutable",
+        "source": "Recorder event producer",
+        "semantics": "source topic, artifact, message identity and whether the event is raw or derived",
+        "introduced_in": 1
+      },
+      "validity": {
+        "type": "string",
+        "required": true,
+        "nullable": false,
+        "mutability": "immutable",
+        "source": "source contract validation",
+        "semantics": "controlled validity of this event",
+        "allowed_values": [
+          "valid",
+          "invalid",
+          "unknown"
+        ],
+        "introduced_in": 1
+      },
+      "invalid_reasons": {
+        "type": "array<string>",
+        "required": true,
+        "nullable": false,
+        "mutability": "immutable",
+        "source": "source contract validation",
+        "semantics": "bounded reasons; empty only when validity is valid",
+        "introduced_in": 1
+      },
+      "source_event_ids": {
+        "type": "array<string>",
+        "required": true,
+        "nullable": false,
+        "mutability": "immutable",
+        "source": "Recorder derived-event producer",
+        "semantics": "source event identities for a derived event; raw events use an empty array and payload message identity",
+        "introduced_in": 1
+      }
+    }
+  },
+  "raw_artifact_schema": {
+    "implementation_status": "legacy_current_and_planned_offline_or_b2_optional",
+    "current_legacy_artifacts": [
+      "metadata.json",
+      "final_actions.jsonl",
+      "action_dispatches.jsonl",
+      "action_frames.jsonl",
+      "action_pairing_issues.jsonl",
+      "fsm_status.jsonl",
+      "competition_contexts.jsonl",
+      "rosbag/"
+    ],
+    "high_bandwidth_storage": "RGB, Depth, CameraInfo, Odom and JointState remain raw rosbag messages",
+    "samples_jsonl": {
+      "implementation_status": "not_implemented_online",
+      "owner": "Commit C offline Indexer and QC"
+    },
+    "raw_records_jsonl": {
+      "implementation_status": "planned_offline_or_b2_optional",
+      "allowed_fields": [
+        "message_identity",
+        "topic",
+        "ros_type",
+        "sensor_timestamp_ns",
+        "receive_timestamp_ns",
+        "bag_segment",
+        "message_sequence",
+        "run_id",
+        "task_id",
+        "settled_attempt_count"
+      ]
+    },
+    "next_observation_binding": "offline_only_commit_c",
+    "training_eligibility": "offline_qc_only_commit_c",
+    "online_training_episode_creation": false
+  },
+  "action_recording_schema": {
+    "interface_reference": "interface_schema.action_recording_contract",
+    "terms": [
+      "proposed_action",
+      "selected_action",
+      "dispatched_action",
+      "publisher_call_attempted",
+      "publisher_call_succeeded",
+      "publisher_failure_reason",
+      "execution_feedback"
+    ],
+    "current_implementation": {
+      "proposed_action": "not_available_complete_numeric_values",
+      "selected_action": "FinalAction",
+      "dispatched_action": "ActionDispatchRecord exact non-null publisher payload",
+      "publisher_call_attempted": "ActionDispatchRecord.publish_attempted and group records",
+      "publisher_call_succeeded": "ActionDispatchRecord local publisher return only",
+      "publisher_failure_reason": "ActionDispatchRecord aggregate and group failure reasons",
+      "execution_feedback": "JointState and Odom in rosbag, not yet paired to actions"
+    },
+    "final_action_is_actual_published_action": false,
+    "head_only_exact_payload_source": "ActionDispatchRecord exact payload; never reconstructed from FinalAction or JointState",
+    "publisher_success_disclaimer": "publisher_call_succeeded does not prove DDS delivery, Server receipt, controller acceptance or robot execution",
+    "controller_accepted": {
+      "value": null,
+      "status": "unresolved",
+      "reason": "no authoritative Server or controller acknowledgement",
+      "source": "Interface v1"
+    },
+    "execution_confirmed": {
+      "value": null,
+      "status": "unresolved",
+      "reason": "later JointState/Odom have no frozen confirmation tolerance or pairing window",
+      "source": "Interface v1"
+    },
+    "observe_only_formal_bc_label_eligible_by_default": false,
+    "training_eligibility_owner": "Commit C offline QC"
+  },
+  "shutdown_schema": {
+    "implementation_status": "planned_b2",
+    "states": [
+      "active",
+      "shutdown_requested",
+      "complete",
+      "unclean_detected",
+      "recovery_required"
+    ],
+    "markers": {
+      "ACTIVE": "created and durably recorded when a future segment starts",
+      "COMPLETE": "created only after artifacts, bag outcome and final metadata are durably recorded"
+    },
+    "b1_creates_markers": false,
+    "kill_9_or_power_loss_finally_guaranteed": false,
+    "unclean_detection_owner": "a later Recorder startup or offline recovery scan",
+    "jsonl_recovery": {
+      "incomplete_final_tail": "may be excluded only in a derived recovery view",
+      "interior_corruption": "must fail closed and must never be silently ignored",
+      "raw_in_place_truncation_or_rewrite": "forbidden",
+      "recovery_record_requires": [
+        "source_sha256",
+        "valid_byte_end_offset",
+        "reason",
+        "recovery_tool_version"
+      ]
+    }
+  },
+  "provenance_schema": {
+    "source_categories": [
+      "auto_detected",
+      "launcher_injected",
+      "unavailable",
+      "prohibited_collection"
+    ],
+    "docker_socket_dependency": "forbidden",
+    "sensitive_collection": {
+      "tokens": "prohibited_collection",
+      "ssh_information": "prohibited_collection",
+      "complete_environment": "prohibited_collection",
+      "unrelated_paths": "prohibited_collection"
+    },
+    "fields": {
+      "project_commit": "launcher_injected",
+      "project_branch": "launcher_injected",
+      "dirty_worktree": "launcher_injected",
+      "config_sha256": "auto_detected",
+      "interface_schema_sha256": "auto_detected",
+      "recorder_schema_sha256": "auto_detected",
+      "official_server_image_id": "launcher_injected",
+      "official_client_image_id": "launcher_injected",
+      "docker_image_digest": "launcher_injected",
+      "hostname": "auto_detected_or_prohibited_collection_by_policy",
+      "ros_domain_id": "auto_detected",
+      "rmw_implementation": "auto_detected",
+      "python_version": "auto_detected",
+      "package_version": "auto_detected",
+      "container_identity": "launcher_injected_or_prohibited_collection_by_policy"
+    },
+    "hostname_and_container_identity_may_be_disabled_or_redacted": true,
+    "missing_image_identity": {
+      "value": null,
+      "status": "unavailable",
+      "reason": "not_injected_by_launcher",
+      "source": "launcher_injected"
+    }
+  },
+  "rosbag_schema": {
+    "implementation_status": "legacy_current_with_b3_tf_plan",
+    "currently_recorded_topics": [
+      "/material/instruction",
+      "/head_camera/color/image_raw",
+      "/head_camera/aligned_depth_to_color/image_raw",
+      "/head_camera/color/camera_info",
+      "/slamware_ros_sdk_server_node/odom",
+      "/joint_states",
+      "/team/object_estimates",
+      "/team/fsm_status",
+      "/team/competition_context",
+      "/team/final_action",
+      "/referee/taskinfo",
+      "/referee/gameinfo",
+      "/referee/score"
+    ],
+    "currently_not_recorded_topics": [
+      "/tf",
+      "/tf_static",
+      "/team/action_dispatch"
+    ],
+    "action_dispatch_storage": "structured action_dispatches.jsonl; duplicate rosbag recording is not required by v1",
+    "b3_planned_topics": [
+      "/tf",
+      "/tf_static"
+    ],
+    "tf_static_qos_and_late_join_status": "requires_real_humble_validation",
+    "world_equals_odom": false,
+    "must_not_assume_world_equals_odom": true,
+    "b1_changes_runtime_topic_list": false
+  },
+  "legacy_compatibility": {
+    "legacy_schema_id": "legacy_flat_episode_v0",
+    "detection_rule": "a flat Recorder directory without a Recorder schema identity is read as legacy_flat_episode_v0",
+    "in_place_modification": "forbidden",
+    "facts_that_must_not_be_invented": [
+      "run boundary",
+      "clean shutdown",
+      "TF completeness"
+    ],
+    "legacy_metadata_task_semantics": "metadata.task is a first-task compatibility field and must not be treated as the complete task set",
+    "migration_output_rule": "migration or unified views are written to a new output directory",
+    "migration_provenance_required": [
+      "source_path",
+      "source_sha256",
+      "migration_tool_version"
+    ],
+    "unknown_major_reader_behavior": "fail_closed"
+  },
+  "schema_evolution": {
+    "major_change_conditions": [
+      "field deletion or rename",
+      "unit change",
+      "time source change",
+      "identity semantics change",
+      "null semantics change",
+      "layout role change",
+      "event semantics change",
+      "action label eligibility change"
+    ],
+    "same_major_addition_rule": "only fields with explicit missing semantics may be added compatibly",
+    "new_event_rule": "a new controlled event type must declare introduced_in",
+    "unknown_field_reader_behavior": "preserve when possible without changing known field interpretation",
+    "unknown_major_reader_behavior": "fail_closed",
+    "raw_in_place_migration": "forbidden",
+    "migration_rule": "write a new output with source and destination schema hashes and migration tool version"
+  },
+  "planned_runtime_capabilities": [
+    {
+      "capability": "run manifests, bootstrap/run-bound segments and events.jsonl",
+      "implementation_owner": "Commit B2",
+      "implemented_in_b1": false
+    },
+    {
+      "capability": "ACTIVE/COMPLETE markers and unclean recovery detection",
+      "implementation_owner": "Commit B2",
+      "implemented_in_b1": false
+    },
+    {
+      "capability": "record /tf and /tf_static in rosbag",
+      "implementation_owner": "Commit B3",
+      "implemented_in_b1": false
+    },
+    {
+      "capability": "raw index, samples, next_observation and training eligibility",
+      "implementation_owner": "Commit C offline Indexer/QC",
+      "implemented_in_b1": false
+    }
+  ],
+  "unresolved": [
+    {
+      "key": "official_attempt_start_identity",
+      "status": "unresolved",
+      "why_unresolved": "public referee fields expose settled count but no official attempt start identity",
+      "affected_components": ["Recorder", "Offline Indexer"],
+      "required_test_or_decision": "trace public referee transitions in the official environment",
+      "must_not_assume": "settled_attempt_count is a current 1-based attempt number"
+    },
+    {
+      "key": "run_continuity_across_client_restart",
+      "status": "unresolved",
+      "why_unresolved": "CompetitionRunCoordinator creates a new local UUID after Client restart",
+      "affected_components": ["CompetitionContext", "Recorder", "Offline QC"],
+      "required_test_or_decision": "define an authoritative continuity source or explicit offline review policy",
+      "must_not_assume": "matching task_set_fingerprint proves two run_id values are one run"
+    },
+    {
+      "key": "world_to_odom_relationship",
+      "status": "unresolved",
+      "why_unresolved": "no authoritative transform or equality contract is available",
+      "affected_components": ["Recorder", "Offline Replay", "Perception", "Navigation"],
+      "required_test_or_decision": "record TF and compare official world task coordinates",
+      "must_not_assume": "world equals odom"
+    },
+    {
+      "key": "mmk2_fk_output_frame",
+      "status": "unresolved",
+      "why_unresolved": "official FK adapter output frame is not verified online",
+      "affected_components": ["Offline QC", "Perception", "Arm"],
+      "required_test_or_decision": "compare FK output with online TF and known poses",
+      "must_not_assume": "FK output is world or odom"
+    },
+    {
+      "key": "tf_static_rosbag_qos_behavior",
+      "status": "unresolved",
+      "why_unresolved": "Humble rosbag2 late-join behavior has not been verified in the official Client image",
+      "affected_components": ["Recorder", "Replay Tool"],
+      "required_test_or_decision": "record and replay a pre-existing transient-local /tf_static publisher",
+      "must_not_assume": "default rosbag QoS captures pre-existing static transforms"
+    },
+    {
+      "key": "ros_time_rollback_policy",
+      "status": "unresolved",
+      "why_unresolved": "simulation reset and ROS clock rollback boundaries are not frozen",
+      "affected_components": ["Recorder", "Offline Indexer"],
+      "required_test_or_decision": "choose segment rollover and ordering behavior for detected rollback",
+      "must_not_assume": "ROS time is globally monotonic"
+    },
+    {
+      "key": "bag_storage_and_compression_policy",
+      "status": "unresolved",
+      "why_unresolved": "storage plugin, compression and durability tradeoffs are not selected",
+      "affected_components": ["Recorder", "Offline Tooling"],
+      "required_test_or_decision": "benchmark supported official-image rosbag2 storage configurations",
+      "must_not_assume": "one plugin or compression mode is universally available"
+    },
+    {
+      "key": "jsonl_fsync_interval",
+      "status": "unresolved",
+      "why_unresolved": "durability and write-amplification budget has not been measured",
+      "affected_components": ["Recorder"],
+      "required_test_or_decision": "benchmark fsync cadence under expected control and storage rates",
+      "must_not_assume": "per-line fsync is required or affordable"
+    },
+    {
+      "key": "disk_full_recorder_policy",
+      "status": "unresolved",
+      "why_unresolved": "the required relationship between recording failure and control process lifetime is not decided",
+      "affected_components": ["Recorder", "ROS Integration", "Safety"],
+      "required_test_or_decision": "decide and test fail-closed recording behavior without coupling Recorder to control",
+      "must_not_assume": "Recorder may stop or alter control when disk is full"
+    },
+    {
+      "key": "multiple_recorder_writer_policy",
+      "status": "unresolved",
+      "why_unresolved": "single-writer locking and concurrent run manifest updates are not designed",
+      "affected_components": ["Recorder", "Dataset Layout"],
+      "required_test_or_decision": "choose exclusive writer or revisioned manifest protocol",
+      "must_not_assume": "PID alone provides a safe writer lock"
+    },
+    {
+      "key": "complete_proposed_action_telemetry",
+      "status": "unresolved",
+      "why_unresolved": "current ActionMuxDecision records presence and masks but not complete candidate numeric values",
+      "affected_components": ["Interface", "Recorder", "Offline QC"],
+      "required_test_or_decision": "review a non-invasive public telemetry contract outside Commit B",
+      "must_not_assume": "FinalAction reconstructs raw proposed candidates"
+    },
+    {
+      "key": "server_receive_acknowledgement",
+      "status": "unresolved",
+      "why_unresolved": "local publisher return has no authoritative Server acknowledgement",
+      "affected_components": ["Recorder", "Control", "Offline QC"],
+      "required_test_or_decision": "obtain or add authoritative Server-side receipt evidence",
+      "must_not_assume": "publisher_call_succeeded means Server receipt"
+    },
+    {
+      "key": "execution_confirmation_tolerance",
+      "status": "unresolved",
+      "why_unresolved": "no accepted feedback tolerance or settling rule is frozen",
+      "affected_components": ["Offline QC", "Control"],
+      "required_test_or_decision": "calibrate feedback tolerances and settling windows",
+      "must_not_assume": "publisher success means execution"
+    },
+    {
+      "key": "observation_action_offline_pairing_window",
+      "status": "unresolved",
+      "why_unresolved": "sensor rates, transport latency and feedback lag are not calibrated",
+      "affected_components": ["Offline Indexer", "Offline QC"],
+      "required_test_or_decision": "measure timestamp and receive-time skew in recorded runs",
+      "must_not_assume": "nearest timestamp is always the correct observation or feedback"
+    },
+    {
+      "key": "image_identity_injection_owner",
+      "status": "unresolved",
+      "why_unresolved": "the launcher responsible for authoritative Server and Client image identities is not assigned",
+      "affected_components": ["Deployment", "Recorder Provenance"],
+      "required_test_or_decision": "assign injection ownership and define accepted image ID/digest format",
+      "must_not_assume": "Recorder can query Docker or infer image identity"
+    },
+    {
+      "key": "bag_failure_rollover_policy",
+      "status": "unresolved",
+      "why_unresolved": "automatic segment rollover after rosbag failure is not approved",
+      "affected_components": ["Recorder", "ROS Integration"],
+      "required_test_or_decision": "decide whether to stop recording or create a new segment after bag failure",
+      "must_not_assume": "automatic restart is safe or preserves continuity"
+    }
+  ]
+}
