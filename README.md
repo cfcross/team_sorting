@@ -171,9 +171,10 @@ ROS 2 节点可以理解为一个独立运行、通过话题交换消息的程�
   `/material/instruction`，以及
   `/referee/taskinfo`、`/referee/gameinfo`、`/referee/score`。配置中的原始传感器和
   `/team/object_estimates` 由它管理的外部 `ros2 bag record` 进程订阅。
-- **发布**：无控制话题；输出是 Episode 目录中的 `rosbag/`、JSONL 和 `metadata.json`。
-- **调用**：`recorder.py` 的 `EpisodeRecorder`、`fsm.py` 的 `InstructionParser`，以及
-  `interfaces.py` 中唯一的 FSM/动作 JSON 编解码函数。
+- **发布**：无控制话题；输出是 dataset root 下的 bootstrap/run-bound Recorder
+  Segment、run manifest、事件流、原有 JSONL/`metadata.json` 和每段独立 `rosbag/`。
+- **调用**：`recorder_runtime.py` 的 `RecorderRuntimeManager` 管理身份、落盘和 bag
+  生命周期；段内原始兼容文件仍由 `recorder.py` 的 `EpisodeRecorder` 写入。
 - **不负责**：感知、控制、状态推进、训练 ACT/VLA，或把裁判结果扩展成逐帧标签。
 - **是否必需**：可选，`recorder.enabled` 默认是 `false`，普通启动不创建该节点。
 
@@ -411,19 +412,22 @@ Recorder的数据身份、逻辑布局、manifest/segment/event字段、关闭�
 兼容和演进规则由
 [`config/contracts/recorder_schema_v1.json`](config/contracts/recorder_schema_v1.json)
 冻结，中文说明见
-[`docs/recorder_schema_v1.md`](docs/recorder_schema_v1.md)。当前B1仅提供契约、加载器和
-安装支持；其中标记为B2/B3或Commit C的运行时与离线能力尚未实现。
+[`docs/recorder_schema_v1.md`](docs/recorder_schema_v1.md)。B2 已实现该冻结契约的运行时
+生命周期；契约文档中的 `planned_b2` 是冻结时的版本事实，不通过改写契约追记实现状态。
+B3 的 TF 录制以及 Commit C 的离线索引、QC、Replay、sample 和训练 Episode 能力仍未实现。
 
-Recorder 节点从启动到停止连续保存一个原始 Run，不按官方 Task 或已结算 attempt 拆分
-rosbag，也不把这个文件边界冒充为正式训练 Episode。官方三任务及每任务最多三次已结算
-attempt 的比赛生命周期已经明确；`competition_contexts.jsonl` 和 metadata 中的索引用于
-在同一原始 Run 内恢复 Run/Task/Attempt 层级。当前能够覆盖的数据如下：
+Recorder 启动时先创建 `bootstrap/<segment_id>/`。第一条合法且未结束的
+`CompetitionContext` 到达后，bootstrap 原地完整关闭，不被移动或追溯绑定；随后创建
+`runs/<run_id>/manifest.json` 和新的 run-bound Segment。Task 或已结算 attempt 变化只写
+transition 事件，不切 Segment、不重启 bag；run_id 变化或首次 `finished=true` 才关闭当前
+run-bound Segment。Segment 是原始记录生命周期边界，不是官方 Attempt，也不是正式训练
+Episode。当前能够覆盖的数据如下：
 
 | 数据 | 保存位置 | 当前说明 |
 |---|---|---|
 | `instruction_raw` | `metadata.json`，同时在 rosbag 保留原消息 | 原文即使解析失败也保留 |
 | 解析后的 `TaskSpec` | `metadata.json` | 由唯一 `InstructionParser` 生成；完整三任务保存在 `parsed_tasks`，旧 `task` 字段仅作 metadata 消费者兼容，不参与当前任务选择 |
-| `CompetitionContext` | `competition_contexts.jsonl`、`metadata.json` | 连续记录公开裁判上下文，并按 `run_id`、`task_id`、已结算 attempt 建立索引，不拆分整局 Run |
+| `CompetitionContext` | `competition_contexts.jsonl`、`metadata.json` | 连续记录公开裁判上下文，并按 `run_id`、`task_id`、已结算 attempt 建立索引；不因 Task/attempt 拆分 Segment |
 | RGB、Depth、CameraInfo | rosbag | 原始高带宽 ROS 消息，不在 Python 回调中逐帧复制 |
 | Odom、JointState | rosbag | 保留原消息、时间和 frame |
 | `ObjectEstimate3D` | rosbag 中的 `/team/object_estimates` | 保存团队感知输出 |
@@ -435,22 +439,50 @@ attempt 的比赛生命周期已经明确；`competition_contexts.jsonl` 和 met
 | referee 信息 | `metadata.json`，同时进入 rosbag | 原样记录 taskinfo、gameinfo、score，能解析 JSON 时附解析值 |
 | success / score 等结果 | FSM JSONL、referee metadata | 官方累计分数来自公开 `/referee/score`，任务进度来自 taskinfo/gameinfo；`FSMStatus.success` 只是本地 FSM 诊断，不能冒充官方比赛结果 |
 
-三种格式各司其职：
+这些格式各司其职：
 
 - **rosbag** 是 ROS 2 原始消息包，保存 RGB、Depth 等高带宽话题，也保留原消息类型、
   时间戳和坐标系。
 - **JSONL** 是“一行一个 JSON 对象”，便于逐周期读取；保存 FSM、两条原始合法动作
   遥测、严格配对 Frame 和配对 Issue。
-- **metadata** 是一个原始 Run 的摘要，保存任务原文、完整 `TaskSpec` 集合、
-  CompetitionContext 索引、裁判消息、bag 状态、话题计数和可选最终结果。
+- **metadata** 是每个 Recorder Segment 内的兼容摘要，保存任务原文、完整 `TaskSpec`
+  集合、CompetitionContext 索引、裁判消息、bag 状态、话题计数和可选最终结果。
+- **manifest/segment/event** 分别保存 team-local Run 身份、单段生命周期和轻量事实；
+  `ACTIVE`/`COMPLETE` 用于识别正常或异常关闭。启动恢复扫描只生成新的只读报告，不修改旧段。
 
-专家训练动作只能使用 `ActionMux` 生成、`valid=True` 且已经过
-`OfficialCommandPublisher` 成功发布的 `FinalAction`。`valid=False` 的 `FinalAction`
-可以保留用于诊断，但不能直接作为专家训练动作；`SAFE_HOLD`、`FAILED` 和恢复片段也可
-保留，并在数据处理时单独标记。`IKResult` 只是目标解，`JointTrajectory` 只是计划，
-未插值的路点也不是当时的实发动作，三者都不能替代训练标签。裁判 success/score 是
-Episode 级结果，不能复制成每一帧的真值标签。当前仓库只负责可靠记录，不负责 ACT/VLA
-的数据清洗、训练或在线推理。
+同一Run的`events.jsonl`是跨Segment追加的共享流，因此已关闭Segment只记录其关闭时的
+`byte_end_offset`与`sha256_prefix`，不把仍会增长的文件误报成最终全文件hash。恢复扫描会
+对每个Run的共享事件流检查一次并区分尾部与中间损坏。`bag_storage_identifier`当前不会
+猜测为`sqlite3`；运行时尚未解析真实`metadata.yaml`时保持结构化unavailable。
+
+规范布局为：
+
+```text
+team_sorting_dataset/
+├── bootstrap/<segment_id>/{segment.json,events.jsonl,ACTIVE|COMPLETE,...}
+├── runs/<run_id>/{manifest.json,events.jsonl,segments/<segment_id>/...}
+└── recovery/<recovery_report_id>.json
+```
+
+manifest 通过同目录临时文件、严格 JSON、文件 `fsync`、`os.replace` 和父目录 `fsync`
+更新；marker 排他创建，正常结束仅在 `COMPLETE` 持久化后移除 `ACTIVE`。运行时只扫描上述
+规范位置，不迁移、不修复、不覆盖旧扁平目录。路径不安全或身份冲突的 run_id 会 fail
+closed，invalid Context 只留下事件诊断且不会替换最近合法身份。
+
+provenance 自动记录 Python/package 版本、契约与配置 hash、ROS domain/RMW 和最终安全开关。
+启动器可显式注入 `TEAM_SORTING_PROJECT_COMMIT`、`TEAM_SORTING_PROJECT_BRANCH`、
+`TEAM_SORTING_DIRTY_WORKTREE`、`TEAM_SORTING_OFFICIAL_SERVER_IMAGE_ID`、
+`TEAM_SORTING_OFFICIAL_CLIENT_IMAGE_ID`、`TEAM_SORTING_DOCKER_IMAGE_DIGEST` 和
+`TEAM_SORTING_CONTAINER_IDENTITY`；未注入时使用结构化 unavailable，不访问 Docker socket，
+也不采集 hostname、完整环境、token 或 SSH 信息。
+
+`ActionMux` 生成、`valid=True` 且存在本地 publisher 成功事实的 `FinalAction` 也只满足
+候选动作的最低条件；DDS交付、Server/controller接受和机器人执行仍未知，必须在Commit C
+离线QC中结合实际反馈判断，B2不产生training eligibility。`valid=False` 的 FinalAction、
+`SAFE_HOLD`、`FAILED` 和恢复片段可保留用于诊断。`IKResult` 只是目标解，
+`JointTrajectory` 只是计划，未插值路点也不是实发动作，三者都不能替代训练标签。裁判
+success/score 是比赛/Run级结果，不能复制成每帧真值。当前仓库不负责 ACT/VLA 数据清洗、
+训练或在线推理。
 
 Recorder 的任意到达顺序、严格关联、重复/冲突、monotonic 超时、容量淘汰和 shutdown
 orphan 规则见
@@ -503,7 +535,11 @@ orphan 规则见
 | `perception.estimator_3d.object_dimensions_m.*` | `[0.24, 0.16, 0.19]` | 启发式中心补偿使用的宽、高、沿相机视线近似深度；不是物体局部XYZ尺寸 |
 | `recorder.enabled` | `false` | 默认不启动记录 |
 | `recorder.record_rosbag` | `true` | 启动 Recorder 时同时管理 rosbag |
-| `recorder.root_dir` | `./team_sorting_dataset` | Episode 根目录 |
+| `recorder.root_dir` | `./team_sorting_dataset` | Recorder schema v1 dataset root；旧扁平目录不自动迁移 |
+| `recorder.recovery_scan_enabled` | `true` | 启动时只读扫描规范 Segment 并另写 recovery 报告 |
+| `recorder.bag_shutdown.sigint_timeout_sec` | `30.0` | bag 收到 SIGINT 后的有界等待 |
+| `recorder.bag_shutdown.terminate_timeout_sec` | `5.0` | SIGINT 超时后 terminate 的有界等待 |
+| `recorder.bag_shutdown.kill_timeout_sec` | `2.0` | terminate 超时后 kill 的最终有界等待 |
 | `recorder.action_pairing.enabled` | `true` | 订阅并严格配对 FinalAction/Dispatch 内部遥测 |
 | `recorder.action_pairing.max_pending_per_side` | `256` | 每侧等待表容量 |
 | `recorder.action_pairing.max_completed_sequences` | `1024` | 近期终态 digest LRU 容量；精确终态区间账本另行阻止旧 sequence 重开 |
@@ -621,9 +657,9 @@ TeamClient 将完整三任务集合与 `/referee/taskinfo`、`/referee/gameinfo`
 JSON。`attempt` 是当前任务已结算次数；任务切换只重建本地单任务 `GlobalFSM`，不表示
 官方物理场景复位。同一任务的 `attempt` 增加也只重新武装本地单任务 FSM，不改变
 `run_id`、不生成新任务集合、不清空 Recorder 历史，也不代表 Server、机器人或物品
-复位。Recorder 仍连续保存一个原始 Run，并用
-`competition_contexts.jsonl` 和 metadata 索引恢复 Run/Task/Attempt 层级；节点启动到
-停止不再被描述为正式训练 Episode 边界。
+复位。Recorder 在同一 run-bound Segment 中连续保存这些变化，并用原有
+`competition_contexts.jsonl`、metadata 索引和新增 transition 事件恢复
+Run/Task/Attempt 层级；Segment 边界不被描述为正式训练 Episode 边界。
 
 ## 13. 当前已完成和未完成
 
@@ -637,7 +673,8 @@ JSON。`attempt` 是当前任务已结算次数；任务切换只重建本地单
 - YOLO、MMK2FK、KDL 薄适配器及缺失依赖的清晰报错；
 - YOLO 检测的 RGB frame 传递、二维稳定轨迹 ID 与 PerceptionNode 接线；
 - 三维深度中位数、反投影、配置尺寸中心补偿、稳定 ID EMA、跳变拒绝与三方时帧校验；
-- Episode metadata、FSM/动作 JSONL 和外部 rosbag 管理链；
+- Recorder schema v1 bootstrap/run-bound 生命周期、manifest/segment/event、只读恢复报告，
+  以及兼容 metadata、FSM/动作 JSONL 和分段外部 rosbag 管理链；
 - 几何、任务解析、FSM、19 维动作、安全覆盖与 Recorder 的测试骨架。
 
 ### 尚未完成
@@ -665,7 +702,7 @@ JSON。`attempt` 是当前任务已结算次数；任务切换只重建本地单
   不再固定采用 `tasks[0]`。
 - 每项任务最多有三次已结算 attempt；放置成功或机会用尽后进入下一任务。同一 Task 的
   attempt 变化和 Task 切换都不会复位 Server、机器人或物品，只会重新武装本地单任务 FSM。
-- Recorder 连续保存整局原始 Run，不因 Task/attempt 变化清空历史；
+- Recorder 的 run-bound Segment 不因 Task/attempt 变化切分或清空历史；
   `competition_contexts.jsonl` 和 metadata 按 Run/Task/已结算 attempt 建立索引。
 - 正式随机 Server 开发入口 `start_official_random_server.sh` 显式设置
   `MATERIAL_RANDOMIZE=1`。这描述的是正式启动入口，不把 Python 环境变量的缺省解析

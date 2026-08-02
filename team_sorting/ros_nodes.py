@@ -88,7 +88,6 @@ import json
 import math
 import os
 from pathlib import Path
-import signal
 import subprocess
 import time
 from types import SimpleNamespace
@@ -134,8 +133,8 @@ from .interfaces import (
 from .navigation import Bounds3D, classify_slot_type
 from .perception_2d import Detection2DStabilizer, OfficialYoloAdapter
 from .perception_3d import CameraTransformProvider, Perception3DEstimator
-from .recorder import EpisodeRecorder
 from .recording_contracts import ActionPairingConfig
+from .recorder_runtime import RecorderRuntimeConfig, RecorderRuntimeManager
 
 
 class TimestampedCache:
@@ -1725,32 +1724,34 @@ def _create_recorder_node(ros: SimpleNamespace) -> type:
                 )
             except ValueError as exc:
                 raise RuntimeError(f"Recorder action pairing配置无效：{exc}") from exc
-            self._recorder = EpisodeRecorder(
-                recorder_config["root_dir"], pairing_config
+            bag_shutdown = recorder_config["bag_shutdown"]
+            control = _validated_control_config(config)
+            runtime_config = RecorderRuntimeConfig(
+                root_dir=Path(recorder_config["root_dir"]),
+                record_rosbag=recorder_config.get("record_rosbag", True),
+                rosbag_topics=tuple(
+                    str(topic) for topic in recorder_config["rosbag_topics"]
+                ),
+                recovery_scan_enabled=recorder_config["recovery_scan_enabled"],
+                bag_sigint_timeout_sec=bag_shutdown["sigint_timeout_sec"],
+                bag_terminate_timeout_sec=bag_shutdown["terminate_timeout_sec"],
+                bag_kill_timeout_sec=bag_shutdown["kill_timeout_sec"],
+                observe_only=control["observe_only"],
+                official_publish_enabled=_official_publish_enabled(control),
+                config_path=_resolve_config_path(),
             )
-            self._rosbag_process: Optional[Any] = None
-            self._rosbag_failure = ""
+            self._runtime = RecorderRuntimeManager(
+                runtime_config,
+                pairing_config,
+                process_factory=subprocess.Popen,
+            )
             self._pairing_timer: Optional[Any] = None
-            self._destroyed = False
+            self._parent_destroyed = False
+            self._runtime_closed = False
             now_ns = self.get_clock().now().nanoseconds
-            episode_id = EpisodeRecorder.make_episode_id(recorder_config["episode_prefix"])
-            self._recorder.start(
-                episode_id,
-                now_ns,
-                "原始Run文件边界：recorder节点启动到停止；不是正式训练Episode边界",
-            )
             try:
-                if bool(recorder_config.get("record_rosbag", True)):
-                    command = self._recorder.build_rosbag_command(
-                        tuple(str(topic) for topic in recorder_config["rosbag_topics"])
-                    )
-                    self._rosbag_process = subprocess.Popen(command)
-                    self._recorder.mark_rosbag_started(command[4])
-                    exit_code = self._rosbag_process.poll()
-                    if exit_code is not None:
-                        self._recorder.mark_rosbag_finished(exit_code)
-                        self._rosbag_process = None
-                        raise RuntimeError(f"ros2 bag record 启动后立即退出，退出码={exit_code}")
+                self._runtime.start(now_ns)
+                if runtime_config.record_rosbag:
                     self.create_timer(1.0, self._monitor_rosbag)
                 self.create_subscription(ros.String, topics["final_action"], self._on_action, 50)
                 if pairing_config.enabled:
@@ -1790,29 +1791,24 @@ def _create_recorder_node(ros: SimpleNamespace) -> type:
                     ros.Int32, topics["referee_score"], self._on_referee_score, 10
                 )
             except Exception as exc:  # noqa: BLE001 - 初始化失败必须回滚后原样上抛
-                # bag 已启动后若 Timer 或订阅创建失败，必须先停止子进程并结束元数据，
-                # 避免留下无人管理的录制进程或看似仍在进行的 Episode。
                 cleanup_errors: list[str] = []
+                if self._pairing_timer is not None:
+                    self._pairing_timer.cancel()
+                    self._pairing_timer = None
                 try:
-                    self._stop_pairing_timer_and_close()
+                    self._runtime.close(
+                        self.get_clock().now().nanoseconds,
+                        reason="node_initialization_failed",
+                    )
                 except Exception as cleanup_exc:  # noqa: BLE001 - 汇总到初始化错误
-                    cleanup_errors.append(f"关闭 action pairing 失败：{cleanup_exc}")
-                try:
-                    self._stop_rosbag()
-                except Exception as cleanup_exc:  # noqa: BLE001 - 汇总到初始化错误
-                    cleanup_errors.append(f"停止 rosbag 失败：{cleanup_exc}")
-                try:
-                    if self._recorder.metadata is not None:
-                        self._recorder.finish(self.get_clock().now().nanoseconds)
-                except Exception as cleanup_exc:  # noqa: BLE001 - 汇总到初始化错误
-                    cleanup_errors.append(f"结束 Episode 失败：{cleanup_exc}")
+                    cleanup_errors.append(f"关闭Recorder runtime失败：{cleanup_exc}")
                 details = f"；回滚问题={'；'.join(cleanup_errors)}" if cleanup_errors else ""
                 raise RuntimeError(f"Recorder 初始化失败：{exc}{details}") from exc
 
         def _on_action(self, message: Any) -> None:
             try:
-                if self._recorder.action_pairing_enabled:
-                    issue_types = self._recorder.ingest_final_action_payload(
+                if self._runtime.action_pairing_enabled:
+                    issue_types = self._runtime.record_final_action_payload(
                         message.data,
                         self.get_clock().now().nanoseconds,
                         time.monotonic_ns(),
@@ -1822,13 +1818,15 @@ def _create_recorder_node(ros: SimpleNamespace) -> type:
                             f"FinalAction pairing诊断：{','.join(issue_types)}"
                         )
                 else:
-                    self._recorder.record_final_action(final_action_from_json(message.data))
+                    self._runtime.record_final_action(
+                        final_action_from_json(message.data)
+                    )
             except (ValueError, RuntimeError) as exc:
                 self.get_logger().error(f"记录 FinalAction 失败：{exc}")
 
         def _on_action_dispatch(self, message: Any) -> None:
             try:
-                issue_types = self._recorder.ingest_action_dispatch_payload(
+                issue_types = self._runtime.record_action_dispatch_payload(
                     message.data,
                     self.get_clock().now().nanoseconds,
                     time.monotonic_ns(),
@@ -1842,7 +1840,7 @@ def _create_recorder_node(ros: SimpleNamespace) -> type:
 
         def _prune_action_pairs(self) -> None:
             try:
-                issue_types = self._recorder.prune_action_pairs(
+                issue_types = self._runtime.prune_action_pairs(
                     self.get_clock().now().nanoseconds,
                     time.monotonic_ns(),
                 )
@@ -1853,37 +1851,33 @@ def _create_recorder_node(ros: SimpleNamespace) -> type:
             except RuntimeError as exc:
                 self.get_logger().error(f"Action pairing定时清理失败：{exc}")
 
-        def _stop_pairing_timer_and_close(self) -> None:
+        def _stop_pairing_timer(self) -> None:
             if self._pairing_timer is not None:
                 self._pairing_timer.cancel()
                 self._pairing_timer = None
-            self._recorder.close_action_pairing(
-                self.get_clock().now().nanoseconds,
-                time.monotonic_ns(),
-            )
 
         def _on_fsm(self, message: Any) -> None:
             try:
-                self._recorder.record_fsm_status(fsm_status_from_json(message.data))
+                self._runtime.record_fsm_status(fsm_status_from_json(message.data))
             except (ValueError, RuntimeError) as exc:
                 self.get_logger().error(f"记录 FSM 失败：{exc}")
 
         def _on_instruction(self, message: Any) -> None:
             try:
-                task = self._recorder.record_instruction(
+                task = self._runtime.record_instruction(
                     message.data,
                     self.get_clock().now().nanoseconds,
                     self._parser,
                 )
                 if task is None:
-                    reason = self._recorder.metadata.instruction_parse_failure
+                    reason = self._runtime.metadata.instruction_parse_failure
                     self.get_logger().warning(f"任务原文已保存，但解析失败：{reason}")
             except RuntimeError as exc:
                 self.get_logger().error(f"记录任务指令失败：{exc}")
 
         def _on_referee_text(self, topic: str, message: Any) -> None:
             try:
-                self._recorder.record_referee_message(
+                self._runtime.record_referee_message(
                     topic, message.data, self.get_clock().now().nanoseconds
                 )
             except (ValueError, RuntimeError) as exc:
@@ -1891,15 +1885,17 @@ def _create_recorder_node(ros: SimpleNamespace) -> type:
 
         def _on_competition_context(self, message: Any) -> None:
             try:
-                self._recorder.record_competition_context(
-                    CompetitionContext.from_json(message.data)
+                self._runtime.record_competition_context_payload(
+                    message.data,
+                    self.get_clock().now().nanoseconds,
+                    time.monotonic_ns(),
                 )
             except (ValueError, RuntimeError) as exc:
                 self.get_logger().error(f"记录CompetitionContext失败：{exc}")
 
         def _on_referee_score(self, message: Any) -> None:
             try:
-                self._recorder.record_referee_message(
+                self._runtime.record_referee_message(
                     "/referee/score",
                     int(message.data),
                     self.get_clock().now().nanoseconds,
@@ -1908,68 +1904,39 @@ def _create_recorder_node(ros: SimpleNamespace) -> type:
                 self.get_logger().error(f"记录裁判分数失败：{exc}")
 
         def _monitor_rosbag(self) -> None:
-            if self._rosbag_process is None:
-                return
-            exit_code = self._rosbag_process.poll()
-            if exit_code is None:
-                return
-            self._recorder.mark_rosbag_finished(exit_code)
-            self._rosbag_process = None
-            self._rosbag_failure = f"ros2 bag record 在节点运行期间提前退出，退出码={exit_code}"
-            self.get_logger().error(self._rosbag_failure)
-
-        def _stop_rosbag(self) -> None:
-            if self._rosbag_process is None:
-                if self._rosbag_failure:
-                    raise RuntimeError(self._rosbag_failure)
-                return
-            process = self._rosbag_process
-            exit_code = process.poll()
-            if exit_code is None:
-                process.send_signal(signal.SIGINT)
-                try:
-                    exit_code = process.wait(timeout=30.0)
-                except subprocess.TimeoutExpired as exc:
-                    process.terminate()
-                    exit_code = process.wait(timeout=5.0)
-                    self._recorder.mark_rosbag_finished(exit_code)
-                    self._rosbag_process = None
-                    raise RuntimeError(
-                        f"ros2 bag record 收到 SIGINT 后 30 秒未正常结束，终止退出码={exit_code}"
-                    ) from exc
-            self._recorder.mark_rosbag_finished(int(exit_code))
-            self._rosbag_process = None
-            if exit_code != 0:
-                raise RuntimeError(f"ros2 bag record 非正常退出，退出码={exit_code}")
+            try:
+                failure = self._runtime.monitor_bag(
+                    self.get_clock().now().nanoseconds
+                )
+                if failure:
+                    self.get_logger().error(failure)
+            except (ValueError, RuntimeError) as exc:
+                self.get_logger().error(f"监控rosbag失败：{exc}")
 
         def destroy_node(self) -> Any:
-            """正常停止 rosbag、结束临时 Episode 并销毁 ROS2 节点。
+            """幂等关闭当前Recorder Segment与rosbag并销毁ROS2节点。
 
-            参数：无。返回父类销毁结果；先向 bag 进程发送 SIGINT 并等待，时间单位
-            纳秒，空间坐标系不适用。bag 或元数据收尾失败仍会调用父类销毁，随后抛出
-            ``RuntimeError``；正式 Episode 边界仍待赛事方确认。
+            参数：无。返回父类销毁结果；bag按SIGINT、terminate、kill三级有界停止。
+            bag或落盘收尾失败仍调用父类销毁，随后抛出``RuntimeError``。Segment不是
+            官方Attempt或Training Episode，关闭也不会改变控制状态或发布开关。
             """
 
-            if self._destroyed and self._recorder.metadata is None:
+            if self._runtime_closed and self._parent_destroyed:
                 return None
-            already_destroyed = self._destroyed
-            self._destroyed = True
             errors: list[str] = []
-            try:
-                # 必须先停止独立 prune timer，避免与 orphan/文件关闭路径并发。
-                self._stop_pairing_timer_and_close()
-            except Exception as exc:  # noqa: BLE001 - 仍需停止bag并销毁节点
-                errors.append(f"关闭 action pairing 失败：{exc}")
-            try:
-                self._stop_rosbag()
-            except Exception as exc:  # noqa: BLE001 - 仍需完成元数据并销毁节点
-                errors.append(str(exc))
-            try:
-                if self._recorder.metadata is not None:
-                    self._recorder.finish(self.get_clock().now().nanoseconds)
-            except Exception as exc:  # noqa: BLE001 - 销毁后仍要报告元数据错误
-                errors.append(f"结束 Episode 失败：{exc}")
-            result = None if already_destroyed else super().destroy_node()
+            if not self._runtime_closed:
+                try:
+                    self._stop_pairing_timer()
+                    self._runtime.close(self.get_clock().now().nanoseconds)
+                    self._runtime_closed = True
+                except Exception as exc:  # noqa: BLE001 - 允许后续调用重试收尾
+                    errors.append(f"关闭Recorder runtime失败：{exc}")
+            result = None
+            if not self._parent_destroyed:
+                # 即使runtime收尾失败，父ROS节点也只销毁一次；标志先置位避免父类
+                # 内部异常导致后续调用重复执行非幂等ROS销毁。
+                self._parent_destroyed = True
+                result = super().destroy_node()
             if errors:
                 raise RuntimeError("；".join(errors))
             return result

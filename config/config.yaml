@@ -241,9 +241,16 @@ recorder:
   enabled: false
   # 仅在Recorder节点已经运行时生效；true表示由该节点管理外部ros2 bag子进程。
   record_rosbag: true
+  # 仅扫描本dataset_root中的bootstrap和run segment；只写独立recovery报告，不改旧数据。
+  recovery_scan_enabled: true
+  # 每个segment使用独立bag；关闭依次执行SIGINT、terminate和最终kill，全部等待均有界。
+  bag_shutdown:
+    sigint_timeout_sec: 30.0
+    terminate_timeout_sec: 5.0
+    kill_timeout_sec: 2.0
   # 相对路径由节点进程的当前工作目录解析；安装/launch环境最终落点必须运行确认。
   root_dir: "./team_sorting_dataset"
-  # EpisodeRecorder生成可读且安全的Episode目录名前缀。
+  # legacy EpisodeRecorder单元测试仍使用此字段；schema v1 runtime生成独立segment ID。
   episode_prefix: "episode"
   # Recorder旁路配对只关联已经产生的团队遥测，不参与ActionMux、FSM或官方发布。
   action_pairing:
