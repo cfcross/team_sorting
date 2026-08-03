@@ -476,8 +476,17 @@ def test_invalid_base_speed_safely_falls_back_to_zero(v: object, w: object) -> N
         timestamp_ns=1_000,
         valid_until_ns=2_000,
     )
+    # Interface v1构造边界已经拒绝这些值；这里显式绕过dataclass，只保留ActionMux面对
+    # 内存损坏/不可信旧对象时仍安全降级的防御纵深回归。
+    malformed = object.__new__(BaseCommand)
+    object.__setattr__(malformed, "v", v)
+    object.__setattr__(malformed, "w", w)
+    object.__setattr__(malformed, "timestamp_ns", 1_000)
+    object.__setattr__(malformed, "valid_until_ns", 2_000)
+    object.__setattr__(malformed, "valid", True)
+    object.__setattr__(malformed, "failure_reason", "")
     action = ActionMux().compose(
-        BaseCommand(v, w, 1_000, 2_000),  # type: ignore[arg-type]
+        malformed,
         command,
         joints,
         _status(),

@@ -332,6 +332,7 @@ class ExternalCandidateConsumer:
         self._request_id_set: set[str] = set()
         self._pending: Optional[_PendingCandidate] = None
         self._last_candidate_received_ns = 0
+        self._last_watchdog_failure_reason = ""
         self._shutdown = False
 
     @property
@@ -382,6 +383,11 @@ class ExternalCandidateConsumer:
             self._selected_task_id = selected_task_id
             self._task_key = task_key
             self._current_task_identity = identity
+            if self._last_watchdog_failure_reason in {
+                "instruction_future_timestamp",
+                "instruction_stale",
+            }:
+                self._last_watchdog_failure_reason = ""
             return changed
 
     def receive(self, raw: str, received_ros_ns: int) -> ExternalCandidateDecision:
@@ -412,6 +418,11 @@ class ExternalCandidateConsumer:
             self._remember_request_id_locked(candidate.request_id)
             self._pending = _PendingCandidate(candidate, received_ros_ns, consumer_valid_until)
             self._last_candidate_received_ns = received_ros_ns
+            if self._last_watchdog_failure_reason in {
+                "candidate_expired",
+                "candidate_publisher_timeout",
+            }:
+                self._last_watchdog_failure_reason = ""
             return self._decision_locked(
                 "candidate_pending", received_ros_ns, True, "", candidate, consumer_valid_until
             )
@@ -568,7 +579,7 @@ class ExternalCandidateConsumer:
         """Clear stale state only; never creates or replays a command."""
 
         with self._lock:
-            if self._shutdown:
+            if not self.config.enabled or self._shutdown:
                 return None
             reason = ""
             if self._instruction_received_ns > 0:
@@ -590,6 +601,9 @@ class ExternalCandidateConsumer:
                     self._pending = None
             if not reason:
                 return None
+            if reason == self._last_watchdog_failure_reason:
+                return None
+            self._last_watchdog_failure_reason = reason
             return self._decision_locked("watchdog_cleared", now_ns, False, reason)
 
     def shutdown(self, now_ns: int) -> ExternalCandidateDecision:
@@ -604,6 +618,7 @@ class ExternalCandidateConsumer:
         self._request_id_set.clear()
         self._pending = None
         self._last_candidate_received_ns = 0
+        self._last_watchdog_failure_reason = ""
 
     def _remember_request_id_locked(self, request_id: str) -> None:
         if len(self._request_ids) >= self.config.request_id_cache_size:

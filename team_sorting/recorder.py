@@ -38,6 +38,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import tempfile
 import time
 from threading import RLock
@@ -51,6 +52,7 @@ from .interfaces import (
     fsm_status_to_json,
 )
 from .fsm import InstructionParser
+from .competition_context import CompetitionContext
 from .recording_contracts import (
     ActionDispatchPairer,
     ActionPairingConfig,
@@ -153,6 +155,8 @@ class EpisodeMetadata:
     rosbag_exit_code: Optional[int] = None
     ended_at_ns: Optional[int] = None
     referee_messages: list[dict[str, Any]] = field(default_factory=list)
+    competition_context_count: int = 0
+    competition_context_index: list[dict[str, Any]] = field(default_factory=list)
     final_result: Optional[dict[str, Any]] = None
     topic_counts: dict[str, int] = field(default_factory=dict)
 
@@ -198,6 +202,7 @@ class EpisodeRecorder:
             else None
         )
         self._action_pairer: Optional[ActionDispatchPairer] = None
+        self._last_competition_context_key: Optional[tuple[str, Optional[int], int]] = None
 
     def check_root(self) -> Path:
         """检查并创建数据根目录。
@@ -250,13 +255,15 @@ class EpisodeRecorder:
         started_at_ns: int,
         boundary_policy: str,
         task: Optional[TaskSpec] = None,
+        *,
+        precreated_lifecycle_directory: bool = False,
     ) -> Path:
         """创建一个新的 Episode 目录并写入初始元数据。
 
-        参数：安全标识、开始纳秒、边界策略说明和可选任务。返回：Episode 目录；任务
-        位置单位米且沿用任务坐标系。失败：标识含危险字符、目录已存在、当前记录未结束
-        或目录不可写时抛出异常，绝不覆盖旧数据。初始metadata成功落盘后才算启动；
-        写失败时仅尝试删除本次创建的空目录，含任何内容的目录都会保留。
+        参数：安全标识、开始纳秒、边界策略说明和可选任务。生命周期管理器可通过仅限
+        关键字参数接管已经只含``ACTIVE``/``segment.json``的预创建目录；默认调用仍严格
+        拒绝已存在目录。返回兼容文件目录；任务位置单位米且沿用任务坐标系。失败时绝不
+        覆盖旧数据。初始metadata成功落盘后才算启动；仅清理本调用自行创建的空目录。
         """
 
         if self.metadata is not None:
@@ -269,12 +276,30 @@ class EpisodeRecorder:
             raise ValueError("boundary_policy必须是非空说明文本")
         root = self.check_root()
         episode_dir = _resolved_child(root, episode_id, "episode_id")
-        if episode_dir.exists():
-            raise FileExistsError(f"Episode 目录已存在，拒绝覆盖：{episode_dir}")
-        try:
-            episode_dir.mkdir()
-        except OSError as exc:
-            raise RuntimeError(f"无法创建 Episode 目录 {episode_dir}: {exc}") from exc
+        created_here = False
+        if precreated_lifecycle_directory:
+            if not episode_dir.is_dir():
+                raise FileNotFoundError(
+                    f"生命周期层预创建的segment目录不存在：{episode_dir}"
+                )
+            unexpected = sorted(
+                path.name
+                for path in episode_dir.iterdir()
+                if path.name not in {"ACTIVE", "segment.json"}
+            )
+            if unexpected:
+                raise RuntimeError(
+                    f"预创建segment目录包含非生命周期文件，拒绝覆盖："
+                    f"{episode_dir}，unexpected={unexpected}"
+                )
+        else:
+            if episode_dir.exists():
+                raise FileExistsError(f"Episode 目录已存在，拒绝覆盖：{episode_dir}")
+            try:
+                episode_dir.mkdir()
+                created_here = True
+            except OSError as exc:
+                raise RuntimeError(f"无法创建 Episode 目录 {episode_dir}: {exc}") from exc
         candidate = EpisodeMetadata(
             episode_id=episode_id,
             started_at_ns=started_at_ns,
@@ -288,10 +313,11 @@ class EpisodeRecorder:
         except Exception:
             # 只尝试删除本次刚创建且仍为空的目录；并发写入的任何内容都会使
             # rmdir失败并被保留，因此不会递归删除调用前已存在的用户数据。
-            try:
-                episode_dir.rmdir()
-            except OSError:
-                pass
+            if created_here:
+                try:
+                    episode_dir.rmdir()
+                except OSError:
+                    pass
             raise
         self.episode_dir = episode_dir
         self.metadata = candidate
@@ -300,6 +326,7 @@ class EpisodeRecorder:
             if self._action_pairing_config is not None
             else None
         )
+        self._last_competition_context_key = None
         return episode_dir
 
     def record_final_action(self, action: FinalAction) -> None:
@@ -630,6 +657,31 @@ class EpisodeRecorder:
         self._write_metadata(metadata)
         self.metadata = metadata
 
+    def record_competition_context(self, context: CompetitionContext) -> None:
+        """Append structured run/task/settled-attempt context without splitting rosbag."""
+
+        if not isinstance(context, CompetitionContext):
+            raise ValueError("context必须是CompetitionContext")
+        metadata = deepcopy(self._active_metadata())
+        key = (context.run_id, context.current_task_id, context.current_attempt_count)
+        sequence = metadata.competition_context_count
+        self._append_line(self._active_path("competition_contexts.jsonl"), context.to_json())
+        metadata.competition_context_count += 1
+        if key != self._last_competition_context_key:
+            metadata.competition_context_index.append({
+                "sequence": sequence,
+                "run_id": context.run_id,
+                "task_id": context.current_task_id,
+                "settled_attempt_count": context.current_attempt_count,
+                "referee_timestamp_ns": context.referee_timestamp_ns,
+                "context_valid": context.valid,
+                "failure_reason": context.failure_reason,
+            })
+        self._count("/team/competition_context", metadata)
+        self._write_metadata(metadata)
+        self.metadata = metadata
+        self._last_competition_context_key = key
+
     def mark_rosbag_started(self, output_path: str | Path) -> None:
         """在外部 rosbag 进程成功创建后更新 Episode 元数据。
 
@@ -736,13 +788,15 @@ class EpisodeRecorder:
         self,
         topics: Sequence[str],
         output_name: str = "rosbag",
+        qos_overrides_path: Optional[str | Path] = None,
     ) -> tuple[str, ...]:
         """生成但不执行 ``ros2 bag record`` 命令。
 
         参数：需要原样记录的话题列表和输出子目录名。返回：可交给 ``subprocess`` 的
         参数元组；消息保持自身单位/坐标系。失败：Episode 未开始、ros2 不在 PATH、话题
         为空、重复、像命令选项或输出名不安全时抛出异常；话题顺序保持不变。本方法不
-        执行命令，也不实现 ``rosbag2_py``。
+        执行命令，也不实现 ``rosbag2_py``。提供QoS文件时必须是绝对路径、安全的非空
+        普通文件；符号链接和依赖当前工作目录的相对路径均被拒绝。
         """
 
         episode_dir = self._active_directory().resolve()
@@ -754,7 +808,32 @@ class EpisodeRecorder:
             raise FileExistsError(f"rosbag 输出路径已存在，拒绝覆盖：{output}")
         if shutil.which("ros2") is None:
             raise RuntimeError("未找到 ros2 命令，无法启动 ros2 bag；请先 source ROS2 环境")
-        return ("ros2", "bag", "record", "-o", str(output), *validated_topics)
+        qos_arguments: tuple[str, ...] = ()
+        if qos_overrides_path is not None:
+            qos_path = Path(qos_overrides_path)
+            if not qos_path.is_absolute():
+                raise ValueError("rosbag QoS override路径必须是绝对路径")
+            try:
+                metadata = os.lstat(qos_path)
+                if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+                    raise ValueError("rosbag QoS override必须是非符号链接普通文件")
+                if metadata.st_size <= 0:
+                    raise ValueError("rosbag QoS override文件不能为空")
+                with qos_path.open("rb") as stream:
+                    if not stream.read(1):
+                        raise ValueError("rosbag QoS override文件不能为空")
+            except OSError as exc:
+                raise ValueError(f"rosbag QoS override文件不可读：{qos_path}: {exc}") from exc
+            qos_arguments = ("--qos-profile-overrides-path", str(qos_path))
+        return (
+            "ros2",
+            "bag",
+            "record",
+            "-o",
+            str(output),
+            *qos_arguments,
+            *validated_topics,
+        )
 
     @staticmethod
     def make_episode_id(prefix: str = "episode") -> str:

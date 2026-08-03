@@ -88,7 +88,6 @@ import json
 import math
 import os
 from pathlib import Path
-import signal
 import subprocess
 import time
 from types import SimpleNamespace
@@ -97,6 +96,7 @@ from typing import Any, Mapping, Optional
 from .action_mux import ActionMux, ActionMuxConfig
 from .controller_manifest import validate_controller_config
 from .arm_execution import ArmExecutionController
+from .competition_context import CompetitionContext, CompetitionRunCoordinator
 from .external_candidate import (
     ExternalCandidateConfig,
     ExternalCandidateConsumer,
@@ -133,8 +133,12 @@ from .interfaces import (
 from .navigation import Bounds3D, classify_slot_type
 from .perception_2d import Detection2DStabilizer, OfficialYoloAdapter
 from .perception_3d import CameraTransformProvider, Perception3DEstimator
-from .recorder import EpisodeRecorder
 from .recording_contracts import ActionPairingConfig
+from .recorder_runtime import (
+    RecorderRuntimeConfig,
+    RecorderRuntimeManager,
+    resolve_rosbag_qos_overrides_path,
+)
 
 
 class TimestampedCache:
@@ -801,8 +805,10 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             self._joint_cache = TimestampedCache()
             self._latest_estimates: tuple[ObjectEstimate3D, ...] = ()
             self._parsed_tasks: tuple[TaskSpec, ...] = ()
-            self._pending_task: Optional[TaskSpec] = None
-            self._warned_multiple_tasks = False
+            self._instruction_raw = ""
+            self._coordinator = CompetitionRunCoordinator()
+            self._active_context: Optional[CompetitionContext] = None
+            self._last_activated_context: Optional[CompetitionContext] = None
             self._local_io_ready = False
             self._system_ready_submitted = False
             self._last_control_warning = ""
@@ -862,7 +868,20 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 ros.String, action_dispatch_topic, 10
             )
             self._fsm_pub = self.create_publisher(ros.String, topics["fsm_status"], 10)
+            self._context_pub = self.create_publisher(
+                ros.String, topics["competition_context"], 10
+            )
             self.create_subscription(ros.String, topics["instruction"], self._on_instruction, 10)
+            self.create_subscription(
+                ros.String, topics["referee_taskinfo"], self._on_referee_taskinfo, 10
+            )
+            self.create_subscription(
+                ros.String, topics["referee_gameinfo"], self._on_referee_gameinfo, 10
+            )
+            self.create_subscription(
+                getattr(ros, "Int32", ros.String),
+                topics["referee_score"], self._on_referee_score, 10
+            )
             if _external_candidate_subscription_enabled(self._external_candidate_config):
                 self._external_candidate_subscription = self.create_subscription(
                     ros.String,
@@ -886,34 +905,94 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             now_ns = self.get_clock().now().nanoseconds
             try:
                 tasks = self._parser.parse(message.data, now_ns)
-                # 解析只回答“消息中有哪些任务”；选择回答“当前采用哪一个”，两者分开
-                # 才能在正式规则发布后替换策略而不改 InstructionParser。
                 self._parsed_tasks = tasks
-                selected_task = self._select_task(tasks)
-                # 每次合法广播都刷新 consumer 自己的指令活性时间；下面的 FSM 语义去重
-                # 保持原样，不会重复提交相同任务。
-                self._external_candidate.update_instruction(
-                    message.data, selected_task.task_id, now_ns
+                self._instruction_raw = message.data
+                changed = self._coordinator.update_tasks(tasks, now_ns)
+                if changed:
+                    self.get_logger().info("收到新的完整三任务集合，已创建新的本地run身份")
+                self._refresh_competition_context(
+                    now_ns, refresh_instruction_liveness=True
                 )
-                selected_fingerprint = self._task_semantic_fingerprint(selected_task)
-                if (
-                    self._fsm.task is not None
-                    and selected_fingerprint == self._task_semantic_fingerprint(self._fsm.task)
-                ):
-                    return
-                if (
-                    self._pending_task is not None
-                    and selected_fingerprint
-                    == self._task_semantic_fingerprint(self._pending_task)
-                ):
-                    return
-                # 周期广播只更新时间，不应把同一业务任务再次提交给FSM。不同任务仍
-                # 先缓存；是否以及何时激活新的任务，待官方确认。
-                self._pending_task = selected_task
-                if self._system_ready_submitted:
-                    self._submit_pending_task(now_ns)
             except ValueError as exc:
                 self.get_logger().error(f"任务解析失败：{exc}")
+
+        def _on_referee_taskinfo(self, message: Any) -> None:
+            now_ns = self.get_clock().now().nanoseconds
+            try:
+                self._coordinator.referee.update_taskinfo(message.data, now_ns)
+            except (AttributeError, TypeError, ValueError) as exc:
+                self.get_logger().error(f"裁判taskinfo解析失败：{exc}")
+            self._refresh_competition_context(now_ns)
+
+        def _on_referee_gameinfo(self, message: Any) -> None:
+            now_ns = self.get_clock().now().nanoseconds
+            try:
+                self._coordinator.referee.update_gameinfo(message.data, now_ns)
+            except (AttributeError, TypeError, ValueError) as exc:
+                self.get_logger().error(f"裁判gameinfo解析失败：{exc}")
+            self._refresh_competition_context(now_ns)
+
+        def _on_referee_score(self, message: Any) -> None:
+            now_ns = self.get_clock().now().nanoseconds
+            try:
+                self._coordinator.referee.update_score(message.data, now_ns)
+            except (AttributeError, TypeError, ValueError) as exc:
+                self.get_logger().error(f"裁判score解析失败：{exc}")
+            self._refresh_competition_context(now_ns)
+
+        def _refresh_competition_context(
+            self, now_ns: int, *, refresh_instruction_liveness: bool = False
+        ) -> None:
+            context = self._coordinator.context()
+            message = self._ros.String()
+            message.data = context.to_json()
+            self._context_pub.publish(message)
+            self._active_context = context
+            if not context.valid or context.finished or context.active_task is None:
+                return
+            active_instruction = json.dumps(
+                context.to_dict()["active_task"], ensure_ascii=False,
+                sort_keys=True, separators=(",", ":"), allow_nan=False,
+            )
+            if refresh_instruction_liveness:
+                self._external_candidate.update_instruction(
+                    active_instruction, context.current_task_id, now_ns
+                )
+            if not self._system_ready_submitted:
+                return
+            if not self._coordinator.active_task_changed(context):
+                return
+            previous = self._last_activated_context
+            same_run_and_task = (
+                previous is not None
+                and previous.run_id == context.run_id
+                and previous.current_task_id == context.current_task_id
+            )
+            if same_run_and_task:
+                self.get_logger().info(
+                    "attempt_transition: 官方attempt已结算，当前进入同一任务的下一次"
+                    f"局内尝试：{previous.current_attempt_count} -> "
+                    f"{context.current_attempt_count}。此操作只重建本地单任务FSM，"
+                    "不代表Server、机器人或物品复位。"
+                )
+            else:
+                old_id = None if previous is None else previous.current_task_id
+                self.get_logger().info(
+                    f"task_transition: 官方当前任务切换：{old_id} -> "
+                    f"{context.current_task_id}；仅重建本地单任务FSM，"
+                    "不代表Server、机器人或物品复位。"
+                )
+            # GlobalFSM is deliberately a one-task machine. Rebuilding it on
+            # an official task/attempt transition is a local software reset
+            # only; it never requests or claims a server, robot, or object reset.
+            self._fsm = GlobalFSM(max_pick_retries=int(self._config["fsm"]["max_pick_retries"]))
+            self._fsm.handle_event(FSMEvent.SYSTEM_READY, now_ns)
+            self._fsm.submit_task(context.active_task, now_ns)
+            self._last_activated_context = context
+            if not refresh_instruction_liveness:
+                self._external_candidate.update_instruction(
+                    active_instruction, context.current_task_id, now_ns
+                )
 
         def _on_external_candidate(self, message: Any) -> None:
             """Validate and reserve one candidate; never creates or publishes an action."""
@@ -948,32 +1027,6 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 task.failure_reason,
             )
 
-        def _select_task(self, tasks: tuple[TaskSpec, ...]) -> TaskSpec:
-            """选择当前提交给 FSM 的任务，同时保留完整解析结果。
-
-            单条任务直接采用；多条任务为兼容旧版本暂取第一条。正式选择、排序或是否
-            顺序执行仍待官方确认，不能在这里写死比赛规则。
-            """
-
-            if not tasks:
-                raise ValueError("任务选择不能接收空任务列表")
-            if len(tasks) > 1 and not self._warned_multiple_tasks:
-                self.get_logger().warning(
-                    f"收到 {len(tasks)} 条任务，当前兼容策略暂选第一条；完整解析结果已缓存，"
-                    "正式多任务语义待官方确认"
-                )
-                self._warned_multiple_tasks = True
-            # TODO(official-task-selection): 官方规则确认后只替换本函数，不默认顺序执行。
-            return tasks[0]
-
-        def _submit_pending_task(self, now_ns: int) -> None:
-            if not self._system_ready_submitted or self._pending_task is None:
-                return
-            if self._fsm.submit_task(self._pending_task, now_ns):
-                self._pending_task = None
-            else:
-                self.get_logger().warning("当前 FSM 阶段不接受已缓存任务，任务仍保留待诊断")
-
         def _check_readiness(
             self,
             now_ns: int,
@@ -999,7 +1052,7 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 return
             self._system_ready_submitted = True
             _log_input_issue_on_change(self, self._input_issues, "readiness", "")
-            self._submit_pending_task(now_ns)
+            self._refresh_competition_context(now_ns)
 
         def _on_odom(self, message: Any) -> None:
             try:
@@ -1470,7 +1523,11 @@ def _create_perception_node(ros: SimpleNamespace) -> type:
                     "perception.depth_unit_scale_m 必须是正的有限数；"
                     f"实际值={self._depth_unit_scale_m!r}"
                 )
-            self._camera_info: Optional[CameraIntrinsics] = None
+            # CameraInfo is static calibration in the official server: its
+            # header is empty/zero.  Cache only K and dimensions here; bind it
+            # to each synchronized image frame below instead of pretending the
+            # calibration message itself is a new sensor measurement.
+            self._camera_calibration_cache = StaticCameraCalibrationCache()
             self._last_frame_issue = ""
             self._input_issues: dict[str, str] = {}
             self._base_cache = TimestampedCache()
@@ -1516,27 +1573,9 @@ def _create_perception_node(ros: SimpleNamespace) -> type:
 
         def _on_camera_info(self, message: Any) -> None:
             try:
-                k = tuple(float(value) for value in message.k)
-                if len(k) != 9:
-                    raise ValueError(f"CameraInfo.K 必须有9项，实际为{len(k)}项")
-                if not all(math.isfinite(value) for value in k):
-                    raise ValueError("CameraInfo.K 包含 NaN 或 Inf")
-                if k[0] <= 0.0 or k[4] <= 0.0:
-                    raise ValueError("CameraInfo 的 fx 和 fy 必须大于0")
-                width = int(message.width)
-                height = int(message.height)
-                if width <= 0 or height <= 0:
-                    raise ValueError("CameraInfo 图像宽高必须大于0")
-                self._camera_info = CameraIntrinsics(
-                    k=k,
-                    width=width,
-                    height=height,
-                    frame_id=str(message.header.frame_id),
-                    timestamp_ns=_stamp_to_ns(message.header.stamp),
-                )
+                self._camera_calibration_cache.update(message)
                 _log_input_issue_on_change(self, self._input_issues, "camera_info", "")
             except (AttributeError, TypeError, ValueError) as exc:
-                self._camera_info = None
                 _log_input_issue_on_change(
                     self,
                     self._input_issues,
@@ -1588,7 +1627,7 @@ def _create_perception_node(ros: SimpleNamespace) -> type:
                 base = self._base_cache.nearest(timestamp_ns, self._state_max_delta_ns)
                 joints = self._joint_cache.nearest(timestamp_ns, self._state_max_delta_ns)
                 missing: list[str] = []
-                if self._camera_info is None:
+                if self._camera_calibration_cache.value is None:
                     missing.append("CameraInfo")
                 if base is None or not base.valid:
                     missing.append("邻近有效Odom")
@@ -1602,22 +1641,26 @@ def _create_perception_node(ros: SimpleNamespace) -> type:
                 rgb = RGBFrame(
                     image=self._bridge.imgmsg_to_cv2(rgb_message, desired_encoding="bgr8"),
                     encoding="bgr8",
-                    frame_id=str(rgb_message.header.frame_id),
+                    frame_id=normalize_ros_frame_id(rgb_message.header.frame_id),
                     timestamp_ns=timestamp_ns,
                 )
                 depth = DepthFrame(
                     image=self._bridge.imgmsg_to_cv2(depth_message, desired_encoding="passthrough"),
                     unit_scale_m=self._depth_unit_scale_m,
-                    frame_id=str(depth_message.header.frame_id),
+                    frame_id=normalize_ros_frame_id(depth_message.header.frame_id),
                     timestamp_ns=_stamp_to_ns(depth_message.header.stamp),
                 )
+                assert self._camera_calibration_cache.value is not None
+                intrinsics = bind_static_camera_calibration(
+                    self._camera_calibration_cache.value, rgb_message, depth_message
+                )
                 detections = self._stabilizer.update(
-                    self._yolo.detect(rgb, depth, self._camera_info),
+                    self._yolo.detect(rgb, depth, intrinsics),
                     frame_timestamp_ns=rgb.timestamp_ns,
                     frame_id=rgb.frame_id,
                 )
                 estimates = self._estimator.estimate(
-                    detections, depth, self._camera_info, base, joints
+                    detections, depth, intrinsics, base, joints
                 )
                 self._publisher.publish(
                     _estimates_to_vision(estimates, self._ros, rgb_message.header.stamp)
@@ -1685,32 +1728,52 @@ def _create_recorder_node(ros: SimpleNamespace) -> type:
                 )
             except ValueError as exc:
                 raise RuntimeError(f"Recorder action pairing配置无效：{exc}") from exc
-            self._recorder = EpisodeRecorder(
-                recorder_config["root_dir"], pairing_config
+            bag_shutdown = recorder_config["bag_shutdown"]
+            control = _validated_control_config(config)
+            config_path = _resolve_config_path()
+            record_rosbag = recorder_config.get("record_rosbag", True)
+            qos_overrides_path: Optional[Path] = None
+            if record_rosbag is True:
+                rosbag_config = recorder_config.get("rosbag")
+                if not isinstance(rosbag_config, Mapping):
+                    raise RuntimeError("record_rosbag=true时recorder.rosbag配置必须是映射")
+                qos_overrides_path = resolve_rosbag_qos_overrides_path(
+                    config_path,
+                    rosbag_config.get("qos_overrides_path"),
+                )
+            runtime_config = RecorderRuntimeConfig(
+                root_dir=Path(recorder_config["root_dir"]),
+                record_rosbag=record_rosbag,
+                rosbag_topics=tuple(
+                    str(topic) for topic in recorder_config["rosbag_topics"]
+                ),
+                recovery_scan_enabled=recorder_config["recovery_scan_enabled"],
+                bag_sigint_timeout_sec=bag_shutdown["sigint_timeout_sec"],
+                bag_terminate_timeout_sec=bag_shutdown["terminate_timeout_sec"],
+                bag_kill_timeout_sec=bag_shutdown["kill_timeout_sec"],
+                bag_startup_timeout_sec=bag_shutdown.get(
+                    "startup_timeout_sec", 10.0
+                ),
+                bag_startup_poll_interval_sec=bag_shutdown.get(
+                    "startup_poll_interval_sec", 0.02
+                ),
+                observe_only=control["observe_only"],
+                official_publish_enabled=_official_publish_enabled(control),
+                rosbag_qos_overrides_path=qos_overrides_path,
+                config_path=config_path,
             )
-            self._rosbag_process: Optional[Any] = None
-            self._rosbag_failure = ""
+            self._runtime = RecorderRuntimeManager(
+                runtime_config,
+                pairing_config,
+                process_factory=subprocess.Popen,
+            )
             self._pairing_timer: Optional[Any] = None
-            self._destroyed = False
+            self._parent_destroyed = False
+            self._runtime_closed = False
             now_ns = self.get_clock().now().nanoseconds
-            episode_id = EpisodeRecorder.make_episode_id(recorder_config["episode_prefix"])
-            self._recorder.start(
-                episode_id,
-                now_ns,
-                "临时边界：recorder 节点启动到停止；正式 Episode 边界待赛事方确认",
-            )
             try:
-                if bool(recorder_config.get("record_rosbag", True)):
-                    command = self._recorder.build_rosbag_command(
-                        tuple(str(topic) for topic in recorder_config["rosbag_topics"])
-                    )
-                    self._rosbag_process = subprocess.Popen(command)
-                    self._recorder.mark_rosbag_started(command[4])
-                    exit_code = self._rosbag_process.poll()
-                    if exit_code is not None:
-                        self._recorder.mark_rosbag_finished(exit_code)
-                        self._rosbag_process = None
-                        raise RuntimeError(f"ros2 bag record 启动后立即退出，退出码={exit_code}")
+                self._runtime.start(now_ns)
+                if runtime_config.record_rosbag:
                     self.create_timer(1.0, self._monitor_rosbag)
                 self.create_subscription(ros.String, topics["final_action"], self._on_action, 50)
                 if pairing_config.enabled:
@@ -1730,43 +1793,44 @@ def _create_recorder_node(ros: SimpleNamespace) -> type:
                 )
                 self.create_subscription(
                     ros.String,
-                    "/referee/taskinfo",
-                    lambda message: self._on_referee_text("/referee/taskinfo", message),
+                    topics["competition_context"],
+                    self._on_competition_context,
                     10,
                 )
                 self.create_subscription(
                     ros.String,
-                    "/referee/gameinfo",
-                    lambda message: self._on_referee_text("/referee/gameinfo", message),
+                    topics["referee_taskinfo"],
+                    lambda message: self._on_referee_text(topics["referee_taskinfo"], message),
                     10,
                 )
                 self.create_subscription(
-                    ros.Int32, "/referee/score", self._on_referee_score, 10
+                    ros.String,
+                    topics["referee_gameinfo"],
+                    lambda message: self._on_referee_text(topics["referee_gameinfo"], message),
+                    10,
+                )
+                self.create_subscription(
+                    ros.Int32, topics["referee_score"], self._on_referee_score, 10
                 )
             except Exception as exc:  # noqa: BLE001 - 初始化失败必须回滚后原样上抛
-                # bag 已启动后若 Timer 或订阅创建失败，必须先停止子进程并结束元数据，
-                # 避免留下无人管理的录制进程或看似仍在进行的 Episode。
                 cleanup_errors: list[str] = []
+                if self._pairing_timer is not None:
+                    self._pairing_timer.cancel()
+                    self._pairing_timer = None
                 try:
-                    self._stop_pairing_timer_and_close()
+                    self._runtime.close(
+                        self.get_clock().now().nanoseconds,
+                        reason="node_initialization_failed",
+                    )
                 except Exception as cleanup_exc:  # noqa: BLE001 - 汇总到初始化错误
-                    cleanup_errors.append(f"关闭 action pairing 失败：{cleanup_exc}")
-                try:
-                    self._stop_rosbag()
-                except Exception as cleanup_exc:  # noqa: BLE001 - 汇总到初始化错误
-                    cleanup_errors.append(f"停止 rosbag 失败：{cleanup_exc}")
-                try:
-                    if self._recorder.metadata is not None:
-                        self._recorder.finish(self.get_clock().now().nanoseconds)
-                except Exception as cleanup_exc:  # noqa: BLE001 - 汇总到初始化错误
-                    cleanup_errors.append(f"结束 Episode 失败：{cleanup_exc}")
+                    cleanup_errors.append(f"关闭Recorder runtime失败：{cleanup_exc}")
                 details = f"；回滚问题={'；'.join(cleanup_errors)}" if cleanup_errors else ""
                 raise RuntimeError(f"Recorder 初始化失败：{exc}{details}") from exc
 
         def _on_action(self, message: Any) -> None:
             try:
-                if self._recorder.action_pairing_enabled:
-                    issue_types = self._recorder.ingest_final_action_payload(
+                if self._runtime.action_pairing_enabled:
+                    issue_types = self._runtime.record_final_action_payload(
                         message.data,
                         self.get_clock().now().nanoseconds,
                         time.monotonic_ns(),
@@ -1776,13 +1840,15 @@ def _create_recorder_node(ros: SimpleNamespace) -> type:
                             f"FinalAction pairing诊断：{','.join(issue_types)}"
                         )
                 else:
-                    self._recorder.record_final_action(final_action_from_json(message.data))
+                    self._runtime.record_final_action(
+                        final_action_from_json(message.data)
+                    )
             except (ValueError, RuntimeError) as exc:
                 self.get_logger().error(f"记录 FinalAction 失败：{exc}")
 
         def _on_action_dispatch(self, message: Any) -> None:
             try:
-                issue_types = self._recorder.ingest_action_dispatch_payload(
+                issue_types = self._runtime.record_action_dispatch_payload(
                     message.data,
                     self.get_clock().now().nanoseconds,
                     time.monotonic_ns(),
@@ -1796,7 +1862,7 @@ def _create_recorder_node(ros: SimpleNamespace) -> type:
 
         def _prune_action_pairs(self) -> None:
             try:
-                issue_types = self._recorder.prune_action_pairs(
+                issue_types = self._runtime.prune_action_pairs(
                     self.get_clock().now().nanoseconds,
                     time.monotonic_ns(),
                 )
@@ -1807,45 +1873,51 @@ def _create_recorder_node(ros: SimpleNamespace) -> type:
             except RuntimeError as exc:
                 self.get_logger().error(f"Action pairing定时清理失败：{exc}")
 
-        def _stop_pairing_timer_and_close(self) -> None:
+        def _stop_pairing_timer(self) -> None:
             if self._pairing_timer is not None:
                 self._pairing_timer.cancel()
                 self._pairing_timer = None
-            self._recorder.close_action_pairing(
-                self.get_clock().now().nanoseconds,
-                time.monotonic_ns(),
-            )
 
         def _on_fsm(self, message: Any) -> None:
             try:
-                self._recorder.record_fsm_status(fsm_status_from_json(message.data))
+                self._runtime.record_fsm_status(fsm_status_from_json(message.data))
             except (ValueError, RuntimeError) as exc:
                 self.get_logger().error(f"记录 FSM 失败：{exc}")
 
         def _on_instruction(self, message: Any) -> None:
             try:
-                task = self._recorder.record_instruction(
+                task = self._runtime.record_instruction(
                     message.data,
                     self.get_clock().now().nanoseconds,
                     self._parser,
                 )
                 if task is None:
-                    reason = self._recorder.metadata.instruction_parse_failure
+                    reason = self._runtime.metadata.instruction_parse_failure
                     self.get_logger().warning(f"任务原文已保存，但解析失败：{reason}")
             except RuntimeError as exc:
                 self.get_logger().error(f"记录任务指令失败：{exc}")
 
         def _on_referee_text(self, topic: str, message: Any) -> None:
             try:
-                self._recorder.record_referee_message(
+                self._runtime.record_referee_message(
                     topic, message.data, self.get_clock().now().nanoseconds
                 )
             except (ValueError, RuntimeError) as exc:
                 self.get_logger().error(f"记录裁判元数据失败：{exc}")
 
+        def _on_competition_context(self, message: Any) -> None:
+            try:
+                self._runtime.record_competition_context_payload(
+                    message.data,
+                    self.get_clock().now().nanoseconds,
+                    time.monotonic_ns(),
+                )
+            except (ValueError, RuntimeError) as exc:
+                self.get_logger().error(f"记录CompetitionContext失败：{exc}")
+
         def _on_referee_score(self, message: Any) -> None:
             try:
-                self._recorder.record_referee_message(
+                self._runtime.record_referee_message(
                     "/referee/score",
                     int(message.data),
                     self.get_clock().now().nanoseconds,
@@ -1854,68 +1926,39 @@ def _create_recorder_node(ros: SimpleNamespace) -> type:
                 self.get_logger().error(f"记录裁判分数失败：{exc}")
 
         def _monitor_rosbag(self) -> None:
-            if self._rosbag_process is None:
-                return
-            exit_code = self._rosbag_process.poll()
-            if exit_code is None:
-                return
-            self._recorder.mark_rosbag_finished(exit_code)
-            self._rosbag_process = None
-            self._rosbag_failure = f"ros2 bag record 在节点运行期间提前退出，退出码={exit_code}"
-            self.get_logger().error(self._rosbag_failure)
-
-        def _stop_rosbag(self) -> None:
-            if self._rosbag_process is None:
-                if self._rosbag_failure:
-                    raise RuntimeError(self._rosbag_failure)
-                return
-            process = self._rosbag_process
-            exit_code = process.poll()
-            if exit_code is None:
-                process.send_signal(signal.SIGINT)
-                try:
-                    exit_code = process.wait(timeout=30.0)
-                except subprocess.TimeoutExpired as exc:
-                    process.terminate()
-                    exit_code = process.wait(timeout=5.0)
-                    self._recorder.mark_rosbag_finished(exit_code)
-                    self._rosbag_process = None
-                    raise RuntimeError(
-                        f"ros2 bag record 收到 SIGINT 后 30 秒未正常结束，终止退出码={exit_code}"
-                    ) from exc
-            self._recorder.mark_rosbag_finished(int(exit_code))
-            self._rosbag_process = None
-            if exit_code != 0:
-                raise RuntimeError(f"ros2 bag record 非正常退出，退出码={exit_code}")
+            try:
+                failure = self._runtime.monitor_bag(
+                    self.get_clock().now().nanoseconds
+                )
+                if failure:
+                    self.get_logger().error(failure)
+            except (ValueError, RuntimeError) as exc:
+                self.get_logger().error(f"监控rosbag失败：{exc}")
 
         def destroy_node(self) -> Any:
-            """正常停止 rosbag、结束临时 Episode 并销毁 ROS2 节点。
+            """幂等关闭当前Recorder Segment与rosbag并销毁ROS2节点。
 
-            参数：无。返回父类销毁结果；先向 bag 进程发送 SIGINT 并等待，时间单位
-            纳秒，空间坐标系不适用。bag 或元数据收尾失败仍会调用父类销毁，随后抛出
-            ``RuntimeError``；正式 Episode 边界仍待赛事方确认。
+            参数：无。返回父类销毁结果；bag按SIGINT、terminate、kill三级有界停止。
+            bag或落盘收尾失败仍调用父类销毁，随后抛出``RuntimeError``。Segment不是
+            官方Attempt或Training Episode，关闭也不会改变控制状态或发布开关。
             """
 
-            if self._destroyed and self._recorder.metadata is None:
+            if self._runtime_closed and self._parent_destroyed:
                 return None
-            already_destroyed = self._destroyed
-            self._destroyed = True
             errors: list[str] = []
-            try:
-                # 必须先停止独立 prune timer，避免与 orphan/文件关闭路径并发。
-                self._stop_pairing_timer_and_close()
-            except Exception as exc:  # noqa: BLE001 - 仍需停止bag并销毁节点
-                errors.append(f"关闭 action pairing 失败：{exc}")
-            try:
-                self._stop_rosbag()
-            except Exception as exc:  # noqa: BLE001 - 仍需完成元数据并销毁节点
-                errors.append(str(exc))
-            try:
-                if self._recorder.metadata is not None:
-                    self._recorder.finish(self.get_clock().now().nanoseconds)
-            except Exception as exc:  # noqa: BLE001 - 销毁后仍要报告元数据错误
-                errors.append(f"结束 Episode 失败：{exc}")
-            result = None if already_destroyed else super().destroy_node()
+            if not self._runtime_closed:
+                try:
+                    self._stop_pairing_timer()
+                    self._runtime.close(self.get_clock().now().nanoseconds)
+                    self._runtime_closed = True
+                except Exception as exc:  # noqa: BLE001 - 允许后续调用重试收尾
+                    errors.append(f"关闭Recorder runtime失败：{exc}")
+            result = None
+            if not self._parent_destroyed:
+                # 即使runtime收尾失败，父ROS节点也只销毁一次；标志先置位避免父类
+                # 内部异常导致后续调用重复执行非幂等ROS销毁。
+                self._parent_destroyed = True
+                result = super().destroy_node()
             if errors:
                 raise RuntimeError("；".join(errors))
             return result
@@ -2232,6 +2275,86 @@ def _set_stamp(stamp: Any, timestamp_ns: int) -> None:
     stamp.nanosec = timestamp_ns % 1_000_000_000
 
 
+def normalize_ros_frame_id(value: object) -> str:
+    """Remove only legacy leading slashes from a ROS frame identifier."""
+
+    if not isinstance(value, str):
+        raise ValueError("frame_id必须是字符串")
+    normalized = value.lstrip("/")
+    if not normalized:
+        raise ValueError("frame_id规范化后不能为空")
+    return normalized
+
+
+def static_camera_calibration_from_message(
+    message: Any,
+) -> tuple[tuple[float, ...], int, int]:
+    """Validate and extract only static K/width/height from CameraInfo."""
+
+    k = tuple(float(value) for value in message.k)
+    if len(k) != 9:
+        raise ValueError(f"CameraInfo.K 必须有9项，实际为{len(k)}项")
+    if not all(math.isfinite(value) for value in k):
+        raise ValueError("CameraInfo.K 包含 NaN 或 Inf")
+    if k[0] <= 0.0 or k[4] <= 0.0:
+        raise ValueError("CameraInfo 的 fx 和 fy 必须大于0")
+    width, height = int(message.width), int(message.height)
+    if width <= 0 or height <= 0:
+        raise ValueError("CameraInfo 图像宽高必须大于0")
+    return k, width, height
+
+
+def bind_static_camera_calibration(
+    calibration: tuple[tuple[float, ...], int, int],
+    rgb_message: Any,
+    depth_message: Any,
+) -> CameraIntrinsics:
+    """Bind static calibration to the current synchronized image context."""
+
+    k, width, height = calibration
+    rgb_frame = normalize_ros_frame_id(rgb_message.header.frame_id)
+    depth_frame = normalize_ros_frame_id(depth_message.header.frame_id)
+    if rgb_frame != depth_frame:
+        raise ValueError(f"RGB/Depth frame冲突：{rgb_frame!r} != {depth_frame!r}")
+    for label, message in (("RGB", rgb_message), ("Depth", depth_message)):
+        if int(message.width) != width or int(message.height) != height:
+            raise ValueError(
+                f"{label}尺寸与CameraInfo不一致：{message.width}x{message.height} != {width}x{height}"
+            )
+    return CameraIntrinsics(
+        k=k, width=width, height=height, frame_id=rgb_frame,
+        timestamp_ns=_stamp_to_ns(rgb_message.header.stamp),
+    )
+
+
+class StaticCameraCalibrationCache:
+    """Latch runtime CameraInfo changes invalid until node restart."""
+
+    def __init__(self) -> None:
+        self._value: Optional[tuple[tuple[float, ...], int, int]] = None
+        self._rejected = False
+
+    @property
+    def value(self) -> Optional[tuple[tuple[float, ...], int, int]]:
+        return self._value
+
+    def update(self, message: Any) -> tuple[tuple[float, ...], int, int]:
+        try:
+            calibration = static_camera_calibration_from_message(message)
+        except (AttributeError, TypeError, ValueError):
+            self._value = None
+            self._rejected = True
+            raise
+        if self._value is not None and calibration != self._value:
+            self._value = None
+            self._rejected = True
+            raise ValueError("CameraInfo K或图像尺寸运行中突变，已清空标定并fail-closed")
+        if self._rejected:
+            raise ValueError("CameraInfo标定已因运行中突变锁定为无效")
+        self._value = calibration
+        return calibration
+
+
 def _base_state_from_odom(message: Any) -> BaseState:
     try:
         pose = message.pose.pose
@@ -2276,7 +2399,7 @@ def _base_state_from_odom(message: Any) -> BaseState:
         yaw=yaw,
         linear_velocity_xyz=linear_velocity,
         angular_velocity_xyz=angular_velocity,
-        frame_id=str(message.header.frame_id),
+        frame_id=normalize_ros_frame_id(message.header.frame_id),
         timestamp_ns=timestamp_ns,
     )
 

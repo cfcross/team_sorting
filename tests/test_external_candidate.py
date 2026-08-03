@@ -374,9 +374,13 @@ def test_instruction_time_is_independently_checked(received_ns: int, reason: str
 
 def test_repeated_instruction_refreshes_liveness_without_identity_change() -> None:
     consumer = _consumer()
+    assert _accept(consumer).accepted
     identity = consumer.current_task_identity
+    generation = consumer.bound_generation
     assert not consumer.update_instruction(RAW_INSTRUCTION, 1, NOW)
     assert consumer.current_task_identity == identity
+    assert consumer.bound_generation == generation
+    assert consumer.pending
     assert consumer.instruction_received_ns == NOW
 
 
@@ -453,6 +457,7 @@ def test_watchdog_clears_expired_pending() -> None:
     decision = consumer.watchdog(NOW + 100_000_000)
     assert decision.failure_reason == "candidate_expired"
     assert not consumer.pending
+    assert consumer.watchdog(NOW + 100_000_001) is None
 
 
 def test_publisher_timeout_clears_without_replay() -> None:
@@ -460,7 +465,78 @@ def test_publisher_timeout_clears_without_replay() -> None:
     assert _accept(consumer, valid_until_ns=NOW + 1_000_000_000).accepted
     decision = consumer.watchdog(NOW + 300_000_001)
     assert decision.failure_reason == "candidate_publisher_timeout"
+    assert consumer.watchdog(NOW + 300_000_002) is None
     assert _take(consumer, now_ns=NOW + 300_000_001).command is None
+
+
+def test_disabled_watchdog_never_reports_or_clears() -> None:
+    consumer = ExternalCandidateConsumer(_config(enabled=False))
+    consumer.update_instruction(RAW_INSTRUCTION, 1, NOW - 2_000_000_000)
+
+    assert consumer.watchdog(NOW) is None
+    assert consumer.watchdog(NOW + 10_000_000_000) is None
+
+
+def test_instruction_stale_is_latched_until_valid_instruction_refresh() -> None:
+    consumer = _consumer()
+    first_stale_ns = NOW + 1_500_000_000
+
+    first = consumer.watchdog(first_stale_ns)
+    assert first is not None
+    assert first.failure_reason == "instruction_stale"
+    assert consumer.watchdog(first_stale_ns + 1) is None
+    assert consumer.watchdog(first_stale_ns + 50_000_000) is None
+
+    refreshed_ns = first_stale_ns + 100_000_000
+    assert not consumer.update_instruction(RAW_INSTRUCTION, 1, refreshed_ns)
+    assert consumer.watchdog(refreshed_ns + 1_500_000_000) is None
+    stale_again = consumer.watchdog(refreshed_ns + 1_500_000_001)
+    assert stale_again is not None
+    assert stale_again.failure_reason == "instruction_stale"
+
+
+def test_watchdog_reports_each_new_failure_reason_once() -> None:
+    consumer = _consumer()
+    assert _accept(consumer).accepted
+
+    expired = consumer.watchdog(NOW + 100_000_000)
+    assert expired is not None
+    assert expired.failure_reason == "candidate_expired"
+    stale = consumer.watchdog(NOW + 1_500_000_000)
+    assert stale is not None
+    assert stale.failure_reason == "instruction_stale"
+    assert consumer.watchdog(NOW + 1_500_000_001) is None
+
+
+@pytest.mark.parametrize(
+    ("failure_reason", "first_fault_ns", "candidate_ttl_ms", "second_fault_offset_ns"),
+    [
+        ("candidate_expired", NOW + 250_000_000, 250.0, 250_000_000),
+        ("candidate_publisher_timeout", NOW + 300_000_001, 1000.0, 300_000_001),
+    ],
+)
+def test_new_valid_candidate_rearms_matching_watchdog_failure(
+    failure_reason: str,
+    first_fault_ns: int,
+    candidate_ttl_ms: float,
+    second_fault_offset_ns: int,
+) -> None:
+    consumer = _consumer(
+        _config(candidate_ttl_ms=candidate_ttl_ms, watchdog_timeout_ms=300.0)
+    )
+    assert _accept(consumer, valid_until_ns=NOW + 1_000_000_000).accepted
+    first = consumer.watchdog(first_fault_ns)
+    assert first is not None and first.failure_reason == failure_reason
+
+    received_ns = first_fault_ns + 1
+    candidate = _raw(
+        request_id="request-2",
+        timestamp_ns=received_ns - 1,
+        valid_until_ns=received_ns + 1_000_000_000,
+    )
+    assert consumer.receive(candidate, received_ns).accepted
+    second = consumer.watchdog(received_ns + second_fault_offset_ns)
+    assert second is not None and second.failure_reason == failure_reason
 
 
 def test_shutdown_clears_pending_and_rejects_future_input() -> None:
