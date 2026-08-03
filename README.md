@@ -19,8 +19,16 @@
 B3数据、TF/QoS、raw/derived边界、采集profile和训练资格的独立机器契约见
 [`config/contracts/data_tf_policy_v1.json`](config/contracts/data_tf_policy_v1.json)，中文投影见
 [`docs/data_tf_policy_v1.md`](docs/data_tf_policy_v1.md)。B3B第一步已把`/tf`和`/tf_static`
-加入raw rosbag，并使用安装资源中的显式QoS override；压缩、降频、Indexer/QC和训练样本
-生成仍未实现。
+加入raw rosbag，并使用安装资源中的显式QoS override；压缩、降频和训练样本生成仍未实现，
+只读Indexer/QC见下一节。
+
+### Stage 2.3 Dataset Index/QC v1
+
+B3C core的机器契约、只读Indexer和基础QC入口分别见
+[`config/contracts/dataset_index_v1.json`](config/contracts/dataset_index_v1.json)、
+[`docs/dataset_index_v1.md`](docs/dataset_index_v1.md)和`team_sorting_dataset_index`。
+当前只生成四类derived索引/QC输出；不修改raw，不生成sample或训练manifest，formal BC资格
+在feedback时间窗实现前不会被判为`eligible`。
 
 ### Stage 2A External Candidate Consumer
 

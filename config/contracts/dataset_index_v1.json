@@ -1,0 +1,127 @@
+{
+  "schema_name": "team_sorting.dataset_index",
+  "schema_version": 1,
+  "contract_id": "dataset_index_v1",
+  "implementation_status": "implemented_b3c_core",
+  "dependency_contracts": {
+    "interface": {"path": "config/contracts/interface_v1.json", "schema_name": "team_sorting.interface", "schema_version": 1, "frozen_sha256": "a86548b2a43581af70b8d585d523a06bb97a8d96e1fe52950097b12d061fdaea"},
+    "recorder": {"path": "config/contracts/recorder_schema_v1.json", "schema_name": "team_sorting.recorder", "schema_version": 1, "frozen_sha256": "e7965c34a38c11d551d9943d8d614c05bc8e28e186432ad5ff4d0eed243225cf"},
+    "data_tf_policy": {"path": "config/contracts/data_tf_policy_v1.json", "schema_name": "team_sorting.data_tf_policy", "schema_version": 1, "frozen_sha256": "982934579d816d67c63c1ff8938ea49c54982cf7d75472a58c00fe6a9cefae80"}
+  },
+  "layout": {
+    "derived_root": "derived/indexer_v1/<deterministic_build_id>",
+    "implemented_outputs": ["index_build.json", "dataset_index.jsonl", "segment_qc.json", "run_qc.json"],
+    "prohibited_outputs": ["sample_index.jsonl", "training_manifest.jsonl"]
+  },
+  "raw_policy": {
+    "immutable": true,
+    "exclude_derived_from_sources": true,
+    "source_paths_repo_relative": true,
+    "absolute_source_paths_forbidden": true,
+    "source_symlinks_forbidden": true,
+    "automatic_repair": false,
+    "marker_mutation": false
+  },
+  "build_identity": {
+    "hash_algorithm": "sha256",
+    "canonical_encoding": "utf-8 canonical JSON sorted keys compact separators",
+    "inputs": ["schema_name", "schema_version", "indexer_name", "indexer_version", "implementation_identity", "qc_config_sha256", "source_artifact_relative_paths_and_sha256", "dependency_contract_sha256"],
+    "excluded": ["generated_at_utc", "host_absolute_path", "username", "temporary_directory", "derived_outputs"]
+  },
+  "provenance_fields": ["source_relative_path", "source_sha256", "indexer_name", "indexer_version", "implementation_identity", "qc_config_sha256", "deterministic_build_id"],
+  "finding_contract": {
+    "fields": ["code", "severity", "evaluation_status", "artifact", "relative_path", "message", "evidence", "blocking_use_cases"],
+    "severity": ["fatal", "error", "warning", "info"],
+    "evaluation_status": ["pass", "fail", "not_applicable", "not_evaluated"],
+    "not_evaluated_is_pass": false,
+    "fail_blocking_use_cases_mandatory": true,
+    "blocking_scopes": ["segment", "run"],
+    "not_evaluated_auto_blocks": false
+  },
+  "qc": {
+    "finding_codes": ["active_marker_remaining", "complete_marker_missing", "marker_invalid", "marker_identity_mismatch", "bag_path_invalid", "rosbag_metadata_missing", "rosbag_metadata_empty", "rosbag_metadata_invalid", "rosbag_exit_nonzero", "segment_manifest_invalid", "segment_identity_mismatch", "segment_sequence_invalid", "unexpected_symlink", "source_path_escape", "recovery_finding_present", "recovery_required_by_manifest", "json_invalid", "jsonl_midstream_corruption", "sqlite_integrity_failed", "required_topic_missing", "topic_type_mismatch", "metadata_sqlite_count_mismatch", "timestamp_regression", "message_timestamp_span_invalid", "empty_required_topic", "competition_context_missing", "competition_context_invalid", "run_id_mixed", "segment_context_identity_mismatch", "camera_info_missing", "tf_dynamic_missing", "tf_static_required_edge_missing", "observe_only_not_formal_bc", "selected_action_missing", "selected_action_invalid", "dispatched_action_missing", "action_dispatch_invalid", "selected_dispatched_mismatch", "execution_feedback_missing", "run_manifest_missing", "run_manifest_invalid", "run_identity_mismatch", "run_manifest_segment_missing", "run_manifest_unlisted_segment", "run_manifest_segment_order_mismatch", "segment_parent_run_id_mismatch", "task_set_fingerprint_mismatch", "run_end_incomplete", "duplicate_segment_id", "tf_graph_disconnected", "rgb_depth_alignment_failed", "joint_state_dimension_invalid", "odom_frame_invalid"],
+    "always_not_evaluated": ["tf_static_required_edge_missing", "tf_graph_disconnected", "rgb_depth_alignment_failed", "joint_state_dimension_invalid", "odom_frame_invalid", "selected_dispatched_mismatch", "execution_feedback_missing"]
+  },
+  "action_contract": {
+    "file_or_object_presence_is_valid_record": false,
+    "final_action_parser": "strict_final_action_from_json",
+    "action_dispatch_parser": "strict_action_dispatch_from_json",
+    "invalid_record_always_finding": true,
+    "summary_fields": ["selected_action_record_count", "selected_action_valid_record_count", "selected_action_invalid_record_count", "selected_action_record_present", "selected_action_present", "action_dispatch_record_count", "action_dispatch_valid_record_count", "action_dispatch_invalid_record_count", "action_dispatch_record_present", "publish_attempted_record_count", "exact_payload_record_count", "exact_dispatched_action_present", "publisher_call_succeeded_record_count", "dispatched_action_present", "execution_feedback_evaluation"],
+    "formal_bc_candidate_requirements": ["observe_only_false", "publish_attempted_true", "attempted_groups_nonempty", "dispatched_mask_any_true", "dispatched_action_any_nonnull", "publisher_call_succeeded_true"],
+    "publisher_call_succeeded_is_execution_confirmation": false
+  },
+  "eligibility": {
+    "use_cases": ["diagnostic", "perception", "formal_bc"],
+    "values": ["eligible", "conditionally_eligible", "ineligible"],
+    "formal_bc_eligible_in_v1": false,
+    "observe_only_formal_bc": "ineligible",
+    "missing_dispatch_formal_bc": "ineligible",
+    "feedback_not_evaluated_ceiling": "conditionally_eligible",
+    "tf_dynamic_missing_perception": "conditionally_eligible",
+    "tf_dynamic_missing_blocks": ["formal_bc"]
+  },
+  "safety": {
+    "dataset_root_symlink_allowed": false,
+    "source_symlink_allowed": false,
+    "path_traversal_allowed": false,
+    "sqlite_uri": "mode=ro&immutable=1",
+    "sqlite_query_only": true,
+    "sqlite_attach_allowed": false,
+    "sqlite_extension_loading_allowed": false,
+    "size_limits_bytes": {"json": 67108864, "jsonl": 268435456, "yaml": 16777216, "sqlite": 68719476736}
+  },
+  "publication": {
+    "temporary_directory_same_parent": true,
+    "fsync_before_publish": true,
+    "atomic_directory_publish": true,
+    "identical_existing_build": "reuse",
+    "different_existing_build": "fail_closed",
+    "overwrite_existing": false,
+    "post_publish_raw_change_new_build": "safe_remove_then_fail",
+    "failure_may_remove_reused_build": false,
+    "existing_build_exact_files": ["index_build.json", "dataset_index.jsonl", "segment_qc.json", "run_qc.json"],
+    "existing_extra_entry_policy": "fail_closed_preserve_existing",
+    "existing_manifest_revalidated_against_current_material": true,
+    "pre_rename_failure_cleanup": "temporary_only",
+    "post_rename_failure_cleanup": "newly_published_final_only",
+    "cleanup_failure_preserves_primary_error": true
+  },
+  "recovery_integrity": {
+    "strict_json_required": true,
+    "symlink_allowed": false,
+    "invalid_artifact_policy": "fail_closed",
+    "silent_ignore_allowed": false,
+    "association_fields": ["source_segment_path", "source_parent_run_id"],
+    "unsafe_or_missing_segment_reference_policy": "fail_closed"
+  },
+  "source_validation": {
+    "segment_manifest_schema": "recorder_segment_schema",
+    "run_manifest_schema": "run_manifest_schema",
+    "schema_descriptors_are_authoritative": true,
+    "marker_identity_strict": true,
+    "manifest_bag_path_authoritative": true,
+    "metadata_semantic_validation_required": true,
+    "run_segment_list_exact": true,
+    "recovery_required_blocks": ["perception", "formal_bc"]
+  },
+  "topic_requirements": {
+    "perception_required": ["/head_camera/color/image_raw", "/head_camera/aligned_depth_to_color/image_raw", "/head_camera/color/camera_info", "/joint_states", "/slamware_ros_sdk_server_node/odom", "/team/competition_context"],
+    "perception_conditional": ["/tf"],
+    "non_perception_topics": ["/material/instruction", "/referee/taskinfo", "/referee/gameinfo", "/referee/score", "/team/object_estimates", "/team/fsm_status", "/team/final_action"],
+    "action_dispatch_jsonl_authoritative": true
+  },
+  "qc_config": {
+    "fields": ["required_topics", "required_static_edges"],
+    "required_topics_known_policy_topics_only": true,
+    "required_topics_unique_absolute_names": true,
+    "required_static_edges_v1": "empty_only",
+    "unknown_fields": "reject"
+  },
+  "cli_errors": {
+    "normalized_types": ["DatasetIndexError", "ValueError", "TypeError", "OSError"],
+    "json_summary_failure_status": "indexer_failed",
+    "failure_exit_code": 2
+  },
+  "deferred": ["sample_index.jsonl", "training_manifest.jsonl", "image_decode_export", "image_compression", "topic_downsampling", "sample_pairing", "action_interpolation", "execution_feedback_window_pairing", "tf_frame_graph_reconstruction", "train_split"]
+}

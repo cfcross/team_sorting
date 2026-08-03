@@ -554,12 +554,13 @@ def test_setup_installs_new_contract_and_document() -> None:
     assert setup_text.count('"share/" + package_name + "/config/contracts"') == 1
 
 
-def test_readme_links_policy_and_limits_b3b_runtime_claims() -> None:
+def test_readme_links_policy_and_limits_b3b_b3c_runtime_claims() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     assert "config/contracts/data_tf_policy_v1.json" in readme
     assert "docs/data_tf_policy_v1.md" in readme
     assert "B3B第一步已把`/tf`和`/tf_static`" in readme
-    assert "压缩、降频、Indexer/QC和训练样本" in readme
+    assert "压缩、降频和训练样本生成仍未实现" in readme
+    assert "只读Indexer/QC见下一节" in readme
 
 
 def test_existing_frozen_contract_files_remain_exact() -> None:
