@@ -646,11 +646,20 @@ ros2 launch team_sorting team.launch.xml record_data:=true
 执行完全离线 pip 安装。默认卷 `team_sorting_offline_client_runtime_v1` 挂载到
 `/opt/team_sorting_runtime`，实际安装前缀是
 `/opt/team_sorting_runtime/prefix/local`；这是该镜像中 pip `--prefix` 自动增加的
-`local` 层，不能把 `/opt/team_sorting_runtime/prefix` 直接当作 ROS 前缀。脚本固定使用 host network、
-`ROS_DOMAIN_ID=99`、`rmw_cyclonedds_cpp`，默认配置仍为 observe-only，不启动或修改
-官方 Server，也不联网下载模型。宿主机 `MATERIAL_SORTING_OFFICIAL_ROOT` 是必填目录，
+`local` 层，不能把 `/opt/team_sorting_runtime/prefix` 直接当作 ROS 前缀。脚本固定使用 host network
+和 host IPC（`--network host --ipc host`）、`ROS_DOMAIN_ID=99`、`rmw_cyclonedds_cpp`，
+默认配置仍为 observe-only，不启动或修改官方 Server，也不联网下载模型。宿主机 `MATERIAL_SORTING_OFFICIAL_ROOT` 是必填目录，
 脚本会在 Docker 启动前验证官方 Server 关键文件。`TEAM_SORTING_CLIENT_GPUS` 默认
 为 `all`；无 NVIDIA GPU 的环境必须显式设为 `none`（空字符串同样禁用 GPU 参数）。
+
+官方 Client 镜像的 Entrypoint 只负责 source ROS 环境并 `exec "$@"`，默认 Cmd 是
+`sleep infinity`，不会自动执行团队程序；因此本脚本必须显式执行 `ros2 launch
+team_sorting team.launch.xml`。与官方 README 一致，Client 容器使用 host network 和
+host IPC，以保证 ROS_DOMAIN_ID=99 的 CycloneDDS 通信和显示/共享内存行为。
+`/material/detections` 是官方 Baseline Client 侧 `box_detect.py` 感知节点发布的检测
+结果，不是 Server 原生真值；Server 原生发布的是 `/material/instruction` 与裁判话题。
+官方头部对齐深度话题 `/head_camera/aligned_depth_to_color/image_raw` 为 `mono16`，
+原始数值单位是毫米，而团队三维感知按 `depth_unit_scale_m=0.001` 转换为米后再反投影。
 
 ```bash
 MATERIAL_SORTING_OFFICIAL_ROOT=/absolute/path/to/official \

@@ -53,7 +53,7 @@ fi
 validate_optional_path MATERIAL_SORTING_YOLO_CHECKPOINT "${YOLO_CHECKPOINT}"
 validate_optional_path TEAM_SORTING_MJCF "${MJCF_PATH}"
 
-command=(docker run --rm -it --network host
+command=(docker run --rm -it --network host --ipc host
     -e ROS_DOMAIN_ID=99
     -e RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
     -e "ROS_LOCALHOST_ONLY=${ROS_LOCALHOST_ONLY_VALUE}"
