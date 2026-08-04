@@ -106,6 +106,19 @@ def test_ros_localhost_only_explicit_zero_overrides_default(tmp_path):
     assert "-e ROS_LOCALHOST_ONLY=0" in command_line
 
 
+def test_docker_command_uses_host_network_and_host_ipc(tmp_path):
+    result = _run(
+        tmp_path,
+        MATERIAL_SORTING_OFFICIAL_ROOT=str(_official_root(tmp_path)),
+    )
+    assert result.returncode == 0
+    command_line = next(
+        line for line in result.stdout.splitlines() if line.startswith("Command:")
+    )
+    assert "--network host" in command_line
+    assert "--ipc host" in command_line
+
+
 def test_none_or_empty_gpu_setting_omits_docker_gpus_argument(tmp_path):
     root = str(_official_root(tmp_path))
     for value in ("none", ""):
