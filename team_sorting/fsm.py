@@ -86,8 +86,8 @@ class FSMEvent(str, Enum):
       有效，而不只是“已经开始规划”。
     - 执行类：``PICK_EXECUTED``、``PLACE_EXECUTED`` 必须由 ``RobotJointState`` 等
       真实反馈确认，不能以命令已发布或轨迹时间结束代替。
-    - 验证类：``PICK_VERIFIED``、``PICK_FAILED``、``PLACE_VERIFIED`` 必须来自明确
-      的抓放验证结果。
+    - 验证类：``PICK_VERIFIED``、``PICK_FAILED``、``PLACE_VERIFIED``、
+      ``PLACE_FAILED`` 必须来自明确的抓放验证结果。
     - 控制类：``SYSTEM_READY`` 表示客户端依赖已满足；``FAILURE`` 表示业务模块明确
       判断流程无法继续；``RESET`` 清空内存任务并重新等待。
 
@@ -166,6 +166,16 @@ class FSMEvent(str, Enum):
     # 推动：VERIFY_PLACE → RETURN_END
     PLACE_VERIFIED = "PLACE_VERIFIED"
 
+    # 放置验证已确认物体脱离夹爪且当前稳定，机器人可安全
+    # 重新搜索，但物体未满足目标区域要求。夹持状态未知、物体仍在
+    # 掉落、机械臂不安全或验证数据失效时不得使用本事件。
+    # FSM 只改变阶段，不持有 ObjectEstimate3D、NavGoal、JointTrajectory
+    # 或 GraspContext。转入 SEARCH_TARGET 后集成层必须使旧目标、导航目标、
+    # 轨迹和抓取上下文失效，后续 TARGET_FOUND 必须来自本事件之后的新鲜感知。
+    # 有恢复次数：VERIFY_PLACE → SEARCH_TARGET
+    # 恢复次数耗尽：VERIFY_PLACE → RETURN_END → FAILED
+    PLACE_FAILED = "PLACE_FAILED"
+
     # 底盘导航模块根据实际Odom确认机器人已返回结束区域。
     #
     # 正常任务：
@@ -216,7 +226,13 @@ class FSMEvent(str, Enum):
     # 安全监控明确确认恢复条件已经满足。只能从SAFE_HOLD恢复到原阶段，不会越级
     # 宣称任何感知、导航、规划或执行步骤成功。当前ros_nodes尚未接入真实生产者。
     SAFETY_RECOVERED = "SAFETY_RECOVERED"
-    # ————————————————————————————————
+
+
+class _SafeHoldCause(Enum):
+    """SAFE_HOLD 的内部来源，不通过诊断字符串反推。"""
+
+    EXTERNAL = "external"
+    PHASE_TIMEOUT = "phase_timeout"
 
 
 # 官方任务JSON解析
@@ -429,12 +445,13 @@ class GlobalFSM:
     ``status`` 只生成 ``FSMStatus`` 快照；非法或错误顺序事件返回 ``False``。显式
     失败会进入返区或 ``FAILED``，绝不把阶段推进本身当作抓放成功。
 
-    ``phase_entered_ns`` 记录最近一次真实进入或恢复当前阶段的时间；暂停前已累计的
-    业务活动时间单独保存在私有偏移量中，安全暂停时长不计入原阶段耗时。可选的
-    ``phase_timeouts_ns`` 由调用方显式注入；默认不启用任何阶段超时。配置阶段达到
-    超时边界后直接进入 ``FAILED``，不会自动成功、重试、返区或进入可恢复安全暂停。
-    外部 ``SAFETY_HOLD`` 仍只能由 ``SAFETY_RECOVERED`` 恢复到被中断阶段。状态和
-    事件存在不代表完整业务闭环已经完成。
+    ``phase_entered_ns`` 记录最近一次真实进入或恢复当前阶段的时间；外部安全
+    暂停前已累计的业务活动时间单独保存，暂停时长不计入原阶段耗时。可选的
+    ``phase_timeouts_ns`` 由调用方显式注入；默认不启用任何阶段超时。配置阶段第一次
+    达到超时边界时进入 ``SAFE_HOLD``，只有明确的 ``SAFETY_RECOVERED`` 才会以真实
+    恢复时间重新给予一份完整预算；同一真实阶段停留中恢复次数耗尽后进入
+    ``FAILED``。外部 ``SAFETY_HOLD`` 仍恢复暂停前累计的活动时间。状态和事件存在不代表
+    完整业务闭环已经完成。
     """
 
     # 正常主流程转换
@@ -485,13 +502,17 @@ class GlobalFSM:
         # 4. GlobalFSM构造器增加了可选参数，已有只传重试次数的调用保持兼容。
         phase_timeouts_ns: Optional[Mapping[GlobalPhase, int]] = None,
         # ————————————————————————————————
+        *,
+        max_timeout_recoveries_per_phase: int = 1,
+        max_place_retries: int = 1,
     ) -> None:
         """初始化尚未装载任务的客户端状态。
 
-        ``max_pick_retries`` 是允许回到 ``REFINE_TARGET`` 的客户端重试上限，不能据此
-        推断赛事正式重试规则。``phase_timeouts_ns`` 是调用方提供的阶段超时纳秒映射；
-        缺省时保持原有不自动超时行为。负数重试、非正超时、终止态或SAFE_HOLD超时
-        配置会抛出 ``ValueError``；WAIT_READY 同样不能配置普通阶段超时。
+        ``max_pick_retries`` 和 ``max_place_retries`` 分别是客户端抓取与放置恢复上限，
+        不能据此推断赛事正式 attempt 规则。``phase_timeouts_ns`` 是调用方提供的阶段
+        超时纳秒映射；缺省时保持不自动超时。``max_timeout_recoveries_per_phase``
+        限制同一真实阶段停留的超时恢复次数，0 表示首次超时直接失败。三个上限都必须是
+        非负 Python 整数，且明确拒绝 bool、浮点数和字符串。
         """
 
         # ————————————————————————————————
@@ -506,6 +527,12 @@ class GlobalFSM:
             or max_pick_retries < 0
         ):
             raise ValueError("max_pick_retries 必须是非负整数")
+        for name, value in (
+            ("max_timeout_recoveries_per_phase", max_timeout_recoveries_per_phase),
+            ("max_place_retries", max_place_retries),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} 必须是非负Python整数")
         if phase_timeouts_ns is None:
             timeout_policy: dict[GlobalPhase, int] = {}
         elif not isinstance(phase_timeouts_ns, Mapping):
@@ -524,6 +551,8 @@ class GlobalFSM:
             ):
                 raise ValueError(f"{phase.value} 的阶段超时必须是正整数纳秒")
         self.max_pick_retries = int(max_pick_retries)
+        self.max_timeout_recoveries_per_phase = max_timeout_recoveries_per_phase
+        self.max_place_retries = max_place_retries
         # ————————————————————————————————
         # ————————————————————————————————
         # 【Codex修改-50：复制并冻结阶段超时配置】
@@ -546,6 +575,8 @@ class GlobalFSM:
         self.local_phase = LocalPhase.IDLE
         self.task: Optional[TaskSpec] = None
         self.retry_count = 0
+        self._place_retry_count = 0
+        self._place_failure_reason = ""
         self.failure_reason = ""
         self._fail_after_return = False
         # ————————————————————————————————
@@ -556,7 +587,7 @@ class GlobalFSM:
         # 4. 只增加私有运行状态，不改变FSMStatus字段或事件方法签名。
         self._last_transition_ns: Optional[int] = None
         self._interrupted_phase: Optional[GlobalPhase] = None
-        # 保存暂停前的业务活动时间，恢复后继续使用原预算而不是重新计时。
+        # 保存暂停前的业务活动时间；外部暂停恢复时继续原预算，超时暂停仅用于诊断。
         self._interrupted_elapsed_ns: Optional[int] = None
         # ————————————————————————————————
         # ————————————————————————————————
@@ -574,6 +605,8 @@ class GlobalFSM:
         # 3. 这样恢复后可清除临时原因，同时保留真正的业务根因用于诊断。
         # 4. 不扩展FSMStatus或其他公共接口。
         self._safe_hold_reason = ""
+        self._safe_hold_cause: Optional[_SafeHoldCause] = None
+        self._timeout_recovery_count = 0
         # ————————————————————————————————
 
     def handle_event(self, event: FSMEvent, timestamp_ns: int, reason: str = "") -> bool:
@@ -620,7 +653,9 @@ class GlobalFSM:
             return False
         if event is FSMEvent.SAFETY_HOLD:
             return self._enter_safe_hold(
-                timestamp_ns, reason or "安全监控请求进入SAFE_HOLD"
+                timestamp_ns,
+                reason or "安全监控请求进入SAFE_HOLD",
+                cause=_SafeHoldCause.EXTERNAL,
             )
         # ————————————————————————————————
         # ————————————————————————————————
@@ -633,6 +668,17 @@ class GlobalFSM:
             if event is FSMEvent.SAFETY_RECOVERED:
                 return self._resume_interrupted_phase(timestamp_ns)
             if event is FSMEvent.FAILURE:
+                if self._safe_hold_cause is _SafeHoldCause.PHASE_TIMEOUT:
+                    timeout_reason = self._safe_hold_reason or "阶段超时后恢复失败"
+                    root_reason = self._combine_reason_once(
+                        self.failure_reason, timeout_reason
+                    )
+                    failure_detail = reason or "外部确认超时故障不可恢复"
+                    final_reason = self._combine_reason_once(
+                        root_reason, f"安全恢复失败：{failure_detail}"
+                    )
+                    self._enter_failed(timestamp_ns, final_reason)
+                    return True
                 safe_failure_reason = (
                     reason
                     or self._safe_hold_reason
@@ -678,7 +724,14 @@ class GlobalFSM:
                 self._enter_failed(timestamp_ns, return_failure_reason)
                 return True
             # ————————————————————————————————
-            self.failure_reason = reason or "业务模块报告失败"
+            reported_reason = reason or "业务模块报告失败"
+            if self._place_failure_reason:
+                self.failure_reason = self._combine_reason_once(
+                    self._place_failure_reason,
+                    f"放置恢复期间后续失败：{reported_reason}",
+                )
+            else:
+                self.failure_reason = reported_reason
             # ————————————————————————————————
             # 【Codex修改-57：普通失败清理残留暂停上下文】
             # 1. 修改前普通FAILURE没有安全暂停上下文可清理，新增上下文后可能泄漏到失败路径。
@@ -688,6 +741,7 @@ class GlobalFSM:
             self._interrupted_phase = None
             self._interrupted_elapsed_ns = None
             self._safe_hold_reason = ""
+            self._safe_hold_cause = None
             # ————————————————————————————————
             if self.task is None:
                 # ————————————————————————————————
@@ -711,7 +765,11 @@ class GlobalFSM:
                 # ————————————————————————————————
             return True
         if self.phase is GlobalPhase.VERIFY_PICK and event is FSMEvent.PICK_FAILED:
-            self.failure_reason = reason or "抓取验证失败"
+            pick_failure_reason = reason or "抓取验证失败"
+            if self._place_failure_reason:
+                self.failure_reason = self._place_failure_reason
+            else:
+                self.failure_reason = pick_failure_reason
             if self.retry_count < self.max_pick_retries:
                 self.retry_count += 1
                 # 抓取接触可能已移动物体，重试必须重新精定位，不能沿用旧三维位置。
@@ -725,6 +783,11 @@ class GlobalFSM:
                 # ————————————————————————————————
             else:
                 # 重试耗尽意味着失败尚未恢复，原因必须保留到返区后的 FAILED。
+                if self._place_failure_reason:
+                    self.failure_reason = self._combine_reason_once(
+                        self._place_failure_reason,
+                        f"放置恢复中重新抓取失败：{pick_failure_reason}",
+                    )
                 self._fail_after_return = True
                 # ————————————————————————————————
                 # 【Codex修改-60：重试耗尽返区同步计时状态】
@@ -734,6 +797,27 @@ class GlobalFSM:
                 # 4. 仍保留原失败原因并等待真实RETURN_REACHED，公共策略不变。
                 self._transition(GlobalPhase.RETURN_END, timestamp_ns)
                 # ————————————————————————————————
+            return True
+        if self.phase is GlobalPhase.VERIFY_PLACE and event is FSMEvent.PLACE_FAILED:
+            place_failure_reason = reason or "放置验证失败"
+            if not self._place_failure_reason:
+                self._place_failure_reason = place_failure_reason
+            self.failure_reason = self._place_failure_reason
+            if self._place_retry_count < self.max_place_retries:
+                self._place_retry_count += 1
+                # 物体已脱离夹爪且位置改变，旧感知、抓取关系和轨迹均已失效。
+                self.retry_count = 0
+                self._transition(GlobalPhase.SEARCH_TARGET, timestamp_ns)
+            else:
+                exhausted_reason = (
+                    "放置恢复次数耗尽"
+                    f"（已用{self._place_retry_count}/{self.max_place_retries}次）"
+                )
+                self.failure_reason = self._combine_reason_once(
+                    self._place_failure_reason, exhausted_reason
+                )
+                self._fail_after_return = True
+                self._transition(GlobalPhase.RETURN_END, timestamp_ns)
             return True
         if self.phase is GlobalPhase.RETURN_END and event is FSMEvent.RETURN_REACHED:
             # ————————————————————————————————
@@ -757,7 +841,9 @@ class GlobalFSM:
             return False
         if self.phase is GlobalPhase.VERIFY_PICK and event is FSMEvent.PICK_VERIFIED:
             # 新验证已确认重试成功，旧的可恢复失败不应继续污染 DONE 或遥测。
-            self.failure_reason = ""
+            self.failure_reason = self._place_failure_reason
+        if self.phase is GlobalPhase.VERIFY_PLACE and event is FSMEvent.PLACE_VERIFIED:
+            self._clear_place_failure_context()
         # ————————————————————————————————
         # 【Codex修改-61：正常主流程转换统一记录时间】
         # 1. 修改前合法前向事件只直接赋值phase，没有更新阶段进入或最近转换时间。
@@ -779,10 +865,14 @@ class GlobalFSM:
         """显式检查当前阶段是否到达调用方配置的超时边界。
 
         默认策略为空，因此保持原有不自动超时行为。检查只使用调用方提供的纳秒时间；
-        ``status`` 不调用本方法。配置阶段在 ``elapsed >= timeout`` 时直接进入
-        ``FAILED``，不会进入 ``SAFE_HOLD``、自动重试、返区或判定成功。迟到检查返回
-        ``False``，非法时间戳抛出 ``ValueError``。ROS 集成层应先处理本周期真实业务
-        回执，再检查当前阶段是否超时，使截止时刻到达的真实成功反馈优先。
+        ``status`` 不调用本方法。配置阶段在 ``elapsed >= timeout`` 时进入
+        ``SAFE_HOLD`` 等待明确恢复；同一阶段停留的恢复次数耗尽时进入 ``FAILED``。
+        两条路径都不会自动判定业务成功或返区。迟到检查返回 ``False``，非法时间戳
+        抛出 ``ValueError``。ROS 集成层应先处理本周期真实业务回执，再检查超时，
+        使截止时刻到达的真实成功反馈优先。
+
+        在真实 ``SAFETY_RECOVERED``/``FAILURE`` 生产者和 ActionMux 安全停机闭环
+        完成前，不应在正式配置中启用阶段超时。
         """
 
         # 拒绝早于最近合法状态转换时间的旧检查。
@@ -793,21 +883,31 @@ class GlobalFSM:
             return False
         # ————————————————————————————————
         # ————————————————————————————————
-        # 【Codex修改-6：阶段超时直接失败】
-        # 1. 修改前超时进入SAFE_HOLD，恢复后因预算耗尽会立刻再次超时并形成循环。
-        # 2. 当前在活动时间达到边界时直接进入FAILED，并记录阶段、实际时间和配置限制。
-        # 3. 这样超时不会伪装成可恢复暂停，也不会自动成功、重试或驱动机器人返区。
-        # 4. check_timeout签名和默认空策略兼容性保持不变。
         timeout_ns = self._phase_timeouts_ns.get(self.phase)
         if timeout_ns is None:
             return False
         elapsed_ns = self._current_phase_elapsed_ns(timestamp_ns)
         if elapsed_ns is None or elapsed_ns < timeout_ns:
             return False
+        timed_out_phase = self.phase
+        timeout_reason = (
+            f"{timed_out_phase.value}阶段超时：实际活动时间{elapsed_ns}ns，"
+            f"配置限制{timeout_ns}ns"
+        )
+        if self._timeout_recovery_count < self.max_timeout_recoveries_per_phase:
+            return self._enter_safe_hold(
+                timestamp_ns,
+                timeout_reason,
+                cause=_SafeHoldCause.PHASE_TIMEOUT,
+            )
+        exhausted_reason = (
+            f"{timeout_reason}；超时恢复机会耗尽"
+            f"（已用{self._timeout_recovery_count}/"
+            f"{self.max_timeout_recoveries_per_phase}次）"
+        )
         self._enter_failed(
             timestamp_ns,
-            f"{self.phase.value}阶段超时：实际活动时间{elapsed_ns}ns，"
-            f"配置限制{timeout_ns}ns",
+            self._combine_reason_once(self.failure_reason, exhausted_reason),
         )
         return True
         # ————————————————————————————————
@@ -829,9 +929,8 @@ class GlobalFSM:
 
         构造后尚无调用方时间基准时返回 ``None``。时间戳必须是非负整数，且不能早于
         最近合法状态转换时间；否则抛出 ``ValueError``。普通业务阶段返回该阶段累计
-        活动时间，并排除中间的安全暂停时长；处于 ``SAFE_HOLD`` 时返回本次安全暂停
-        已持续的时间；恢复原业务阶段后继续累计暂停前的业务活动时间。本方法不读取
-        墙钟。
+        活动时间；外部安全暂停恢复后继续累计暂停前耗时，超时暂停恢复后则从零开始
+        新的完整预算。处于 ``SAFE_HOLD`` 时返回本次暂停已持续的时间。本方法不读取墙钟。
         """
         # ————————————————————————————————
 
@@ -891,6 +990,8 @@ class GlobalFSM:
             return False
         self.task = task
         self.retry_count = 0
+        self._place_retry_count = 0
+        self._place_failure_reason = ""
         self.failure_reason = ""
         self._fail_after_return = False
         # ————————————————————————————————
@@ -953,9 +1054,15 @@ class GlobalFSM:
         displayed_reason = self.failure_reason
         if self.phase is GlobalPhase.SAFE_HOLD:
             # 不扩展 FSMStatus 字段，同时保留原失败与安全暂停原因。
+            hold_label = (
+                "阶段超时"
+                if self._safe_hold_cause is _SafeHoldCause.PHASE_TIMEOUT
+                else "安全暂停"
+            )
             if self.failure_reason and self._safe_hold_reason:
                 displayed_reason = (
-                    f"原失败：{self.failure_reason}；安全暂停：{self._safe_hold_reason}"
+                    f"原失败：{self.failure_reason}；"
+                    f"{hold_label}：{self._safe_hold_reason}"
                 )
             else:
                 displayed_reason = self._safe_hold_reason or self.failure_reason
@@ -997,6 +1104,8 @@ class GlobalFSM:
         self.local_phase = LocalPhase.IDLE
         self.task = None
         self.retry_count = 0
+        self._place_retry_count = 0
+        self._place_failure_reason = ""
         self.failure_reason = ""
         self._fail_after_return = False
         # ————————————————————————————————
@@ -1024,6 +1133,8 @@ class GlobalFSM:
         # 3. 这样RESET后的WAIT_READY不会显示上一生命周期的安全原因。
         # 4. 只清理私有字段，不改变FSMStatus结构。
         self._safe_hold_reason = ""
+        self._safe_hold_cause = None
+        self._timeout_recovery_count = 0
         # ————————————————————————————————
 
     # ————————————————————————————————
@@ -1039,13 +1150,43 @@ class GlobalFSM:
         )
     # ————————————————————————————————
 
-    def _transition(self, phase: GlobalPhase, timestamp_ns: int) -> None:
+    @staticmethod
+    def _combine_reason_once(root: str, detail: str) -> str:
+        """保留首个根因，并且同一补充说明最多追加一次。"""
+
+        if not root:
+            return detail
+        if not detail or detail == root or detail in root:
+            return root
+        return f"{root}；{detail}"
+
+    def _clear_place_failure_context(self) -> None:
+        """放置成功后清理已恢复的局部诊断和重试计数。"""
+
+        if self.failure_reason == self._place_failure_reason:
+            self.failure_reason = ""
+        self._place_failure_reason = ""
+        self._place_retry_count = 0
+
+    def _transition(
+        self,
+        phase: GlobalPhase,
+        timestamp_ns: int,
+        *,
+        preserve_timeout_recovery: bool = False,
+    ) -> None:
         # ————————————————————————————————
         # 【Codex修改-10：新阶段重置活动时间偏移】
         # 1. 修改前没有独立偏移，普通阶段转换无法清晰开始一份全新的活动预算。
         # 2. 当前每次真实进入新阶段都把累计偏移归零，再记录真实进入时间。
         # 3. 这样前一阶段或SAFE_HOLD的活动时间不会泄漏到新阶段。
         # 4. _transition仍是私有方法，不改变公共状态机接口。
+        if not preserve_timeout_recovery:
+            self._timeout_recovery_count = 0
+            self._interrupted_phase = None
+            self._interrupted_elapsed_ns = None
+            self._safe_hold_reason = ""
+            self._safe_hold_cause = None
         self._phase_elapsed_offset_ns = 0
         self.phase = phase
         self.phase_entered_ns = timestamp_ns
@@ -1058,7 +1199,13 @@ class GlobalFSM:
     # 2. 当前拒绝终止态和重复暂停，并在进入SAFE_HOLD前保存当前业务阶段。
     # 3. 这样终止任务不会被安全事件复活，恢复也只能回到确实被中断的阶段。
     # 4. 仅新增私有辅助方法，外部仍通过handle_event提交既有事件。
-    def _enter_safe_hold(self, timestamp_ns: int, reason: str) -> bool:
+    def _enter_safe_hold(
+        self,
+        timestamp_ns: int,
+        reason: str,
+        *,
+        cause: _SafeHoldCause,
+    ) -> bool:
         if self.phase in self._TERMINAL_PHASES or self.phase is GlobalPhase.SAFE_HOLD:
             return False
         self._interrupted_phase = self.phase
@@ -1083,7 +1230,12 @@ class GlobalFSM:
         # 3. 这样暂停本身有可审计时间基准，原业务阶段预算则单独保存在中断上下文。
         # 4. 不扩展FSMStatus字段或公共ROS协议。
         self._safe_hold_reason = reason
-        self._transition(GlobalPhase.SAFE_HOLD, timestamp_ns)
+        self._safe_hold_cause = cause
+        self._transition(
+            GlobalPhase.SAFE_HOLD,
+            timestamp_ns,
+            preserve_timeout_recovery=True,
+        )
         return True
         # ————————————————————————————————
 
@@ -1105,12 +1257,16 @@ class GlobalFSM:
         )
 
     def _resume_interrupted_phase(self, timestamp_ns: int) -> bool:
-        """以真实恢复时间恢复被中断阶段，并继承暂停前累计的活动时间。"""
+        """以真实恢复时间恢复被中断阶段。"""
 
         if self._interrupted_phase is None:
             return False
         resumed_phase = self._interrupted_phase
-        active_elapsed_ns = self._interrupted_elapsed_ns or 0
+        if self._safe_hold_cause is _SafeHoldCause.PHASE_TIMEOUT:
+            active_elapsed_ns = 0
+            self._timeout_recovery_count += 1
+        else:
+            active_elapsed_ns = self._interrupted_elapsed_ns or 0
         self.phase = resumed_phase
         self.phase_entered_ns = timestamp_ns
         self._phase_elapsed_offset_ns = active_elapsed_ns
@@ -1118,6 +1274,7 @@ class GlobalFSM:
         self._interrupted_phase = None
         self._interrupted_elapsed_ns = None
         self._safe_hold_reason = ""
+        self._safe_hold_cause = None
         return True
     # ————————————————————————————————
 
@@ -1140,13 +1297,18 @@ class GlobalFSM:
         self._interrupted_phase = None
         self._interrupted_elapsed_ns = None
         self._safe_hold_reason = ""
+        self._safe_hold_cause = None
         # ————————————————————————————————
         # 【Codex修改-79：统一由阶段转换重置活动时间偏移】
         # 1. 修改前_enter_failed先把偏移归零，随后_transition又执行一次相同清零。
         # 2. 当前删除前一次重复赋值，只由_transition建立FAILED阶段的全新计时状态。
         # 3. 这样失败入口只有一个偏移重置来源，减少以后两处实现发生偏差的风险。
         # 4. 只清理私有重复操作，不改变FAILED结果、时间戳、原因或公共接口。
-        self._transition(GlobalPhase.FAILED, timestamp_ns)
+        self._transition(
+            GlobalPhase.FAILED,
+            timestamp_ns,
+            preserve_timeout_recovery=True,
+        )
         # ————————————————————————————————
     # ————————————————————————————————
 
