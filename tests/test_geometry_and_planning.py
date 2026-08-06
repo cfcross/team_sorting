@@ -69,6 +69,7 @@ from team_sorting.perception_2d import OfficialYoloAdapter
 from team_sorting.perception_3d import (
     CameraTransformProvider,
     Perception3DEstimator,
+    VisualObservationVerifier,
     _HeadCameraPose,
     median_depth_m,
     project_pixel_to_camera,
@@ -80,6 +81,39 @@ from team_sorting.ros_nodes import (
     _perception_pipeline_from_config,
     _validate_vision_schema,
 )
+
+
+def _visual_verifier() -> VisualObservationVerifier:
+    return VisualObservationVerifier(
+        minimum_lift_delta_m=0.03,
+        max_horizontal_drift_m=0.02,
+        max_observation_gap_s=0.5,
+        minimum_observation_confidence=0.5,
+        required_frame_id="odom",
+        min_stationary_observations=3,
+        max_stationary_spread_m=0.01,
+    )
+
+
+def _object_observation(
+    position_xyz: tuple[float, float, float],
+    timestamp_ns: int,
+    *,
+    object_id: str = "pink:track-7",
+    valid: bool = True,
+    confidence: float = 0.8,
+    frame_id: str = "odom",
+) -> ObjectEstimate3D:
+    return ObjectEstimate3D(
+        class_id="pink",
+        position_xyz=position_xyz,
+        confidence=confidence,
+        frame_id=frame_id,
+        timestamp_ns=timestamp_ns,
+        valid=valid,
+        failure_reason="深度不可用" if not valid else "",
+        object_id=object_id,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -3204,6 +3238,225 @@ def test_task_spec_accepts_only_official_point_types(place_type: str) -> None:
     assert task.place_type == place_type
     with pytest.raises(ValueError, match="不得携带"):
         replace(task, direction="left")
+
+
+def test_visual_verifier_confirms_same_target_moves_up_during_test_lift() -> None:
+    result = _visual_verifier().verify_test_lift(
+        _object_observation((1.0, 2.0, 0.50), 100_000_000),
+        _object_observation((1.01, 2.0, 0.54), 200_000_000),
+        timestamp_ns=210_000_000,
+    )
+
+    assert result.success
+    assert result.is_grasped
+    assert result.confidence == pytest.approx(0.8)
+    assert "竖直位移=0.0400m" in result.visual_evidence
+    assert "仅包含视觉证据" in result.effort_evidence
+
+
+def test_visual_verifier_completed_negative_judgment_is_not_process_failure() -> None:
+    result = _visual_verifier().verify_test_lift(
+        _object_observation((1.0, 2.0, 0.50), 100_000_000),
+        _object_observation((1.0, 2.0, 0.51), 200_000_000),
+        timestamp_ns=210_000_000,
+    )
+
+    assert result.success
+    assert not result.is_grasped
+    assert result.failure_reason == ""
+
+
+@pytest.mark.parametrize(
+    ("before", "after", "now_ns", "reason"),
+    (
+        (
+            _object_observation((0.0, 0.0, 0.0), 100, object_id="pink:1"),
+            _object_observation((0.0, 0.0, 0.1), 200, object_id="pink:2"),
+            300,
+            "身份",
+        ),
+        (
+            _object_observation((0.0, 0.0, 0.0), 200),
+            _object_observation((0.0, 0.0, 0.1), 100),
+            300,
+            "时间戳",
+        ),
+        (
+            _object_observation((0.0, 0.0, 0.0), 100, valid=False),
+            _object_observation((0.0, 0.0, 0.1), 200),
+            300,
+            "无效",
+        ),
+        (
+            _object_observation((0.0, 0.0, 0.0), 100_000_000),
+            _object_observation((0.0, 0.0, 0.1), 200_000_000),
+            800_000_001,
+            "过期",
+        ),
+    ),
+)
+def test_visual_verifier_fails_closed_on_unusable_lift_evidence(
+    before: ObjectEstimate3D,
+    after: ObjectEstimate3D,
+    now_ns: int,
+    reason: str,
+) -> None:
+    result = _visual_verifier().verify_test_lift(
+        before, after, timestamp_ns=now_ns
+    )
+
+    assert not result.success
+    assert not result.is_grasped
+    assert result.confidence == 0.0
+    assert reason in result.failure_reason
+
+
+@pytest.mark.parametrize(
+    ("observation_kwargs", "reason"),
+    (
+        ({"confidence": 0.0}, "置信度"),
+        ({"frame_id": "camera_color_optical_frame"}, "frame必须为odom"),
+    ),
+)
+def test_visual_verifier_fails_closed_on_low_confidence_or_wrong_frame_lift(
+    observation_kwargs: dict[str, object], reason: str
+) -> None:
+    result = _visual_verifier().verify_test_lift(
+        _object_observation((0.0, 0.0, 0.0), 100, **observation_kwargs),
+        _object_observation((0.0, 0.0, 0.1), 200),
+        timestamp_ns=300,
+    )
+
+    assert not result.success
+    assert not result.is_grasped
+    assert reason in result.failure_reason
+
+
+def test_visual_verifier_returns_latest_stable_post_motion_fact() -> None:
+    observations = (
+        _object_observation((1.000, 2.000, 0.500), 100_000_000),
+        _object_observation((1.004, 2.001, 0.499), 150_000_000),
+        _object_observation((1.002, 1.999, 0.501), 200_000_000),
+    )
+
+    result = _visual_verifier().stable_post_motion_observation(
+        observations, timestamp_ns=210_000_000
+    )
+
+    assert result is observations[-1]
+    assert result.valid
+
+
+@pytest.mark.parametrize(
+    ("observation_kwargs", "reason"),
+    (
+        ({"confidence": 0.0}, "置信度"),
+        ({"frame_id": "camera_color_optical_frame"}, "frame必须为odom"),
+    ),
+)
+def test_visual_verifier_fails_closed_on_low_confidence_or_wrong_frame_sequence(
+    observation_kwargs: dict[str, object], reason: str
+) -> None:
+    observations = tuple(
+        _object_observation((0.0, 0.0, 0.0), timestamp, **observation_kwargs)
+        for timestamp in (100, 200, 300)
+    )
+
+    result = _visual_verifier().stable_post_motion_observation(
+        observations, timestamp_ns=400
+    )
+
+    assert not result.valid
+    assert reason in result.failure_reason
+
+
+def test_visual_verifier_uses_maximum_pairwise_stationary_distance() -> None:
+    observations = (
+        _object_observation((-0.006, 0.0, 0.0), 100),
+        _object_observation((0.0, 0.0, 0.0), 200),
+        _object_observation((0.006, 0.0, 0.0), 300),
+    )
+
+    result = _visual_verifier().stable_post_motion_observation(
+        observations, timestamp_ns=400
+    )
+
+    assert not result.valid
+    assert "最大两两距离=0.0120m" in result.failure_reason
+
+
+@pytest.mark.parametrize(
+    ("maximum_distance_m", "expected_valid"),
+    ((0.01, True), (0.010001, False)),
+)
+def test_visual_verifier_maximum_pairwise_distance_boundary(
+    maximum_distance_m: float, expected_valid: bool
+) -> None:
+    observations = (
+        _object_observation((0.0, 0.0, 0.0), 100),
+        _object_observation((maximum_distance_m / 2.0, 0.0, 0.0), 200),
+        _object_observation((maximum_distance_m, 0.0, 0.0), 300),
+    )
+
+    result = _visual_verifier().stable_post_motion_observation(
+        observations, timestamp_ns=400
+    )
+
+    assert result.valid is expected_valid
+
+
+@pytest.mark.parametrize(
+    "observations",
+    (
+        (
+            _object_observation((0.0, 0.0, 0.0), 100),
+            _object_observation((0.05, 0.0, 0.0), 200),
+            _object_observation((0.10, 0.0, 0.0), 300),
+        ),
+        (
+            _object_observation((0.0, 0.0, 0.0), 100, object_id="pink:1"),
+            _object_observation((0.0, 0.0, 0.0), 200, object_id="pink:2"),
+            _object_observation((0.0, 0.0, 0.0), 300, object_id="pink:2"),
+        ),
+    ),
+)
+def test_visual_verifier_rejects_unstable_or_mismatched_post_motion_observations(
+    observations: tuple[ObjectEstimate3D, ...],
+) -> None:
+    result = _visual_verifier().stable_post_motion_observation(
+        observations, timestamp_ns=400
+    )
+
+    assert not result.valid
+    assert result.failure_reason
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("minimum_lift_delta_m", 0.0),
+        ("max_horizontal_drift_m", -0.1),
+        ("max_observation_gap_s", True),
+        ("minimum_observation_confidence", 0.0),
+        ("required_frame_id", "camera_color_optical_frame"),
+        ("min_stationary_observations", 1),
+        ("max_stationary_spread_m", -0.1),
+    ),
+)
+def test_visual_verifier_rejects_unsafe_parameters(field: str, value: object) -> None:
+    kwargs = {
+        "minimum_lift_delta_m": 0.03,
+        "max_horizontal_drift_m": 0.02,
+        "max_observation_gap_s": 0.5,
+        "minimum_observation_confidence": 0.5,
+        "required_frame_id": "odom",
+        "min_stationary_observations": 3,
+        "max_stationary_spread_m": 0.01,
+    }
+    kwargs[field] = value
+
+    with pytest.raises(ValueError):
+        VisualObservationVerifier(**kwargs)
 
 
 def test_object_estimate_optional_perception_facts_remain_optional() -> None:

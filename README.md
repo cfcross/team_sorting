@@ -341,6 +341,11 @@ ArmExecution已实现轨迹运动学执行，但真实抓取验证和confirmed G
 稳定、脱夹、位于目标范围或获得 `PLACE_VERIFIED`。执行配置无隐藏默认值，当前
 `config.arm_execution` 全部为 `null`，且ROS/FSM尚未接线。
 
+`VisualObservationVerifier` 当前是纯算法组件：它仅接受达到最低置信度且 frame 严格为
+`odom` 的新鲜同目标观测，以 `odom` Z 轴判断试抬高度，并以最大两两距离判断运动后观测
+是否稳定。稳定的运动后观测本身不能证明放置位置正确或物体已释放，因而不得直接触发
+`PLACE_VERIFIED`。观测缓存、验证器实例化、FSM事件及ROS运行时接线由后续组装阶段完成。
+
 夹爪绝对位置范围是官方 `[0,1]` 控制量；`max_gripper_velocity_per_s` 的单位是控制量/秒，
 位置范围不能推出速度必须小于等于1，最终速度仍需官方仿真标定。ArmExecution生成的
 `ManipulationCommand`只是候选，不证明 `ActionMux` 已接受或官方控制器已经执行。提交4
