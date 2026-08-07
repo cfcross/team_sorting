@@ -32,6 +32,7 @@ from .interfaces import (
     CameraIntrinsics,
     DepthFrame,
     Detection2D,
+    GraspVerification,
     ObjectEstimate3D,
     RobotJointState,
 )
@@ -1500,6 +1501,243 @@ class Perception3DEstimator:
             object_id=None,
             orientation_xyzw=None,
             size_xyz_m=None,
+        )
+
+
+class VisualObservationVerifier:
+    """用新鲜的稳定三维观测完成试抬和放置后的视觉复检。
+
+    本类只判断物体观测，不读取夹爪 effort、不推进 FSM，也不把视觉判断提升为
+    官方控制器执行证明。阈值均由组装层显式注入：距离单位为米，时间单位为秒。
+    当前只允许 ``odom`` 观测，因为本算法把该 frame 的 Z 轴解释为竖直方向。
+    """
+
+    def __init__(
+        self,
+        *,
+        minimum_lift_delta_m: float,
+        max_horizontal_drift_m: float,
+        max_observation_gap_s: float,
+        minimum_observation_confidence: float,
+        required_frame_id: str,
+        min_stationary_observations: int,
+        max_stationary_spread_m: float,
+    ) -> None:
+        self.minimum_lift_delta_m = _finite_number(
+            minimum_lift_delta_m, "minimum_lift_delta_m"
+        )
+        self.max_horizontal_drift_m = _finite_number(
+            max_horizontal_drift_m, "max_horizontal_drift_m"
+        )
+        self.max_observation_gap_s = _finite_number(
+            max_observation_gap_s, "max_observation_gap_s"
+        )
+        self.minimum_observation_confidence = _finite_number(
+            minimum_observation_confidence, "minimum_observation_confidence"
+        )
+        if not isinstance(required_frame_id, str) or not required_frame_id.strip():
+            raise ValueError("required_frame_id 必须是非空字符串")
+        self.required_frame_id = required_frame_id.strip()
+        self.max_stationary_spread_m = _finite_number(
+            max_stationary_spread_m, "max_stationary_spread_m"
+        )
+        if self.minimum_lift_delta_m <= 0.0:
+            raise ValueError("minimum_lift_delta_m 必须大于0")
+        if self.max_horizontal_drift_m < 0.0:
+            raise ValueError("max_horizontal_drift_m 不得小于0")
+        if self.max_observation_gap_s <= 0.0:
+            raise ValueError("max_observation_gap_s 必须大于0")
+        if not 0.0 < self.minimum_observation_confidence <= 1.0:
+            raise ValueError("minimum_observation_confidence 必须位于 (0,1]")
+        if self.required_frame_id != "odom":
+            raise ValueError("当前阶段required_frame_id必须严格为odom")
+        if self.max_stationary_spread_m < 0.0:
+            raise ValueError("max_stationary_spread_m 不得小于0")
+        if (
+            isinstance(min_stationary_observations, bool)
+            or not isinstance(min_stationary_observations, Integral)
+            or int(min_stationary_observations) < 2
+        ):
+            raise ValueError("min_stationary_observations 必须是至少为2的整数")
+        self.min_stationary_observations = int(min_stationary_observations)
+
+    def verify_test_lift(
+        self,
+        before: ObjectEstimate3D,
+        after: ObjectEstimate3D,
+        *,
+        timestamp_ns: int,
+    ) -> GraspVerification:
+        """比较试抬前后同一稳定目标；验证完成与抓取成立是两个独立结论。"""
+
+        now_ns = Perception3DEstimator._timestamp_ns(timestamp_ns, "timestamp_ns")
+        error = self._pair_error(before, after, now_ns)
+        if error:
+            return self._grasp_failure(error, now_ns)
+
+        dx = after.position_xyz[0] - before.position_xyz[0]
+        dy = after.position_xyz[1] - before.position_xyz[1]
+        dz = after.position_xyz[2] - before.position_xyz[2]
+        horizontal_drift = math.hypot(dx, dy)
+        is_grasped = (
+            dz >= self.minimum_lift_delta_m
+            and horizontal_drift <= self.max_horizontal_drift_m
+        )
+        evidence = (
+            f"同一目标 {after.object_id!r}：竖直位移={dz:.4f}m，"
+            f"水平漂移={horizontal_drift:.4f}m"
+        )
+        return GraspVerification(
+            is_grasped=is_grasped,
+            confidence=min(float(before.confidence), float(after.confidence)),
+            visual_evidence=evidence,
+            effort_evidence="未提供；当前结果仅包含视觉证据",
+            success=True,
+            failure_reason="",
+            timestamp_ns=now_ns,
+        )
+
+    def stable_post_motion_observation(
+        self,
+        observations: tuple[ObjectEstimate3D, ...],
+        *,
+        timestamp_ns: int,
+    ) -> ObjectEstimate3D:
+        """确认运动后同一物体连续多帧收敛，并返回最后一帧观测事实。
+
+        该结果不证明位置正确或夹爪已释放，不得单独触发 ``PLACE_VERIFIED``。
+        """
+
+        now_ns = Perception3DEstimator._timestamp_ns(timestamp_ns, "timestamp_ns")
+        try:
+            items = tuple(observations)
+        except TypeError:
+            items = ()
+        if len(items) < self.min_stationary_observations:
+            return self._post_motion_failure(
+                items,
+                now_ns,
+                f"稳定观测不足：需要至少{self.min_stationary_observations}帧",
+            )
+        first = items[0]
+        for index, item in enumerate(items):
+            error = self._observation_error(item, f"observations[{index}]")
+            if error:
+                return self._post_motion_failure(items, now_ns, error)
+            if (
+                item.object_id != first.object_id
+                or item.class_id != first.class_id
+                or item.frame_id != first.frame_id
+            ):
+                return self._post_motion_failure(
+                    items, now_ns, "放置后观测的目标身份、类别或frame不一致"
+                )
+            if index and item.timestamp_ns <= items[index - 1].timestamp_ns:
+                return self._post_motion_failure(
+                    items, now_ns, "放置后观测时间戳必须严格递增"
+                )
+        if self._outside_time_window(first.timestamp_ns, items[-1].timestamp_ns):
+            return self._post_motion_failure(items, now_ns, "放置后观测序列时间跨度过大")
+        if items[-1].timestamp_ns > now_ns:
+            return self._post_motion_failure(items, now_ns, "最新观测时间晚于验证时间")
+        if self._outside_time_window(items[-1].timestamp_ns, now_ns):
+            return self._post_motion_failure(items, now_ns, "最新放置后观测已经过期")
+
+        spread = max(
+            math.dist(items[left].position_xyz, items[right].position_xyz)
+            for left in range(len(items))
+            for right in range(left + 1, len(items))
+        )
+        if spread > self.max_stationary_spread_m:
+            return self._post_motion_failure(
+                items,
+                now_ns,
+                f"放置后目标尚未稳定：最大两两距离={spread:.4f}m",
+            )
+        return items[-1]
+
+    def _pair_error(
+        self,
+        before: ObjectEstimate3D,
+        after: ObjectEstimate3D,
+        now_ns: int,
+    ) -> str:
+        for name, item in (("试抬前观测", before), ("试抬后观测", after)):
+            error = self._observation_error(item, name)
+            if error:
+                return error
+        if (
+            before.object_id != after.object_id
+            or before.class_id != after.class_id
+            or before.frame_id != after.frame_id
+        ):
+            return "试抬前后目标身份、类别或frame不一致"
+        if after.timestamp_ns <= before.timestamp_ns:
+            return "试抬后观测时间戳必须晚于试抬前观测"
+        if self._outside_time_window(before.timestamp_ns, after.timestamp_ns):
+            return "试抬前后观测时间间隔过大"
+        if after.timestamp_ns > now_ns:
+            return "试抬后观测时间晚于验证时间"
+        if self._outside_time_window(after.timestamp_ns, now_ns):
+            return "试抬后观测已经过期"
+        return ""
+
+    def _observation_error(self, item: Any, name: str) -> str:
+        if not isinstance(item, ObjectEstimate3D):
+            return f"{name} 必须是ObjectEstimate3D"
+        if not item.valid:
+            return f"{name}无效：{item.failure_reason or '上游未提供原因'}"
+        if item.confidence < self.minimum_observation_confidence:
+            return (
+                f"{name}置信度{item.confidence:.4f}低于最低要求"
+                f"{self.minimum_observation_confidence:.4f}"
+            )
+        if item.frame_id != self.required_frame_id:
+            return (
+                f"{name}frame必须为{self.required_frame_id}，"
+                f"实际为{item.frame_id}"
+            )
+        if not isinstance(item.object_id, str) or not item.object_id.strip():
+            return f"{name}缺少稳定object_id"
+        try:
+            _finite_vector(item.position_xyz, 3, f"{name}.position_xyz")
+            Perception3DEstimator._timestamp_ns(
+                item.timestamp_ns, f"{name}.timestamp_ns"
+            )
+        except ValueError as exc:
+            return str(exc)
+        return ""
+
+    def _outside_time_window(self, earlier_ns: int, later_ns: int) -> bool:
+        return later_ns - earlier_ns > self.max_observation_gap_s * 1_000_000_000.0
+
+    @staticmethod
+    def _grasp_failure(reason: str, timestamp_ns: int) -> GraspVerification:
+        return GraspVerification(
+            is_grasped=False,
+            confidence=0.0,
+            visual_evidence="视觉证据不足",
+            effort_evidence="未提供；当前结果仅包含视觉证据",
+            success=False,
+            failure_reason=reason,
+            timestamp_ns=timestamp_ns,
+        )
+
+    @staticmethod
+    def _post_motion_failure(
+        observations: tuple[ObjectEstimate3D, ...],
+        timestamp_ns: int,
+        reason: str,
+    ) -> ObjectEstimate3D:
+        valid_items = tuple(
+            item for item in observations if isinstance(item, ObjectEstimate3D)
+        )
+        latest = valid_items[-1] if valid_items else None
+        return Perception3DEstimator._failure(
+            latest.class_id if latest is not None else "",
+            latest.frame_id if latest is not None else "unknown",
+            timestamp_ns,
+            reason,
         )
 
 
