@@ -807,6 +807,7 @@ def test_config_numeric_types_finiteness_and_ranges() -> None:
         "max_track_age_s",
         "max_position_jump_m",
         "object_dimensions_m",
+        "object_local_size_xyz_m",
     }
     assert isinstance(estimator["depth_radius_px"], int)
     assert isinstance(estimator["converge_frames"], int)
@@ -821,11 +822,57 @@ def test_config_numeric_types_finiteness_and_ranges() -> None:
         assert tuple(_strict_finite_number(value) for value in values) == pytest.approx(
             (0.24, 0.16, 0.19)
         )
+    local_sizes = estimator["object_local_size_xyz_m"]
+    assert isinstance(local_sizes, dict)
+    assert set(local_sizes) == set(OfficialYoloAdapter.CLASS_NAMES)
+    for values in local_sizes.values():
+        assert isinstance(values, list) and len(values) == 3
+        assert tuple(_strict_finite_number(value) for value in values) == pytest.approx(
+            (0.24, 0.16, 0.19)
+        )
 
     retry_count = fsm["max_pick_retries"]
     assert isinstance(retry_count, int) and not isinstance(retry_count, bool) and retry_count >= 0
     assert _strict_finite_number(action_mux["max_abs_base_v"]) >= 0.0
     assert _strict_finite_number(action_mux["max_abs_base_w"]) >= 0.0
+
+
+@pytest.mark.parametrize(
+    "invalid_case",
+    ("missing_field", "wrong_classes", "bool_value"),
+)
+def test_perception_config_reader_rejects_invalid_local_size_schema(
+    invalid_case: str,
+) -> None:
+    config = _project_config()
+    perception = config["perception"]
+    assert isinstance(perception, dict)
+    estimator = perception["estimator_3d"]
+    assert isinstance(estimator, dict)
+
+    if invalid_case == "missing_field":
+        del estimator["object_local_size_xyz_m"]
+    else:
+        local_sizes = estimator["object_local_size_xyz_m"]
+        assert isinstance(local_sizes, dict)
+        if invalid_case == "wrong_classes":
+            del local_sizes["brown"]
+            local_sizes["red"] = [0.24, 0.16, 0.19]
+        else:
+            local_sizes["pink"] = [0.24, True, 0.19]
+
+    with pytest.raises(RuntimeError) as exc_info:
+        _perception_pipeline_from_config(
+            config,  # type: ignore[arg-type]
+            CameraTransformProvider(),
+        )
+
+    message = str(exc_info.value)
+    assert "object_local_size_xyz_m" in message
+    if invalid_case == "wrong_classes":
+        assert "brown" in message and "red" in message
+    if invalid_case == "bool_value":
+        assert "pink" in message and "bool" in message
 
 
 def test_config_bounds_and_action_limits_have_safe_static_shapes() -> None:
@@ -1304,6 +1351,82 @@ def test_perception_dimensions_only_compensate_center_not_local_size_axes() -> N
     assert result.position_xyz[2] == pytest.approx(1.165)
     assert result.size_xyz_m is None
     assert estimator._dims["pink"] == (0.11, 0.22, 0.33)
+
+
+def test_perception_independent_local_size_is_published_without_axis_swapping() -> None:
+    estimator = Perception3DEstimator(
+        _OffsetTransformProvider(),
+        converge_frames=1,
+        object_dimensions_m={"pink": (0.11, 0.22, 0.33)},
+        object_local_size_xyz_m={"pink": (0.24, 0.16, 0.19)},
+    )
+    result = estimator.estimate(
+        (_estimator_detection(track_id=10),),
+        _estimator_depth(1000.0, 100),
+        _intrinsics(timestamp_ns=100),
+        _base(),
+        _actual_joints(),
+    )[0]
+
+    assert result.valid
+    # 中心补偿仍只取旧映射的相机视线第三项；局部尺寸来自独立映射并保持XYZ顺序。
+    assert result.position_xyz[2] == pytest.approx(1.165)
+    assert result.size_xyz_m == pytest.approx((0.24, 0.16, 0.19))
+    assert result.orientation_xyzw is None
+    assert estimator._dims["pink"] == (0.11, 0.22, 0.33)
+    assert estimator._local_sizes["pink"] == (0.24, 0.16, 0.19)
+
+
+@pytest.mark.parametrize(
+    "local_sizes",
+    (
+        {" ": (0.24, 0.16, 0.19)},
+        {" pink ": (0.24, 0.16, 0.19)},
+        {"pink": (0.24, 0.16)},
+        {"pink": (0.24, 0.16, 0.0)},
+        {"pink": (0.24, -0.16, 0.19)},
+        {"pink": (0.24, float("nan"), 0.19)},
+        {"pink": (0.24, float("inf"), 0.19)},
+        {"pink": (0.24, True, 0.19)},
+        {"pink": (0.24, "0.16", 0.19)},
+    ),
+)
+def test_perception_rejects_invalid_independent_local_sizes(
+    local_sizes: dict[str, tuple[object, ...]],
+) -> None:
+    with pytest.raises(ValueError, match="object_local_size_xyz_m"):
+        Perception3DEstimator(
+            _OffsetTransformProvider(),
+            object_local_size_xyz_m=local_sizes,  # type: ignore[arg-type]
+        )
+
+
+def test_perception_routes_distinct_local_sizes_by_class_id() -> None:
+    expected = {
+        "pink": (0.21, 0.11, 0.31),
+        "yellow": (0.42, 0.22, 0.62),
+    }
+    estimator = Perception3DEstimator(
+        _OffsetTransformProvider(),
+        converge_frames=1,
+        object_dimensions_m={
+            "pink": (0.1, 0.1, 0.2),
+            "yellow": (0.1, 0.1, 0.2),
+        },
+        object_local_size_xyz_m=expected,
+    )
+    results = estimator.estimate(
+        (
+            _estimator_detection("pink", track_id=11),
+            _estimator_detection("yellow", track_id=12),
+        ),
+        _estimator_depth(1000.0, 100),
+        _intrinsics(timestamp_ns=100),
+        _base(),
+        _actual_joints(),
+    )
+
+    assert {result.class_id: result.size_xyz_m for result in results} == expected
 
 
 def test_perception_3d_depth_failure_is_invalid_without_stopping_batch() -> None:
@@ -2043,6 +2166,16 @@ def test_real_perception_node_config_produces_all_three_valid_classes() -> None:
         OfficialYoloAdapter.CLASS_NAMES
     )
     assert all(result.valid for result in results)
+    assert all(
+        isinstance(result.object_id, str) and bool(result.object_id)
+        for result in results
+    )
+    assert all(result.frame_id == "odom" for result in results)
+    assert all(result.orientation_xyzw is None for result in results)
+    assert all(
+        result.size_xyz_m == pytest.approx((0.24, 0.16, 0.19))
+        for result in results
+    )
     assert [result.position_xyz[2] for result in results] == pytest.approx(
         (1.095, 1.095, 1.095)
     )
@@ -3131,7 +3264,8 @@ class _VisionVector3:
 class _VisionQuaternion(_VisionVector3):
     def __init__(self) -> None:
         super().__init__()
-        self.w = 0.0
+        # geometry_msgs/Quaternion 的真实 ROS 默认构造值为单位四元数。
+        self.w = 1.0
 
 
 class _VisionPose:
@@ -3156,7 +3290,7 @@ class _VisionDetection:
     def __init__(self) -> None:
         self.header = _VisionHeader()
         self.id = ""
-        self.bbox = SimpleNamespace(size=_VisionVector3())
+        self.bbox = SimpleNamespace(center=_VisionPose(), size=_VisionVector3())
         self.results: list[object] = []
 
 
@@ -3664,12 +3798,41 @@ def test_ros_unknown_orientation_and_size_round_trip_as_none() -> None:
         object_id="stable:7", orientation_xyzw=None, size_xyz_m=None,
     )
     message = _estimates_to_vision((estimate,), ros, _VisionStamp())
-    pose = message.detections[0].results[0].pose.pose
+    detection = message.detections[0]
+    pose = detection.results[0].pose.pose
     assert (pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w) == (0, 0, 0, 0)
-    assert tuple(vars(message.detections[0].bbox.size).values()) == (0, 0, 0)
+    assert tuple(vars(detection.bbox.size).values()) == (0, 0, 0)
+    assert tuple(vars(detection.bbox.center.position).values()) == (1, 2, 3)
+    assert tuple(vars(detection.bbox.center.orientation).values()) == (0, 0, 0, 0)
     decoded = _estimates_from_vision(message)[0]
     assert decoded.orientation_xyzw is None and decoded.size_xyz_m is None
     assert decoded.object_id == "stable:7"
+
+
+def test_ros_known_local_size_with_unknown_orientation_round_trip() -> None:
+    estimate = ObjectEstimate3D(
+        "pink", (1, 2, 3), 0.9, "odom", 123,
+        object_id="stable:8", orientation_xyzw=None,
+        size_xyz_m=(0.24, 0.16, 0.19),
+    )
+    message = _estimates_to_vision((estimate,), _vision_types(), _VisionStamp())
+    detection = message.detections[0]
+    result_pose = detection.results[0].pose.pose
+    bbox_pose = detection.bbox.center
+
+    assert tuple(vars(bbox_pose.position).values()) == tuple(
+        vars(result_pose.position).values()
+    ) == (1, 2, 3)
+    assert tuple(vars(bbox_pose.orientation).values()) == tuple(
+        vars(result_pose.orientation).values()
+    ) == (0, 0, 0, 0)
+    assert tuple(vars(detection.bbox.size).values()) == pytest.approx(
+        (0.24, 0.16, 0.19)
+    )
+    decoded = _estimates_from_vision(message)[0]
+    assert decoded.orientation_xyzw is None
+    assert decoded.size_xyz_m == pytest.approx((0.24, 0.16, 0.19))
+    assert decoded.object_id == "stable:8"
 
 
 def test_ros_observed_orientation_and_size_round_trip_normalized() -> None:
@@ -3680,6 +3843,62 @@ def test_ros_observed_orientation_and_size_round_trip_normalized() -> None:
     decoded = _estimates_from_vision(
         _estimates_to_vision((estimate,), _vision_types(), _VisionStamp())
     )[0]
+    assert decoded.orientation_xyzw == (0.0, 0.0, 0.0, 1.0)
+    assert decoded.size_xyz_m == pytest.approx((0.24, 0.16, 0.19))
+
+
+def test_ros_nonzero_size_rejects_inconsistent_bbox_center() -> None:
+    estimate = ObjectEstimate3D(
+        "pink", (1, 2, 3), 0.9, "odom", 123,
+        size_xyz_m=(0.24, 0.16, 0.19),
+    )
+    message = _estimates_to_vision((estimate,), _vision_types(), _VisionStamp())
+    message.detections[0].bbox.center.position.x = 99.0
+
+    with pytest.raises(ValueError, match="center.position"):
+        _estimates_from_vision(message)
+
+
+def test_ros_nonzero_size_rejects_identity_bbox_for_unknown_orientation() -> None:
+    estimate = ObjectEstimate3D(
+        "pink", (1, 2, 3), 0.9, "odom", 123,
+        size_xyz_m=(0.24, 0.16, 0.19),
+    )
+    message = _estimates_to_vision((estimate,), _vision_types(), _VisionStamp())
+    message.detections[0].bbox.center.orientation.w = 1.0
+
+    with pytest.raises(ValueError, match="同时使用零四元数"):
+        _estimates_from_vision(message)
+
+
+def test_ros_nonzero_size_rejects_inconsistent_known_bbox_orientation() -> None:
+    estimate = ObjectEstimate3D(
+        "pink", (1, 2, 3), 0.9, "odom", 123,
+        orientation_xyzw=(0, 0, 0, 1),
+        size_xyz_m=(0.24, 0.16, 0.19),
+    )
+    message = _estimates_to_vision((estimate,), _vision_types(), _VisionStamp())
+    bbox_orientation = message.detections[0].bbox.center.orientation
+    bbox_orientation.z, bbox_orientation.w = 1.0, 0.0
+
+    with pytest.raises(ValueError, match="姿态与结果姿态不一致"):
+        _estimates_from_vision(message)
+
+
+def test_ros_nonzero_size_accepts_equivalent_negated_bbox_quaternion() -> None:
+    estimate = ObjectEstimate3D(
+        "pink", (1, 2, 3), 0.9, "odom", 123,
+        orientation_xyzw=(0, 0, 0, 1),
+        size_xyz_m=(0.24, 0.16, 0.19),
+    )
+    message = _estimates_to_vision((estimate,), _vision_types(), _VisionStamp())
+    bbox_orientation = message.detections[0].bbox.center.orientation
+    bbox_orientation.x = -bbox_orientation.x
+    bbox_orientation.y = -bbox_orientation.y
+    bbox_orientation.z = -bbox_orientation.z
+    bbox_orientation.w = -bbox_orientation.w
+
+    decoded = _estimates_from_vision(message)[0]
     assert decoded.orientation_xyzw == (0.0, 0.0, 0.0, 1.0)
     assert decoded.size_xyz_m == pytest.approx((0.24, 0.16, 0.19))
 

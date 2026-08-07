@@ -652,6 +652,17 @@ def _validate_vision_schema(ros: SimpleNamespace) -> None:
         hasattr(detection.bbox.size, axis) for axis in ("x", "y", "z")
     ):
         raise RuntimeError("Detection3D.bbox 缺少三轴 size")
+    if not hasattr(detection.bbox, "center") or not all(
+        hasattr(detection.bbox.center, name) for name in ("position", "orientation")
+    ):
+        raise RuntimeError("Detection3D.bbox 缺少 center pose")
+    if not all(
+        hasattr(detection.bbox.center.position, axis) for axis in ("x", "y", "z")
+    ) or not all(
+        hasattr(detection.bbox.center.orientation, axis)
+        for axis in ("x", "y", "z", "w")
+    ):
+        raise RuntimeError("Detection3D.bbox.center 缺少 position/orientation 分量")
     hypothesis = getattr(result, "hypothesis", result)
     if not (hasattr(hypothesis, "class_id") or hasattr(hypothesis, "id")):
         raise RuntimeError("ObjectHypothesisWithPose 缺少 class_id/id")
@@ -2130,9 +2141,10 @@ def _perception_3d_estimator_from_config(
 ) -> Perception3DEstimator:
     """从 PerceptionNode 的真实配置构造三维估计器。
 
-    物体尺寸按 ``[width_m, height_m, depth_extent_m]`` 解释；键必须严格覆盖官方
-    YOLO 的三类目标。Detection/Depth/CameraInfo 的最大时间差复用 RGB/Depth 同步
-    的非零 ``sync_slop_s``，避免节点接线中出现两个互相漂移的时间窗口。
+    中心补偿尺寸按 ``[width_m, height_m, depth_extent_m]`` 解释；局部完整尺寸按
+    ``[size_x_m, size_y_m, size_z_m]`` 解释，两者使用独立配置且键都必须严格覆盖
+    官方 YOLO 的三类目标。Detection/Depth/CameraInfo 的最大时间差复用 RGB/Depth
+    同步的非零 ``sync_slop_s``，避免节点接线中出现两个互相漂移的时间窗口。
     """
 
     perception = _config_mapping(config.get("perception"), "perception")
@@ -2146,6 +2158,7 @@ def _perception_3d_estimator_from_config(
         "max_track_age_s",
         "max_position_jump_m",
         "object_dimensions_m",
+        "object_local_size_xyz_m",
     }
     _require_exact_config_keys(values, required, "perception.estimator_3d")
     dimensions = _config_mapping(
@@ -2181,6 +2194,37 @@ def _perception_3d_estimator_from_config(
         )
         normalized_dimensions[class_id] = converted
 
+    local_sizes = _config_mapping(
+        values["object_local_size_xyz_m"],
+        "perception.estimator_3d.object_local_size_xyz_m",
+    )
+    _require_exact_config_keys(
+        local_sizes,
+        expected_classes,
+        "perception.estimator_3d.object_local_size_xyz_m",
+    )
+    normalized_local_sizes: dict[str, tuple[float, float, float]] = {}
+    for class_id in OfficialYoloAdapter.CLASS_NAMES:
+        raw = local_sizes[class_id]
+        if isinstance(raw, (str, bytes)) or not isinstance(raw, (list, tuple)):
+            raise RuntimeError(
+                "perception.estimator_3d.object_local_size_xyz_m"
+                f"[{class_id!r}] 必须是三个正有限数"
+            )
+        if len(raw) != 3:
+            raise RuntimeError(
+                "perception.estimator_3d.object_local_size_xyz_m"
+                f"[{class_id!r}] 必须恰好包含 [size_x_m,size_y_m,size_z_m]"
+            )
+        normalized_local_sizes[class_id] = tuple(
+            _positive_config_number(
+                item,
+                "perception.estimator_3d.object_local_size_xyz_m"
+                f"[{class_id!r}][{index}]",
+            )
+            for index, item in enumerate(raw)
+        )
+
     max_input_skew_s = _positive_config_number(
         perception.get("sync_slop_s"), "perception.sync_slop_s"
     )
@@ -2194,6 +2238,7 @@ def _perception_3d_estimator_from_config(
             max_input_skew_s=max_input_skew_s,
             max_position_jump_m=values["max_position_jump_m"],
             object_dimensions_m=normalized_dimensions,
+            object_local_size_xyz_m=normalized_local_sizes,
         )
     except (TypeError, ValueError) as exc:
         raise RuntimeError(f"perception.estimator_3d 配置无效：{exc}") from exc
@@ -2460,6 +2505,18 @@ def _estimates_to_vision(
         if not hasattr(detection, "id") or not hasattr(detection, "bbox"):
             raise RuntimeError("vision_msgs Detection3D 缺少 id/bbox 字段")
         detection.id = estimate.object_id or ""
+        bbox_center = detection.bbox.center
+        (
+            bbox_center.position.x,
+            bbox_center.position.y,
+            bbox_center.position.z,
+        ) = xyz
+        (
+            bbox_center.orientation.x,
+            bbox_center.orientation.y,
+            bbox_center.orientation.z,
+            bbox_center.orientation.w,
+        ) = orientation
         if estimate.size_xyz_m is None:
             size = (0.0, 0.0, 0.0)
         else:
@@ -2520,6 +2577,63 @@ def _estimates_from_vision(message: Any) -> tuple[ObjectEstimate3D, ...]:
             raise ValueError("vision_msgs bbox.size 必须全零或三轴均为正数")
         else:
             size = size_values
+        if size is not None:
+            try:
+                bbox_center = detection.bbox.center
+                bbox_position = (
+                    float(bbox_center.position.x),
+                    float(bbox_center.position.y),
+                    float(bbox_center.position.z),
+                )
+                bbox_orientation = (
+                    float(bbox_center.orientation.x),
+                    float(bbox_center.orientation.y),
+                    float(bbox_center.orientation.z),
+                    float(bbox_center.orientation.w),
+                )
+            except (AttributeError, TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(
+                    f"vision_msgs 非零 bbox.size 缺少合法 center pose：{exc}"
+                ) from exc
+            if not all(
+                math.isfinite(value)
+                for value in bbox_position + bbox_orientation
+            ):
+                raise ValueError("vision_msgs bbox.center 包含 NaN/Inf")
+            if not all(
+                math.isclose(left, right, rel_tol=0.0, abs_tol=1e-9)
+                for left, right in zip(bbox_position, xyz)
+            ):
+                raise ValueError(
+                    "vision_msgs 非零 bbox.size 的 center.position 与结果中心不一致"
+                )
+            bbox_orientation_norm = math.sqrt(
+                sum(value * value for value in bbox_orientation)
+            )
+            if orientation is None:
+                if bbox_orientation_norm > 1e-12:
+                    raise ValueError(
+                        "vision_msgs 未知物体姿态必须在结果与bbox.center中同时使用零四元数"
+                    )
+            else:
+                if bbox_orientation_norm <= 1e-12:
+                    raise ValueError(
+                        "vision_msgs 非零 bbox.size 的bbox.center缺少有效姿态"
+                    )
+                result_unit = tuple(
+                    value / orientation_norm for value in orientation_values
+                )
+                bbox_unit = tuple(
+                    value / bbox_orientation_norm for value in bbox_orientation
+                )
+                quaternion_error = min(
+                    math.dist(result_unit, bbox_unit),
+                    math.dist(result_unit, tuple(-value for value in bbox_unit)),
+                )
+                if quaternion_error > 1e-9:
+                    raise ValueError(
+                        "vision_msgs 非零 bbox.size 的bbox.center姿态与结果姿态不一致"
+                    )
         try:
             timestamp_ns = _stamp_to_ns(header.stamp)
         except (AttributeError, TypeError, ValueError):
