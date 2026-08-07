@@ -164,6 +164,9 @@ def _loaded_fsm(
     # 防止测试辅助层忽略显式超时配置，从而让边界测试实际运行在默认无超时模式。
     phase_timeouts_ns: dict[GlobalPhase, int] | None = None,
     # ————————————————————————————————
+    *,
+    max_timeout_recoveries_per_phase: int = 1,
+    max_place_retries: int = 1,
 ) -> GlobalFSM:
     raw = json.dumps(_official_task_data())
     task = InstructionParser().parse(raw, 100)[0]
@@ -173,6 +176,8 @@ def _loaded_fsm(
         # 【Codex修改-18：测试辅助构造器传递超时策略】
         # 防止调用GlobalFSM时漏传上方策略，确保测试观察到真实配置行为。
         phase_timeouts_ns=phase_timeouts_ns,
+        max_timeout_recoveries_per_phase=max_timeout_recoveries_per_phase,
+        max_place_retries=max_place_retries,
         # ————————————————————————————————
     )
     assert fsm.handle_event(FSMEvent.SYSTEM_READY, 110)
@@ -183,6 +188,23 @@ def _loaded_fsm(
 def _advance(fsm: GlobalFSM, *events: FSMEvent, start_ns: int = 1_000) -> None:
     for timestamp_ns, event in enumerate(events, start=start_ns):
         assert fsm.handle_event(event, timestamp_ns)
+
+
+def _advance_to_verify_place(fsm: GlobalFSM, *, start_ns: int = 1_000) -> None:
+    _advance(
+        fsm,
+        FSMEvent.TARGET_FOUND,
+        FSMEvent.PICK_NAV_REACHED,
+        FSMEvent.TARGET_REFINED,
+        FSMEvent.PICK_PLAN_READY,
+        FSMEvent.PICK_EXECUTED,
+        FSMEvent.PICK_VERIFIED,
+        FSMEvent.PLACE_NAV_REACHED,
+        FSMEvent.PLACE_PLAN_READY,
+        FSMEvent.PLACE_EXECUTED,
+        start_ns=start_ns,
+    )
+    assert fsm.phase is GlobalPhase.VERIFY_PLACE
 
 
 def _execution_waypoint(
@@ -714,6 +736,171 @@ def test_exhausted_pick_retry_reason_survives_return_to_failed() -> None:
     assert fsm.status(2_300).failure_reason == "重试耗尽"
 
 
+def test_place_failed_is_only_legal_in_verify_place_and_restarts_search() -> None:
+    fsm = _loaded_fsm(max_place_retries=1)
+    assert not fsm.handle_event(FSMEvent.PLACE_FAILED, 150, "错序放置失败")
+    assert fsm.phase is GlobalPhase.SEARCH_TARGET
+    _advance_to_verify_place(fsm, start_ns=200)
+
+    assert fsm.handle_event(FSMEvent.PLACE_FAILED, 300, "首次真实放置失败")
+    assert fsm.phase is GlobalPhase.SEARCH_TARGET
+    assert fsm.phase not in {
+        GlobalPhase.PLAN_PLACE,
+        GlobalPhase.REFINE_TARGET,
+        GlobalPhase.DONE,
+    }
+    assert fsm._place_retry_count == 1
+    assert fsm.retry_count == 0
+    assert fsm.status(300).retry_count == 0
+    assert fsm.failure_reason == "首次真实放置失败"
+    assert not fsm.handle_event(FSMEvent.PLACE_PLAN_READY, 301)
+
+
+def test_place_recovery_resets_independent_pick_retry_budget() -> None:
+    fsm = _loaded_fsm(max_pick_retries=1, max_place_retries=1)
+    _advance(
+        fsm,
+        FSMEvent.TARGET_FOUND,
+        FSMEvent.PICK_NAV_REACHED,
+        FSMEvent.TARGET_REFINED,
+        FSMEvent.PICK_PLAN_READY,
+        FSMEvent.PICK_EXECUTED,
+        start_ns=200,
+    )
+    assert fsm.handle_event(FSMEvent.PICK_FAILED, 300, "可恢复抓取失败")
+    assert fsm.retry_count == 1
+    _advance(
+        fsm,
+        FSMEvent.TARGET_REFINED,
+        FSMEvent.PICK_PLAN_READY,
+        FSMEvent.PICK_EXECUTED,
+        FSMEvent.PICK_VERIFIED,
+        FSMEvent.PLACE_NAV_REACHED,
+        FSMEvent.PLACE_PLAN_READY,
+        FSMEvent.PLACE_EXECUTED,
+        start_ns=400,
+    )
+
+    assert fsm.handle_event(FSMEvent.PLACE_FAILED, 500, "放置不在目标区")
+    assert fsm.retry_count == 0
+    assert fsm._place_retry_count == 1
+
+
+def test_place_recovery_exhaustion_preserves_first_root_until_failed() -> None:
+    fsm = _loaded_fsm(max_place_retries=1)
+    _advance_to_verify_place(fsm, start_ns=200)
+    assert fsm.handle_event(FSMEvent.PLACE_FAILED, 300, "首个放置根因")
+    _advance_to_verify_place(fsm, start_ns=400)
+
+    assert fsm.handle_event(FSMEvent.PLACE_FAILED, 500, "后续重复诊断")
+    expected_reason = "首个放置根因；放置恢复次数耗尽（已用1/1次）"
+    assert fsm.phase is GlobalPhase.RETURN_END
+    assert fsm.failure_reason == expected_reason
+    assert "后续重复诊断" not in fsm.failure_reason
+    assert not fsm.handle_event(FSMEvent.PLACE_FAILED, 501, "再次重复")
+    assert fsm.failure_reason == expected_reason
+
+    assert fsm.handle_event(FSMEvent.RETURN_REACHED, 600)
+    assert fsm.phase is GlobalPhase.FAILED
+    assert fsm.failure_reason == expected_reason
+
+
+def test_place_verified_after_recovery_clears_temporary_failure() -> None:
+    fsm = _loaded_fsm(max_place_retries=1)
+    _advance_to_verify_place(fsm, start_ns=200)
+    assert fsm.handle_event(FSMEvent.PLACE_FAILED, 300, "可恢复放置失败")
+    _advance_to_verify_place(fsm, start_ns=400)
+
+    assert fsm.handle_event(FSMEvent.PLACE_VERIFIED, 500)
+    assert fsm.phase is GlobalPhase.RETURN_END
+    assert fsm.failure_reason == ""
+    assert fsm._place_failure_reason == ""
+    assert fsm._place_retry_count == 0
+    assert fsm.handle_event(FSMEvent.RETURN_REACHED, 501)
+    assert fsm.phase is GlobalPhase.DONE
+
+
+def test_place_failed_is_rejected_by_terminal_states() -> None:
+    done_fsm = _loaded_fsm()
+    _advance_to_verify_place(done_fsm, start_ns=200)
+    assert done_fsm.handle_event(FSMEvent.PLACE_VERIFIED, 300)
+    assert done_fsm.handle_event(FSMEvent.RETURN_REACHED, 301)
+    assert not done_fsm.handle_event(FSMEvent.PLACE_FAILED, 302, "迟到事件")
+    assert done_fsm.phase is GlobalPhase.DONE
+
+    failed_fsm = GlobalFSM()
+    assert failed_fsm.handle_event(FSMEvent.FAILURE, 400, "启动失败")
+    assert not failed_fsm.handle_event(FSMEvent.PLACE_FAILED, 401, "迟到事件")
+    assert failed_fsm.phase is GlobalPhase.FAILED
+
+
+def test_zero_place_retries_returns_before_final_failure() -> None:
+    fsm = _loaded_fsm(max_place_retries=0)
+    _advance_to_verify_place(fsm, start_ns=200)
+
+    assert fsm.handle_event(FSMEvent.PLACE_FAILED, 300, "放置失败")
+    assert fsm.phase is GlobalPhase.RETURN_END
+    assert fsm._place_retry_count == 0
+    assert "放置恢复次数耗尽" in fsm.failure_reason
+    assert fsm.handle_event(FSMEvent.RETURN_REACHED, 301)
+    assert fsm.phase is GlobalPhase.FAILED
+
+
+def test_reset_after_real_place_failure_clears_recovery_context() -> None:
+    fsm = _loaded_fsm(max_place_retries=1)
+    _advance_to_verify_place(fsm, start_ns=200)
+    assert fsm.handle_event(FSMEvent.PLACE_FAILED, 1_100, "真实放置验证失败")
+    assert fsm.phase is GlobalPhase.SEARCH_TARGET
+    assert fsm._place_retry_count == 1
+    assert fsm._place_failure_reason == "真实放置验证失败"
+    assert fsm.failure_reason == "真实放置验证失败"
+
+    assert fsm.handle_event(FSMEvent.RESET, 10)
+    assert fsm.phase is GlobalPhase.WAIT_READY
+    assert fsm.task is None
+    assert fsm.retry_count == 0
+    assert fsm._place_retry_count == 0
+    assert fsm._place_failure_reason == ""
+    assert fsm.failure_reason == ""
+    assert fsm._fail_after_return is False
+    assert fsm._interrupted_phase is None
+    assert fsm._interrupted_elapsed_ns is None
+    assert fsm._phase_elapsed_offset_ns == 0
+    assert fsm._safe_hold_reason == ""
+    assert fsm._safe_hold_cause is None
+    assert fsm._timeout_recovery_count == 0
+    assert fsm.phase_entered_ns == 10
+    assert fsm._last_transition_ns == 10
+    assert not fsm.handle_event(FSMEvent.PLACE_FAILED, 1_101, "旧任务迟到回执")
+    assert fsm.phase is GlobalPhase.WAIT_READY
+
+
+def test_stale_place_failed_cannot_cross_verify_place_boundary() -> None:
+    fsm = _loaded_fsm(max_place_retries=1)
+    _advance_to_verify_place(fsm, start_ns=200)
+    verify_place_entered_ns = fsm.phase_entered_ns
+    assert verify_place_entered_ns is not None
+    original_reason = fsm.failure_reason
+
+    assert not fsm.handle_event(
+        FSMEvent.PLACE_FAILED,
+        verify_place_entered_ns - 1,
+        "迟到放置失败",
+    )
+    assert fsm.phase is GlobalPhase.VERIFY_PLACE
+    assert fsm._place_retry_count == 0
+    assert fsm.failure_reason == original_reason
+    assert fsm.phase_entered_ns == verify_place_entered_ns
+
+    assert fsm.handle_event(
+        FSMEvent.PLACE_FAILED,
+        verify_place_entered_ns + 1,
+        "新鲜放置失败",
+    )
+    assert fsm.phase is GlobalPhase.SEARCH_TARGET
+    assert fsm._place_retry_count == 1
+
+
 # ————————————————————————————————
 # 【Codex修改-23：状态读取无副作用】
 # 防止phase_elapsed_ns或status读取推进FSM、触发超时或刷新阶段进入时间。
@@ -808,10 +995,9 @@ def test_no_timeout_policy_preserves_compatibility() -> None:
 
 
 # ————————————————————————————————
-# 【Codex修改-25：阶段超时边界直接进入FAILED】
-# 防止配置超时进入可恢复SAFE_HOLD、RETURN_END或DONE，并核对完整超时诊断文本。
+# 阶段超时边界必须进入可审计的 SAFE_HOLD，不得跳转到返区或成功终态。
 # ————————————————————————————————
-def test_configured_timeout_uses_exact_boundary_and_enters_failed() -> None:
+def test_configured_timeout_uses_exact_boundary_and_enters_safe_hold() -> None:
     fsm = _loaded_fsm(phase_timeouts_ns={GlobalPhase.SEARCH_TARGET: 10})
     assert not fsm.check_timeout(129)
     assert fsm.phase is GlobalPhase.SEARCH_TARGET
@@ -819,17 +1005,23 @@ def test_configured_timeout_uses_exact_boundary_and_enters_failed() -> None:
 
     assert fsm.check_timeout(130)
     status = fsm.status(130)
-    assert status.global_phase is GlobalPhase.FAILED
-    assert status.global_phase not in {
-        GlobalPhase.SAFE_HOLD,
-        GlobalPhase.RETURN_END,
-        GlobalPhase.DONE,
-    }
+    assert status.global_phase is GlobalPhase.SAFE_HOLD
+    assert status.global_phase not in {GlobalPhase.RETURN_END, GlobalPhase.DONE}
     assert status.success is False
     assert "SEARCH_TARGET阶段超时" in status.failure_reason
     assert "实际活动时间10ns" in status.failure_reason
     assert "配置限制10ns" in status.failure_reason
     assert fsm.phase_entered_ns == 130
+    assert fsm._interrupted_phase is GlobalPhase.SEARCH_TARGET
+    assert fsm._interrupted_elapsed_ns == 10
+    failure_reason_before_status = fsm.failure_reason
+    safe_hold_reason_before_status = fsm._safe_hold_reason
+    assert fsm.status(130) == status
+    assert fsm.failure_reason == failure_reason_before_status
+    assert fsm._safe_hold_reason == safe_hold_reason_before_status
+    assert not fsm.handle_event(FSMEvent.TARGET_FOUND, 131)
+    assert not fsm.handle_event(FSMEvent.PLACE_VERIFIED, 132)
+    assert fsm.phase is GlobalPhase.SAFE_HOLD
 
 
 # ————————————————————————————————
@@ -853,7 +1045,10 @@ def test_external_safe_hold_saves_elapsed_time_before_pause() -> None:
 # 防止安全暂停时长被算入业务耗时，也防止恢复时重新获得一整份阶段预算。
 # ————————————————————————————————
 def test_safe_hold_recovery_preserves_elapsed_timeout_budget() -> None:
-    fsm = _loaded_fsm(phase_timeouts_ns={GlobalPhase.SEARCH_TARGET: 100})
+    fsm = _loaded_fsm(
+        phase_timeouts_ns={GlobalPhase.SEARCH_TARGET: 100},
+        max_timeout_recoveries_per_phase=0,
+    )
     assert fsm.phase_elapsed_ns(150) == 30
     assert fsm.handle_event(FSMEvent.SAFETY_HOLD, 150, "短暂安全暂停")
     assert fsm._interrupted_elapsed_ns == 30
@@ -873,7 +1068,10 @@ def test_safe_hold_recovery_preserves_elapsed_timeout_budget() -> None:
 # 防止第二次暂停覆盖第一次已用预算，或把两段长暂停时长累加到业务阶段。
 # ————————————————————————————————
 def test_multiple_safe_holds_accumulate_only_active_elapsed_time() -> None:
-    fsm = _loaded_fsm(phase_timeouts_ns={GlobalPhase.SEARCH_TARGET: 100})
+    fsm = _loaded_fsm(
+        phase_timeouts_ns={GlobalPhase.SEARCH_TARGET: 100},
+        max_timeout_recoveries_per_phase=0,
+    )
     assert fsm.handle_event(FSMEvent.SAFETY_HOLD, 150, "第一次暂停")
     assert fsm.handle_event(FSMEvent.SAFETY_RECOVERED, 1_000)
     assert fsm.phase_entered_ns == 1_000
@@ -900,13 +1098,159 @@ def test_multiple_safe_holds_accumulate_only_active_elapsed_time() -> None:
 def test_timeout_failure_is_terminal_and_cannot_recover() -> None:
     fsm = _loaded_fsm(phase_timeouts_ns={GlobalPhase.SEARCH_TARGET: 10})
     assert fsm.check_timeout(130)
+    assert fsm.phase is GlobalPhase.SAFE_HOLD
+    assert fsm.handle_event(FSMEvent.SAFETY_RECOVERED, 1_000)
+    assert fsm.phase is GlobalPhase.SEARCH_TARGET
+    assert fsm.phase_entered_ns == 1_000
+    assert fsm.phase_elapsed_ns(1_000) == 0
+    assert fsm._timeout_recovery_count == 1
+    assert not fsm.check_timeout(1_009)
+    assert fsm.check_timeout(1_010)
     original_reason = fsm.failure_reason
 
     assert fsm.phase is GlobalPhase.FAILED
+    assert "SEARCH_TARGET阶段超时" in original_reason
+    assert "实际活动时间10ns" in original_reason
+    assert "配置限制10ns" in original_reason
+    assert "超时恢复机会耗尽" in original_reason
+    assert fsm._timeout_recovery_count == 1
     assert not fsm.handle_event(FSMEvent.SAFETY_RECOVERED, 1_000)
-    assert not fsm.handle_event(FSMEvent.FAILURE, 1_001, "重复失败")
+    assert not fsm.handle_event(FSMEvent.FAILURE, 1_011, "重复失败")
     assert fsm.phase is GlobalPhase.FAILED
     assert fsm.failure_reason == original_reason
+
+
+def test_timeout_recovery_uses_real_time_and_gets_full_new_budget() -> None:
+    fsm = _loaded_fsm(phase_timeouts_ns={GlobalPhase.SEARCH_TARGET: 100})
+    assert fsm.check_timeout(220)
+    assert fsm.phase is GlobalPhase.SAFE_HOLD
+
+    assert fsm.handle_event(FSMEvent.SAFETY_RECOVERED, 10_000)
+    assert fsm.phase is GlobalPhase.SEARCH_TARGET
+    assert fsm.phase_entered_ns == 10_000
+    assert fsm.phase_elapsed_ns(10_000) == 0
+    assert not fsm.check_timeout(10_099)
+    assert fsm.check_timeout(10_100)
+    assert fsm.phase is GlobalPhase.FAILED
+
+
+def test_multiple_configured_timeout_recoveries_are_bounded() -> None:
+    fsm = _loaded_fsm(
+        phase_timeouts_ns={GlobalPhase.SEARCH_TARGET: 10},
+        max_timeout_recoveries_per_phase=2,
+    )
+
+    assert not fsm.check_timeout(129)
+    assert fsm.check_timeout(130)
+    assert fsm.phase is GlobalPhase.SAFE_HOLD
+    assert fsm.handle_event(FSMEvent.SAFETY_RECOVERED, 200)
+    assert fsm.phase is GlobalPhase.SEARCH_TARGET
+    assert fsm.phase_entered_ns == 200
+    assert fsm.phase_elapsed_ns(200) == 0
+    assert fsm._timeout_recovery_count == 1
+
+    assert not fsm.check_timeout(209)
+    assert fsm.check_timeout(210)
+    assert fsm.phase is GlobalPhase.SAFE_HOLD
+    assert fsm.handle_event(FSMEvent.SAFETY_RECOVERED, 300)
+    assert fsm.phase is GlobalPhase.SEARCH_TARGET
+    assert fsm.phase_entered_ns == 300
+    assert fsm.phase_elapsed_ns(300) == 0
+    assert fsm._timeout_recovery_count == 2
+
+    assert not fsm.check_timeout(309)
+    assert fsm.check_timeout(310)
+    assert fsm.phase is GlobalPhase.FAILED
+    assert fsm.phase is not GlobalPhase.SAFE_HOLD
+    assert "SEARCH_TARGET阶段超时" in fsm.failure_reason
+    assert "实际活动时间10ns" in fsm.failure_reason
+    assert "配置限制10ns" in fsm.failure_reason
+    assert "超时恢复机会耗尽" in fsm.failure_reason
+    assert "已用2/2次" in fsm.failure_reason
+    final_reason = fsm.failure_reason
+    assert not fsm.handle_event(FSMEvent.SAFETY_RECOVERED, 310)
+    assert not fsm.handle_event(FSMEvent.TARGET_FOUND, 311)
+    assert fsm.phase is GlobalPhase.FAILED
+    assert fsm.failure_reason == final_reason
+
+
+def test_external_hold_after_timeout_recovery_does_not_restore_timeout_quota() -> None:
+    fsm = _loaded_fsm(
+        phase_timeouts_ns={GlobalPhase.SEARCH_TARGET: 10},
+        max_timeout_recoveries_per_phase=1,
+    )
+    assert fsm.check_timeout(130)
+    assert fsm.handle_event(FSMEvent.SAFETY_RECOVERED, 200)
+    assert fsm.phase is GlobalPhase.SEARCH_TARGET
+    assert fsm._timeout_recovery_count == 1
+
+    assert fsm.phase_elapsed_ns(204) == 4
+    assert fsm.handle_event(FSMEvent.SAFETY_HOLD, 204, "外部安全暂停")
+    assert fsm._interrupted_elapsed_ns == 4
+    assert fsm.handle_event(FSMEvent.SAFETY_RECOVERED, 300)
+    assert fsm.phase is GlobalPhase.SEARCH_TARGET
+    assert fsm._timeout_recovery_count == 1
+    assert fsm.phase_entered_ns == 300
+    assert fsm.phase_elapsed_ns(300) == 4
+
+    assert not fsm.check_timeout(305)
+    assert fsm.check_timeout(306)
+    assert fsm.phase is GlobalPhase.FAILED
+    assert "已用1/1次" in fsm.failure_reason
+
+
+def test_timeout_safe_hold_failure_is_immediately_terminal() -> None:
+    fsm = _loaded_fsm(phase_timeouts_ns={GlobalPhase.SEARCH_TARGET: 10})
+    assert fsm.check_timeout(130)
+    timeout_reason = fsm._safe_hold_reason
+
+    assert fsm.handle_event(FSMEvent.FAILURE, 140, "硬件故障无法恢复")
+    assert fsm.phase is GlobalPhase.FAILED
+    assert fsm.phase is not GlobalPhase.RETURN_END
+    assert timeout_reason in fsm.failure_reason
+    assert "安全恢复失败：硬件故障无法恢复" in fsm.failure_reason
+    assert fsm._interrupted_phase is None
+    assert fsm._safe_hold_reason == ""
+
+
+def test_zero_timeout_recoveries_fails_on_first_boundary() -> None:
+    fsm = _loaded_fsm(
+        phase_timeouts_ns={GlobalPhase.SEARCH_TARGET: 10},
+        max_timeout_recoveries_per_phase=0,
+    )
+
+    assert fsm.check_timeout(130)
+    assert fsm.phase is GlobalPhase.FAILED
+    assert "超时恢复机会耗尽" in fsm.failure_reason
+    assert "已用0/0次" in fsm.failure_reason
+
+
+def test_timeout_recovery_count_clears_on_real_forward_transition() -> None:
+    fsm = _loaded_fsm(
+        phase_timeouts_ns={
+            GlobalPhase.SEARCH_TARGET: 10,
+            GlobalPhase.NAV_TO_PICK: 10,
+        }
+    )
+    assert fsm.check_timeout(130)
+    assert fsm.handle_event(FSMEvent.SAFETY_RECOVERED, 200)
+    assert fsm._timeout_recovery_count == 1
+
+    assert fsm.handle_event(FSMEvent.TARGET_FOUND, 201)
+    assert fsm.phase is GlobalPhase.NAV_TO_PICK
+    assert fsm._timeout_recovery_count == 0
+    assert fsm.check_timeout(211)
+    assert fsm.phase is GlobalPhase.SAFE_HOLD
+
+
+def test_stale_timeout_check_and_recovery_cannot_cross_hold_boundary() -> None:
+    fsm = _loaded_fsm(phase_timeouts_ns={GlobalPhase.SEARCH_TARGET: 10})
+    assert fsm.check_timeout(130)
+    status_before = fsm.status(130)
+
+    assert not fsm.check_timeout(129)
+    assert not fsm.handle_event(FSMEvent.SAFETY_RECOVERED, 129)
+    assert fsm.status(130) == status_before
 
 
 # ————————————————————————————————
@@ -998,10 +1342,30 @@ def test_safe_hold_failure_enters_failed_and_preserves_diagnostics() -> None:
     assert fsm._interrupted_elapsed_ns is None
     assert fsm._phase_elapsed_offset_ns == 0
     assert fsm._safe_hold_reason == ""
+    assert fsm._safe_hold_cause is None
+    assert fsm._timeout_recovery_count == 0
+    assert fsm._place_retry_count == 0
+    assert fsm._place_failure_reason == ""
     assert not fsm.handle_event(FSMEvent.FAILURE, 321, "重复失败")
     assert fsm.failure_reason == (
         "原失败：一次可恢复抓取失败；安全暂停失败：安全条件不可恢复"
     )
+
+
+def test_submit_task_clears_new_recovery_state() -> None:
+    raw = json.dumps(_official_task_data())
+    task = InstructionParser().parse(raw, 100)[0]
+    fsm = GlobalFSM()
+    assert fsm.handle_event(FSMEvent.SYSTEM_READY, 110)
+    # 预置内部状态，验证任务装载边界不会继承上一任务的恢复上下文。
+    fsm._place_retry_count = 1
+    fsm._place_failure_reason = "旧放置故障"
+    fsm._timeout_recovery_count = 1
+
+    assert fsm.submit_task(task, 120)
+    assert fsm._place_retry_count == 0
+    assert fsm._place_failure_reason == ""
+    assert fsm._timeout_recovery_count == 0
 
 
 # ————————————————————————————————
@@ -1160,6 +1524,10 @@ def test_reset_clears_all_fsm_runtime_state() -> None:
     assert fsm._interrupted_elapsed_ns is None
     assert fsm._phase_elapsed_offset_ns == 0
     assert fsm._safe_hold_reason == ""
+    assert fsm._safe_hold_cause is None
+    assert fsm._timeout_recovery_count == 0
+    assert fsm._place_retry_count == 0
+    assert fsm._place_failure_reason == ""
 
 
 def test_wait_ready_rejects_configured_phase_timeout() -> None:
@@ -1217,6 +1585,28 @@ def test_fsm_timeout_policy_is_copied_and_read_only() -> None:
 def test_fsm_rejects_invalid_internal_retry_limits(value: object) -> None:
     with pytest.raises(ValueError, match="max_pick_retries"):
         GlobalFSM(max_pick_retries=value)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "parameter",
+    ("max_timeout_recoveries_per_phase", "max_place_retries"),
+)
+@pytest.mark.parametrize("value", [True, 1.0, "1", -1])
+def test_fsm_rejects_invalid_recovery_limits(
+    parameter: str, value: object
+) -> None:
+    with pytest.raises(ValueError, match=parameter):
+        GlobalFSM(**{parameter: value})  # type: ignore[arg-type]
+
+
+def test_new_recovery_limits_are_keyword_only_and_old_calls_still_work() -> None:
+    assert GlobalFSM().max_timeout_recoveries_per_phase == 1
+    assert GlobalFSM(max_pick_retries=2).max_pick_retries == 2
+    assert GlobalFSM(2, {GlobalPhase.SEARCH_TARGET: 10}).phase_timeouts_ns == {
+        GlobalPhase.SEARCH_TARGET: 10
+    }
+    with pytest.raises(TypeError):
+        GlobalFSM(1, None, 1)  # type: ignore[misc]
 
 
 def test_fsm_requires_public_contract_types() -> None:
