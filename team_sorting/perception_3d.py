@@ -10,9 +10,11 @@
 计算左右夹爪目标。Odom 只给出底盘位姿；slide 和 head 关节会改变头部相机相对底盘的
 位置与朝向，因此还必须使用实际 ``RobotJointState`` 和 ``MMK2FK`` 闭合坐标链。
 
-MMK2FK、MuJoCo、SciPy 和 NumPy 均按需延迟导入。物体尺寸由调用方注入；已知尺寸时
-沿相机射线把可见表面点补偿到近似几何中心，未知尺寸时明确返回无效估计，禁止把
-表面点冒充物体中心继续下传。
+MMK2FK、MuJoCo、SciPy 和 NumPy 均按需延迟导入。启发式中心补偿尺寸和物体局部
+XYZ 完整尺寸由调用方通过两个语义独立的映射注入：前者只用于沿相机射线把可见
+表面点补偿到近似几何中心，后者只在来源明确时写入 ``ObjectEstimate3D.size_xyz_m``。
+未知中心补偿尺寸时明确返回无效估计；未知局部尺寸时继续输出 ``None``，禁止把两类
+尺寸互相冒充。
 """
 
 from __future__ import annotations
@@ -590,6 +592,9 @@ class Perception3DEstimator:
         object_dimensions_m: Optional[
             dict[str, tuple[float, float, float]]
         ] = None,
+        object_local_size_xyz_m: Optional[
+            dict[str, tuple[float, float, float]]
+        ] = None,
         ambiguity_ratio: float = 2.0,
         center_compensation_mode: str = "degraded",
         heuristic_center_reliability: float = 0.5,
@@ -598,6 +603,9 @@ class Perception3DEstimator:
 
         ``object_dimensions_m`` 的值依次为宽、高、沿相机视线近似深度，单位米；它只
         服务当前启发式中心补偿，不是经过frame语义确认的物体局部XYZ尺寸生产源。
+        ``object_local_size_xyz_m`` 的值是物体局部坐标系下完整 XYZ 三轴尺寸，单位
+        米；只有该独立来源明确提供对应类别时，结果才填写 ``size_xyz_m``。随机 yaw
+        不会交换这三个局部轴，也不会从 ``object_dimensions_m`` 猜测缺失尺寸。
         ``max_track_age_s`` 为轨迹超时秒数，``max_input_skew_s`` 为
         Detection/Depth/CameraInfo 最大绝对时间差秒数，``max_position_jump_m``
         为相邻有效轨迹点允许的最大三维跳变。``ambiguity_ratio`` 控制稳定ID与其他
@@ -667,6 +675,31 @@ class Perception3DEstimator:
                 )
             normalized_dimensions[class_id] = (width, height, depth_extent)
 
+        local_sizes = (
+            dict(object_local_size_xyz_m) if object_local_size_xyz_m else {}
+        )
+        normalized_local_sizes: dict[str, tuple[float, float, float]] = {}
+        for class_id, values in local_sizes.items():
+            if (
+                not isinstance(class_id, str)
+                or not class_id.strip()
+                or class_id != class_id.strip()
+            ):
+                raise ValueError(
+                    "object_local_size_xyz_m 的类别键必须是无首尾空白的非空字符串"
+                )
+            size_x, size_y, size_z = _finite_vector(
+                values,
+                3,
+                f"object_local_size_xyz_m[{class_id!r}]",
+            )
+            if size_x <= 0.0 or size_y <= 0.0 or size_z <= 0.0:
+                raise ValueError(
+                    f"object_local_size_xyz_m[{class_id!r}] 的局部XYZ完整尺寸"
+                    "必须均为正数"
+                )
+            normalized_local_sizes[class_id] = (size_x, size_y, size_z)
+
         self.transform_provider = transform_provider
         self.depth_radius_px = int(depth_radius_px)
         self.ema_alpha = alpha
@@ -678,6 +711,7 @@ class Perception3DEstimator:
         self.center_compensation_mode = center_compensation_mode
         self.heuristic_center_reliability = center_reliability
         self._dims = normalized_dimensions
+        self._local_sizes = normalized_local_sizes
         self._tracks: dict[str, _Track] = {}
         self._last_frame_ts_ns: Optional[int] = None
         self._last_detection_frame_ts_ns: Optional[int] = None
@@ -1045,8 +1079,8 @@ class Perception3DEstimator:
             ),
             object_id=track_key,
             orientation_xyzw=None,
-            # _dims第三轴是相机视线近似深度；随机yaw下不能冒充物体局部XYZ尺寸。
-            size_xyz_m=None,
+            # 姿态仍无真实观测来源；不能用单位四元数或官方初始姿态冒充实时姿态。
+            size_xyz_m=self._local_sizes.get(detection.class_id),
         )
 
     def _surface_probe(
