@@ -501,6 +501,24 @@ def test_navigation_pick_goal_stands_off_and_faces_object() -> None:
     )
 
 
+def test_navigation_pick_goal_rejects_mismatched_class_and_coincident_base() -> None:
+    controller = NavigationController()
+    with pytest.raises(ValueError, match="class_id"):
+        controller.build_pick_goal(
+            _nav_task(),
+            ObjectEstimate3D("yellow", (2.0, 0.0, 0.8), 0.9, "odom", 1_000_000_000),
+            _nav_base(),
+            1_000_000_000,
+        )
+    with pytest.raises(ValueError, match="重合"):
+        controller.build_pick_goal(
+            _nav_task(),
+            ObjectEstimate3D("pink", (0.0, 0.0, 0.8), 0.9, "odom", 1_000_000_000),
+            _nav_base(),
+            1_000_000_000,
+        )
+
+
 @pytest.mark.parametrize("bad_x", [math.nan, math.inf])
 def test_navigation_pick_goal_rejects_invalid_coordinates_and_frame(bad_x: float) -> None:
     controller = NavigationController()
@@ -520,21 +538,82 @@ def test_navigation_pick_goal_rejects_invalid_coordinates_and_frame(bad_x: float
         )
 
 
-def test_navigation_place_goal_requires_approved_world_to_planning_transform() -> None:
+def test_navigation_place_goal_uses_f1_alignment_and_stands_off() -> None:
     controller = NavigationController()
     task = _nav_task()
-    with pytest.raises(NotImplementedError, match="world→planning"):
-        controller.build_place_goal(task, _nav_base(frame="odom"), 1_000_000_000)
-    with pytest.raises(NotImplementedError, match="world→planning"):
+    goal = controller.build_place_goal(task, _nav_base(frame="odom"), 1_000_000_000)
+    assert goal.goal_type == "place"
+    assert goal.frame_id == "odom"
+    assert goal.pose_xyyaw[:2] != pytest.approx(task.place_world_xyz[:2])
+    assert distance_xy(goal.pose_xyyaw, task.place_world_xyz) == pytest.approx(0.6)
+    assert goal.pose_xyyaw[2] == pytest.approx(
+        math.atan2(
+            task.place_world_xyz[1] - goal.pose_xyyaw[1],
+            task.place_world_xyz[0] - goal.pose_xyyaw[0],
+        )
+    )
+
+
+def test_navigation_place_goal_rejects_wrong_frames_and_invalid_coordinates() -> None:
+    controller = NavigationController()
+    with pytest.raises(ValueError, match='BaseState.frame_id.*"odom"'):
         controller.build_place_goal(
-            task, _nav_base(frame="world"), 1_000_000_000
+            _nav_task(), _nav_base(frame="world"), 1_000_000_000
         )
     with pytest.raises(ValueError):
         controller.build_place_goal(
             _nav_task((math.nan, 0.0, 0.5)),
-            _nav_base(frame="world"),
+            _nav_base(),
             1_000_000_000,
         )
+
+
+def test_navigation_return_goal_is_fixed_f5_pose_without_standoff() -> None:
+    config = NavigationConfig(goal_timeout_ns=123_456)
+    goal = NavigationController(config).build_return_goal(
+        _nav_base(x=8.0, y=-3.0, yaw=-1.0), 1_000_000_000
+    )
+    assert goal.goal_type == "return"
+    assert goal.pose_xyyaw == (-0.70, 0.55, math.pi / 2.0)
+    assert goal.frame_id == "odom"
+    assert goal.position_tolerance == config.position_tolerance_m
+    assert goal.yaw_tolerance == config.yaw_tolerance_rad
+    assert goal.deadline_ns == 1_000_123_456
+    assert "return" in goal.goal_id and "1000000000" in goal.goal_id
+
+
+def test_navigation_return_goal_rejects_invalid_stale_or_wrong_frame_odom() -> None:
+    controller = NavigationController(NavigationConfig(odom_max_age_ns=100))
+    for base in (
+        _nav_base(valid=False, stamp=1_000),
+        _nav_base(stamp=899),
+        _nav_base(frame="world", stamp=1_000),
+    ):
+        with pytest.raises(ValueError):
+            controller.build_return_goal(base, 1_000)
+
+
+def test_navigation_all_goal_types_share_the_same_odom_update_path() -> None:
+    controller = NavigationController()
+    base = _nav_base()
+    task = _nav_task()
+    goals = (
+        controller.build_pick_goal(
+            task,
+            ObjectEstimate3D("pink", (2.0, 0.0, 0.8), 0.9, "odom", 1_000_000_000),
+            base,
+            1_000_000_000,
+        ),
+        controller.build_place_goal(task, base, 1_000_000_000),
+        controller.build_return_goal(base, 1_000_000_000),
+    )
+    for goal in goals:
+        command, status = controller.update(base, goal, 1_000_000_000)
+        assert command.valid
+        assert command.valid_until_ns == 1_200_000_000
+        assert status.goal_id == goal.goal_id
+        assert status.state in {"aligning_to_goal", "moving"}
+        assert not status.success
 
 
 def test_navigation_goal_generation_rejects_stale_base_and_target_at_boundary() -> None:
@@ -652,6 +731,31 @@ def test_navigation_deadline_is_exclusive_and_stops_at_equal_timestamp() -> None
     assert not command.valid
     assert status.state == "timeout"
     assert not status.success
+
+
+@pytest.mark.parametrize("timestamp", [True, -1, 1.0])
+def test_navigation_update_fails_closed_for_invalid_cycle_timestamps(
+    timestamp: object,
+) -> None:
+    command, status = NavigationController().update(
+        _nav_base(), _nav_goal(1.0, 0.0, 0.0), timestamp  # type: ignore[arg-type]
+    )
+    assert (command.v, command.w) == (0.0, 0.0)
+    assert not command.valid
+    assert command.valid_until_ns == 200_000_000
+    assert status.state == "failed" and not status.success
+    assert status.failure_reason
+
+
+def test_navigation_update_rejects_odom_timestamp_from_the_future() -> None:
+    command, status = NavigationController().update(
+        _nav_base(stamp=1_000_000_001),
+        _nav_goal(1.0, 0.0, 0.0),
+        1_000_000_000,
+    )
+    assert (command.v, command.w) == (0.0, 0.0)
+    assert not command.valid
+    assert status.state == "failed" and "晚于" in status.failure_reason
 
 
 def test_navigation_fails_closed_when_finite_arithmetic_overflows() -> None:

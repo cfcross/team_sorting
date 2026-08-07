@@ -33,6 +33,11 @@ from .interfaces import (
     TaskSpec,
 )
 
+_ODOM_FRAME_ID = "odom"
+_WORLD_FRAME_ID = "world"
+_RETURN_END_POSE_XYYAW = (-0.70, 0.55, math.pi / 2.0)
+
+
 def _finite_real(value: object, field_name: str) -> float:
     """把真实数转换为有限浮点数，并统一基础几何函数的错误说明。"""
 
@@ -242,6 +247,10 @@ class NavigationController:
         self._validate_base(base, now, require_fresh=True)
         if not isinstance(target, ObjectEstimate3D) or not target.valid:
             raise ValueError("ObjectEstimate3D 无效")
+        if target.class_id != task.target_color:
+            raise ValueError(
+                "ObjectEstimate3D.class_id 必须与 TaskSpec.target_color 一致"
+            )
         target_stamp = self._timestamp(target.timestamp_ns, "target.timestamp_ns")
         if target_stamp > now:
             raise ValueError("ObjectEstimate3D 时间戳晚于当前周期")
@@ -251,7 +260,9 @@ class NavigationController:
             raise ValueError("target.position_xyz 必须包含三项")
         target_x, target_y = _read_xy(target.position_xyz, "target.position_xyz")
         _finite_real(target.position_xyz[2], "target.position_xyz.z")
-        if not target.frame_id or target.frame_id != base.frame_id:
+        if base.frame_id != _ODOM_FRAME_ID or target.frame_id != _ODOM_FRAME_ID:
+            raise ValueError('抓取导航要求 target/base frame_id 严格为 "odom"')
+        if target.frame_id != base.frame_id:
             raise ValueError("目标与 BaseState frame 不一致，且仓库没有坐标转换接口")
         # 物体中心只用于反算站位，不能直接复制为底盘停车点。
         goal_x, goal_y, goal_yaw = self._stand_off_pose(
@@ -271,21 +282,59 @@ class NavigationController:
     def build_place_goal(self, task: TaskSpec, base: BaseState, timestamp_ns: int) -> NavGoal:
         """根据 ``TaskSpec.place_world_xyz`` 反算放置时的底盘站位。
 
-        ``place_world_xyz`` 是物体最终中心，单位米，不是底盘停车点。由于公共接口没有
-        world 到 odom 的转换，本方法只接受已经位于 world frame 的 ``BaseState``，避免
-        暗中假设 ``world == odom``。
+        ``place_world_xyz`` 是物体最终中心，单位米，不是底盘停车点。当前按冻结的 F1
+        约定把 world 数值坐标显式复制为 odom 数值坐标；这是绑定当前官方镜像的
+        world/odom 对齐策略，不是通用 frame 转换，也不会创建或查询 ROS TF。
         """
 
         now = self._timestamp(timestamp_ns, "timestamp_ns")
         self._validate_task(task, now)
         self._validate_base(base, now, require_fresh=True)
+        if task.place_frame_id != _WORLD_FRAME_ID:
+            raise ValueError('TaskSpec.place_frame_id 必须严格为 "world"')
+        if base.frame_id != _ODOM_FRAME_ID:
+            raise ValueError('BaseState.frame_id 必须严格为 "odom"')
         if task.place_world_xyz is None or len(task.place_world_xyz) != 3:
             raise ValueError("TaskSpec.place_world_xyz 必须包含 world 三维坐标")
         place_x, place_y = _read_xy(task.place_world_xyz, "task.place_world_xyz")
         _finite_real(task.place_world_xyz[2], "task.place_world_xyz.z")
-        raise NotImplementedError(
-            "place_world_xyz 位于 world，但当前 planning frame 为 odom；"
-            "world→planning 显式转换契约尚未批准，禁止生成不可执行的放置 NavGoal"
+        # F1：当前官方镜像中 world 与 odom 数值对齐。此处是镜像绑定的数值复制，
+        # 不是一般 ROS 坐标变换；若官方镜像改变，调用方必须先更新冻结约定。
+        place_odom_xyz = (place_x, place_y, float(task.place_world_xyz[2]))
+        goal_x, goal_y, goal_yaw = self._stand_off_pose(
+            place_odom_xyz[0], place_odom_xyz[1], base.position_xyz
+        )
+        self._finite_vector((goal_x, goal_y, goal_yaw), "放置 NavGoal.pose_xyyaw")
+        return NavGoal(
+            f"place-{task.task_id}-{now}",
+            "place",
+            (goal_x, goal_y, goal_yaw),
+            _ODOM_FRAME_ID,
+            self._config.position_tolerance_m,
+            self._config.yaw_tolerance_rad,
+            now + self._config.goal_timeout_ns,
+        )
+
+    def build_return_goal(self, base: BaseState, timestamp_ns: int) -> NavGoal:
+        """生成冻结 F5 结束区目标，不依赖任务、视觉或退让站位。
+
+        目标位于 ``odom``，XY 单位米、yaw 单位弧度；固定位置是官方结束区中心，
+        ``pi/2`` 朝向 world/odom 的 +Y。到达仍必须由后续 ``update`` 使用实际 Odom
+        判断，生成本目标本身不表示已经返区。
+        """
+
+        now = self._timestamp(timestamp_ns, "timestamp_ns")
+        self._validate_base(base, now, require_fresh=True)
+        if base.frame_id != _ODOM_FRAME_ID:
+            raise ValueError('BaseState.frame_id 必须严格为 "odom"')
+        return NavGoal(
+            f"return-{now}",
+            "return",
+            _RETURN_END_POSE_XYYAW,
+            _ODOM_FRAME_ID,
+            self._config.position_tolerance_m,
+            self._config.yaw_tolerance_rad,
+            now + self._config.goal_timeout_ns,
         )
 
     def update(
