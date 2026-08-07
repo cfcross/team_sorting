@@ -861,6 +861,25 @@ def test_phase_specific_cleanup_preserves_cross_phase_pick_context() -> None:
     assert reset_calls["count"] == 0
 
 
+@pytest.mark.parametrize("phase", [GlobalPhase.DONE, GlobalPhase.FAILED])
+def test_terminal_phase_clears_visual_verification_caches(
+    phase: GlobalPhase,
+) -> None:
+    node = _node()
+    state = node._runtime_wiring
+    state.pick_observation_before_lift = _estimate("target-a", 0.9)
+    state.latest_grasp_verification = object()
+    state.place_observation_before_release = _estimate("target-a", 0.9)
+    state.latest_place_verification_observation = _estimate("target-a", 0.9)
+
+    node._prepare_phase_transition(GlobalPhase.VERIFY_PLACE, phase)
+
+    assert state.pick_observation_before_lift is None
+    assert state.latest_grasp_verification is None
+    assert state.place_observation_before_release is None
+    assert state.latest_place_verification_observation is None
+
+
 def test_place_phase_cleanup_keeps_only_confirmed_grasp_and_place_trajectory() -> None:
     node = _node()
     state = node._runtime_wiring
@@ -1268,6 +1287,17 @@ def test_search_target_builds_real_feedback_from_selected_observation() -> None:
     assert (feedback.run_id, feedback.task_id, feedback.attempt) == ("run-1", 1, 0)
 
 
+def test_search_target_rejects_observation_before_phase_entry() -> None:
+    node, feedback = _visual_phase_result(
+        GlobalPhase.SEARCH_TARGET,
+        (_estimate("target-a", 0.9, timestamp_ns=NOW - 101),),
+        phase_entered_ns=NOW - 100,
+    )
+
+    assert feedback is None
+    assert node._runtime_wiring.active_target is None
+
+
 def test_real_search_feedback_advances_only_through_existing_event_adapter() -> None:
     node = _node()
     _prime_control_state(node)
@@ -1404,6 +1434,23 @@ def test_refine_prefers_original_identity_and_uses_only_new_complete_geometry() 
     assert feedback.source_timestamp_ns == preferred.timestamp_ns
 
 
+def test_refine_never_rebinds_when_preferred_identity_is_missing() -> None:
+    node = _node()
+    state = node._runtime_wiring
+    state.run_id, state.task_id, state.attempt = "run-1", 1, 0
+    state.preferred_object_id = "target-a"
+    node._fsm.phase_entered_ns = NOW - 100
+    status = FSMStatus(1, GlobalPhase.REFINE_TARGET, LocalPhase.IDLE, 0, False, "", NOW)
+    snapshot = SensorSnapshot(
+        _task(), _base(), _joints(),
+        (_estimate("target-b", 1.0, timestamp_ns=NOW - 5),), NOW, True,
+    )
+
+    assert node._run_current_phase(snapshot, status, None, NOW)[2] is None
+    assert state.active_target is None
+    assert "禁止静默重绑定" in state.phase_entry_failure_reason
+
+
 def test_current_perception_geometry_gap_keeps_refine_closed_and_never_plans() -> None:
     node = _node()
     node._fsm.phase_entered_ns = NOW - 100
@@ -1420,18 +1467,76 @@ def test_current_perception_geometry_gap_keeps_refine_closed_and_never_plans() -
     assert node._runtime_wiring.active_target is None
 
 
-def test_missing_formal_thresholds_do_not_construct_visual_verifier(
+def test_default_team_policy_constructs_visual_verifier_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(
-        ros_nodes_module,
-        "VisualObservationVerifier",
-        lambda **_kwargs: pytest.fail("缺少正式阈值时不得构造视觉验证器"),
-    )
+    calls: list[dict[str, object]] = []
+    real = ros_nodes_module.VisualObservationVerifier
+
+    def construct(**kwargs: object) -> object:
+        calls.append(kwargs)
+        return real(**kwargs)
+
+    monkeypatch.setattr(ros_nodes_module, "VisualObservationVerifier", construct)
     node = _node()
 
+    assert node._visual_observation_verifier is not None
+    assert node._visual_observation_verifier_unavailable_reason == ""
+    assert calls == [{
+        "minimum_lift_delta_m": 0.03,
+        "max_horizontal_drift_m": 0.02,
+        "max_observation_gap_s": 0.5,
+        "minimum_observation_confidence": 0.65,
+        "required_frame_id": "odom",
+        "min_stationary_observations": 3,
+        "max_stationary_spread_m": 0.01,
+    }]
+
+
+def test_valid_visual_verifier_config_constructs_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, object]] = []
+    real = ros_nodes_module.VisualObservationVerifier
+
+    def construct(**kwargs: object) -> object:
+        calls.append(kwargs)
+        return real(**kwargs)
+
+    monkeypatch.setattr(ros_nodes_module, "VisualObservationVerifier", construct)
+    config = _config()
+    config["perception"]["visual_observation_verifier"] = {
+        "minimum_lift_delta_m": 0.03,
+        "max_horizontal_drift_m": 0.02,
+        "max_observation_gap_s": 0.5,
+        "minimum_observation_confidence": 0.7,
+        "required_frame_id": "odom",
+        "min_stationary_observations": 3,
+        "max_stationary_spread_m": 0.01,
+    }
+    ros = _ros()
+    node = _create_team_client_node(ros)(config, ros)
+
+    assert node._visual_observation_verifier is not None
+    assert len(calls) == 1
+
+
+def test_invalid_visual_verifier_config_fails_closed() -> None:
+    config = _config()
+    config["perception"]["visual_observation_verifier"] = {
+        "minimum_lift_delta_m": -1.0,
+        "max_horizontal_drift_m": 0.02,
+        "max_observation_gap_s": 0.5,
+        "minimum_observation_confidence": 0.7,
+        "required_frame_id": "odom",
+        "min_stationary_observations": 3,
+        "max_stationary_spread_m": 0.01,
+    }
+    ros = _ros()
+    node = _create_team_client_node(ros)(config, ros)
+
     assert node._visual_observation_verifier is None
-    assert "缺少" in node._visual_observation_verifier_unavailable_reason
+    assert "配置无效" in node._visual_observation_verifier_unavailable_reason
 
 
 @pytest.mark.parametrize("phase", [GlobalPhase.VERIFY_PICK, GlobalPhase.VERIFY_PLACE])

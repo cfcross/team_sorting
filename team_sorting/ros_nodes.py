@@ -208,6 +208,17 @@ class _RuntimeFSMFeedback:
 
 _RUNTIME_ID_UNSET = object()
 _MAX_PHASE_EVENT_KEYS = 32
+# 团队保守联调策略，不是赛事官方阈值：3cm试抬达到三倍1cm静止抖动，2cm水平
+# 漂移大于抖动但仍远小于当前24cm物体宽度；0.5s对应20Hz下10个控制周期。
+# 最低置信度复用部署配置perception.confidence_threshold，避免第二套置信门。
+_TEAM_VISUAL_VERIFIER_POLICY = {
+    "minimum_lift_delta_m": 0.03,
+    "max_horizontal_drift_m": 0.02,
+    "max_observation_gap_s": 0.5,
+    "required_frame_id": "odom",
+    "min_stationary_observations": 3,
+    "max_stationary_spread_m": 0.01,
+}
 _INTERNAL_STOP_PHASES = {
     GlobalPhase.WAIT_READY,
     GlobalPhase.LOAD_TASK,
@@ -290,7 +301,7 @@ def _select_target_estimate(
             ):
                 continue
         candidates.append(estimate)
-    if preferred and any(item.object_id.strip() == preferred for item in candidates):
+    if preferred:
         candidates = [
             item for item in candidates if item.object_id.strip() == preferred
         ]
@@ -1158,14 +1169,18 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             self._mux = ActionMux(_action_mux_config(config))
             self._runtime_wiring = _RuntimeWiringState()
 
-            # config.yaml 当前没有视觉验证器所需的完整正式阈值。保持 Optional
-            # 不可用，避免采用算法构造器参数名背后的任何隐式或猜测默认值。
             self._visual_observation_verifier: Optional[
                 VisualObservationVerifier
             ] = None
-            self._visual_observation_verifier_unavailable_reason = (
-                "config缺少VisualObservationVerifier全部正式严格阈值"
-            )
+            self._visual_observation_verifier_unavailable_reason = ""
+            try:
+                self._visual_observation_verifier = (
+                    _visual_observation_verifier_from_config(config)
+                )
+            except (RuntimeError, TypeError, ValueError) as exc:
+                self._visual_observation_verifier_unavailable_reason = (
+                    f"VisualObservationVerifier配置无效，失败关闭：{exc}"
+                )
 
             # 业务对象只在节点初始化时构造一次。默认配置没有正式navigation字段，
             # 因而不能偷偷采用NavigationConfig的模块默认值并宣称导航可用。
@@ -1597,6 +1612,10 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 state.active_pick_trajectory = None
                 state.active_place_trajectory = None
                 state.active_trajectory_id = ""
+                state.pick_observation_before_lift = None
+                state.latest_grasp_verification = None
+                state.place_observation_before_release = None
+                state.latest_place_verification_observation = None
                 state.last_navigation_status = None
                 state.last_manipulation_status = None
 
@@ -1772,12 +1791,12 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                     "frames.planning不是严格odom，视觉业务事件失败关闭"
                 )
                 return base_command, manipulation_command, None
-            if phase is GlobalPhase.REFINE_TARGET and (
+            if phase in {GlobalPhase.SEARCH_TARGET, GlobalPhase.REFINE_TARGET} and (
                 type(self._fsm.phase_entered_ns) is not int
                 or self._fsm.phase_entered_ns < 0
             ):
                 state.phase_entry_failure_reason = (
-                    "REFINE_TARGET缺少有效阶段入口时间，视觉事件失败关闭"
+                    f"{phase.value}缺少有效阶段入口时间，视觉事件失败关闭"
                 )
                 return base_command, manipulation_command, None
 
@@ -1786,11 +1805,7 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 snapshot.task,
                 now_ns,
                 self._state_max_delta_ns,
-                phase_entered_ns=(
-                    self._fsm.phase_entered_ns
-                    if phase is GlobalPhase.REFINE_TARGET
-                    else None
-                ),
+                phase_entered_ns=self._fsm.phase_entered_ns,
                 preferred_object_id=(
                     state.preferred_object_id
                     if phase is GlobalPhase.REFINE_TARGET
@@ -1800,8 +1815,13 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             )
             if selected is None:
                 state.phase_entry_failure_reason = (
-                    "未收到阶段入口后的完整目标几何，REFINE_TARGET保持等待"
+                    (
+                        "未收到preferred_object_id="
+                        f"{state.preferred_object_id!r}的阶段入口后完整目标；"
+                        "禁止静默重绑定其他同类目标"
+                    )
                     if phase is GlobalPhase.REFINE_TARGET
+                    and state.preferred_object_id
                     else "未收到匹配任务且新鲜、稳定的odom目标"
                 )
                 return base_command, manipulation_command, None
@@ -3073,6 +3093,43 @@ def _official_publish_enabled(control: dict[str, bool]) -> bool:
         and control["enable_official_publish"]
         and control["simulation_only"]
     )
+
+
+def _visual_observation_verifier_from_config(
+    config: dict[str, Any],
+) -> VisualObservationVerifier:
+    """一次性构造验证器；显式私有配置可严格覆盖团队保守联调策略。"""
+
+    perception = _config_mapping(config.get("perception"), "perception")
+    raw = perception.get("visual_observation_verifier")
+    if raw is None:
+        confidence = perception.get("confidence_threshold")
+        if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
+            raise RuntimeError(
+                "perception.confidence_threshold必须是有限数且不能是bool"
+            )
+        confidence_value = float(confidence)
+        if not math.isfinite(confidence_value):
+            raise RuntimeError("perception.confidence_threshold必须是有限数")
+        values = {
+            **_TEAM_VISUAL_VERIFIER_POLICY,
+            "minimum_observation_confidence": confidence_value,
+        }
+    else:
+        values = _config_mapping(raw, "perception.visual_observation_verifier")
+        required = {
+            "minimum_lift_delta_m",
+            "max_horizontal_drift_m",
+            "max_observation_gap_s",
+            "minimum_observation_confidence",
+            "required_frame_id",
+            "min_stationary_observations",
+            "max_stationary_spread_m",
+        }
+        _require_exact_config_keys(
+            values, required, "perception.visual_observation_verifier"
+        )
+    return VisualObservationVerifier(**values)
 
 
 def _rclpy_context_ok(ros: SimpleNamespace, node: Optional[Any]) -> bool:
