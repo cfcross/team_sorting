@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import json
 import math
 from pathlib import Path
@@ -322,6 +322,24 @@ def _set_active_fsm(node: Any) -> None:
     node._fsm.status = lambda _now: status
 
 
+def _event_ready_node(
+    phase: GlobalPhase = GlobalPhase.SEARCH_TARGET,
+) -> tuple[Any, FSMStatus]:
+    node = _node()
+    state = node._runtime_wiring
+    state.run_id = "run-1"
+    state.task_id = 1
+    state.attempt = 0
+    state.active_target = _estimate("target-a", 0.9)
+    state.active_nav_goal = SimpleNamespace(goal_id="goal-a")
+    state.active_trajectory_id = "trajectory-a"
+    node._fsm.phase_entered_ns = NOW - 10
+    status = FSMStatus(1, phase, LocalPhase.IDLE, 0, False, "", NOW)
+    node._fsm.status = lambda _now: status
+    node._fsm.handle_event = lambda *_args, **_kwargs: True
+    return node, status
+
+
 def _external_command(
     controlled_indices: tuple[int, ...] = (1,),
 ) -> ManipulationCommand:
@@ -557,7 +575,7 @@ def test_default_control_tick_publishes_only_team_diagnostic_telemetry() -> None
     assert dispatch["dispatched_action"] == [None] * 19
 
 
-def test_kdl_is_constructed_once_but_never_imported_when_planning_disabled(
+def test_kdl_is_not_constructed_or_imported_when_planning_disabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls = {"construct": 0, "self_check": 0}
@@ -577,7 +595,7 @@ def test_kdl_is_constructed_once_but_never_imported_when_planning_disabled(
     node._control_tick()
     node._control_tick()
 
-    assert calls == {"construct": 1, "self_check": 0}
+    assert calls == {"construct": 0, "self_check": 0}
     assert node._arm_planner is None
     assert "disabled" in node._arm_planning_unavailable_reason
 
@@ -644,6 +662,21 @@ def test_missing_arm_execution_config_is_explicitly_fail_closed() -> None:
     assert "ArmExecutionConfig" in node._arm_execution_unavailable_reason
 
 
+def test_disabled_incomplete_arm_planning_does_not_break_config_loading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config()
+    assert config["arm_planning"]["enabled"] is False
+    config["arm_planning"].pop("pregrasp_distance_m")
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    monkeypatch.setattr(ros_nodes_module, "_resolve_config_path", lambda: path)
+
+    loaded = ros_nodes_module._load_config()
+
+    assert loaded["arm_planning"]["enabled"] is False
+
+
 def test_complete_arm_execution_config_constructs_controller_only_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -682,6 +715,7 @@ def _dirty_runtime_wiring(node: Any) -> None:
     state.active_trajectory_id = "trajectory-old"
     state.pick_observation_before_lift = _estimate("old", 0.8)
     state.latest_grasp_verification = object()
+    state.place_observation_before_release = _estimate("old", 0.8)
     state.latest_place_verification_observation = _estimate("old", 0.8)
     state.last_navigation_status = object()
     state.last_manipulation_status = object()
@@ -700,6 +734,7 @@ def _assert_runtime_payload_cleared(node: Any) -> None:
     assert state.active_trajectory_id == ""
     assert state.pick_observation_before_lift is None
     assert state.latest_grasp_verification is None
+    assert state.place_observation_before_release is None
     assert state.latest_place_verification_observation is None
     assert state.last_navigation_status is None
     assert state.last_manipulation_status is None
@@ -769,34 +804,209 @@ def test_phase_entry_runs_once_per_phase_and_rearms_on_change() -> None:
 
     assert node._handle_phase_entry(snapshot, search, None, NOW)
     generation = node._runtime_wiring.phase_generation
+    selected_after_entry = _estimate("selected-after-entry", 0.9)
+    node._runtime_wiring.active_target = selected_after_entry
     assert not node._handle_phase_entry(snapshot, search, None, NOW + 1)
     assert node._runtime_wiring.phase_generation == generation
+    assert node._runtime_wiring.active_target is selected_after_entry
 
     refine = FSMStatus(1, GlobalPhase.REFINE_TARGET, LocalPhase.IDLE, 0, False, "", NOW + 2)
     assert node._handle_phase_entry(snapshot, refine, None, NOW + 2)
     assert node._runtime_wiring.phase_generation == generation + 1
 
 
+def test_phase_specific_cleanup_preserves_cross_phase_pick_context() -> None:
+    node = _node()
+    state = node._runtime_wiring
+    target = _estimate("target-a", 0.9)
+    pick_trajectory = object()
+    planned_context = object()
+    reset_calls = {"count": 0}
+    node._arm_execution = SimpleNamespace(
+        reset=lambda: reset_calls.__setitem__("count", reset_calls["count"] + 1)
+    )
+    state.active_target = target
+    state.active_nav_goal = object()
+    node._prepare_phase_transition(GlobalPhase.SEARCH_TARGET, GlobalPhase.NAV_TO_PICK)
+    assert state.active_target is target
+    assert state.active_nav_goal is None
+
+    state.active_nav_goal = object()
+    state.active_pick_trajectory = object()
+    state.planned_grasp_context = object()
+    node._prepare_phase_transition(GlobalPhase.NAV_TO_PICK, GlobalPhase.REFINE_TARGET)
+    assert state.active_target is target
+    assert state.active_nav_goal is None
+    assert state.active_pick_trajectory is None
+    assert state.planned_grasp_context is None
+
+    node._prepare_phase_transition(GlobalPhase.REFINE_TARGET, GlobalPhase.PLAN_PICK)
+    assert state.active_target is target
+    state.active_pick_trajectory = pick_trajectory
+    state.planned_grasp_context = planned_context
+    node._prepare_phase_transition(GlobalPhase.PLAN_PICK, GlobalPhase.EXECUTE_PICK)
+    assert state.active_pick_trajectory is pick_trajectory
+    assert state.planned_grasp_context is planned_context
+
+    state.latest_grasp_verification = object()
+    node._prepare_phase_transition(GlobalPhase.EXECUTE_PICK, GlobalPhase.VERIFY_PICK)
+    assert state.active_pick_trajectory is pick_trajectory
+    assert state.planned_grasp_context is planned_context
+    assert state.latest_grasp_verification is None
+    assert reset_calls["count"] == 0
+
+
+def test_place_phase_cleanup_keeps_only_confirmed_grasp_and_place_trajectory() -> None:
+    node = _node()
+    state = node._runtime_wiring
+    confirmed_context = object()
+    state.active_target = _estimate("target-a", 0.9)
+    state.active_nav_goal = object()
+    state.planned_grasp_context = object()
+    state.confirmed_grasp_context = confirmed_context
+    state.active_pick_trajectory = object()
+    state.active_place_trajectory = object()
+    state.active_trajectory_id = "old-trajectory"
+    state.latest_grasp_verification = object()
+
+    node._prepare_phase_transition(GlobalPhase.VERIFY_PICK, GlobalPhase.NAV_TO_PLACE)
+    assert state.confirmed_grasp_context is confirmed_context
+    assert state.active_target is None
+    assert state.active_nav_goal is None
+    assert state.planned_grasp_context is None
+    assert state.active_pick_trajectory is None
+    assert state.active_place_trajectory is None
+    assert state.latest_grasp_verification is None
+
+    node._prepare_phase_transition(GlobalPhase.NAV_TO_PLACE, GlobalPhase.PLAN_PLACE)
+    assert state.confirmed_grasp_context is confirmed_context
+    place_trajectory = object()
+    state.active_place_trajectory = place_trajectory
+    state.active_trajectory_id = "place-trajectory"
+    node._prepare_phase_transition(GlobalPhase.PLAN_PLACE, GlobalPhase.EXECUTE_PLACE)
+    assert state.active_place_trajectory is place_trajectory
+    assert state.active_trajectory_id == "place-trajectory"
+    assert state.confirmed_grasp_context is confirmed_context
+    release_baseline = _estimate("released-target", 0.8)
+    state.place_observation_before_release = release_baseline
+    state.latest_place_verification_observation = _estimate("stale", 0.7)
+    node._prepare_phase_transition(GlobalPhase.EXECUTE_PLACE, GlobalPhase.VERIFY_PLACE)
+    assert state.place_observation_before_release is release_baseline
+    assert state.latest_place_verification_observation is None
+    assert state.confirmed_grasp_context is confirmed_context
+
+
+def test_safe_hold_and_recovery_preserve_runtime_context_without_execution_reset() -> None:
+    node = _node()
+    _dirty_runtime_wiring(node)
+    state = node._runtime_wiring
+    before = {
+        name: getattr(state, name)
+        for name in (
+            "active_target",
+            "active_nav_goal",
+            "planned_grasp_context",
+            "confirmed_grasp_context",
+            "active_pick_trajectory",
+            "active_place_trajectory",
+            "active_trajectory_id",
+        )
+    }
+    reset_calls = {"count": 0}
+    node._arm_execution = SimpleNamespace(
+        reset=lambda: reset_calls.__setitem__("count", reset_calls["count"] + 1)
+    )
+
+    node._prepare_phase_transition(GlobalPhase.EXECUTE_PICK, GlobalPhase.SAFE_HOLD)
+    assert {name: getattr(state, name) for name in before} == before
+    node._prepare_phase_transition(GlobalPhase.SAFE_HOLD, GlobalPhase.EXECUTE_PICK)
+    assert {name: getattr(state, name) for name in before} == before
+    assert reset_calls["count"] == 0
+
+    node._prepare_phase_transition(GlobalPhase.SAFE_HOLD, GlobalPhase.FAILED)
+    assert state.active_target is None
+    assert state.active_nav_goal is None
+    assert state.active_pick_trajectory is None
+    assert state.active_place_trajectory is None
+    assert reset_calls["count"] == 0
+
+
+def test_full_lifecycle_resets_call_execution_reset() -> None:
+    node = _node()
+    reset_calls = {"count": 0}
+    node._arm_execution = SimpleNamespace(
+        reset=lambda: reset_calls.__setitem__("count", reset_calls["count"] + 1)
+    )
+    state = node._runtime_wiring
+
+    node._reset_runtime_wiring(run_id="run-1", task_id=1, attempt=0)
+    _dirty_runtime_wiring(node)
+    node._reset_runtime_wiring(task_id=2, attempt=0, reason="new_task")
+    _dirty_runtime_wiring(node)
+    node._reset_runtime_wiring(attempt=1, reason="new_attempt")
+    _dirty_runtime_wiring(node)
+    node._reset_runtime_wiring(context_finished=True, reason="finished")
+
+    assert reset_calls["count"] == 4
+    _assert_runtime_payload_cleared(node)
+    assert state.context_finished
+
+
 def test_event_submission_is_bounded_and_deduplicated() -> None:
     node = _node()
+    node._runtime_wiring.run_id = "run-1"
+    node._runtime_wiring.task_id = 1
+    node._runtime_wiring.attempt = 0
+    node._runtime_wiring.active_target = _estimate("target-a", 0.9)
+    node._fsm.phase_entered_ns = NOW - 1
+    _set_active_fsm(node)
     calls: list[FSMEvent] = []
     node._fsm.handle_event = lambda event, _now, _reason="": calls.append(event) or True
     status = FSMStatus(1, GlobalPhase.SEARCH_TARGET, LocalPhase.IDLE, 0, False, "", NOW)
 
     assert node._submit_fsm_event_once(
-        FSMEvent.TARGET_FOUND, status, NOW, target_identity="target-a"
+        FSMEvent.TARGET_FOUND,
+        status,
+        NOW,
+        source_timestamp_ns=NOW,
+        run_id="run-1",
+        task_id=1,
+        attempt=0,
+        object_id="target-a",
+        confirmed_by_real_feedback=True,
     )
     assert not node._submit_fsm_event_once(
-        FSMEvent.FAILURE, status, NOW, target_identity="target-a"
+        FSMEvent.FAILURE,
+        status,
+        NOW,
+        source_timestamp_ns=NOW,
+        run_id="run-1",
+        task_id=1,
+        attempt=0,
+        confirmed_by_real_feedback=True,
     )
     assert not node._submit_fsm_event_once(
-        FSMEvent.TARGET_FOUND, status, NOW + 1, target_identity="target-a"
+        FSMEvent.TARGET_FOUND,
+        status,
+        NOW + 1,
+        source_timestamp_ns=NOW,
+        run_id="run-1",
+        task_id=1,
+        attempt=0,
+        object_id="target-a",
+        confirmed_by_real_feedback=True,
     )
     assert calls == [FSMEvent.TARGET_FOUND]
 
 
 def test_rejected_fsm_event_is_not_reported_as_transition() -> None:
     node = _node()
+    node._runtime_wiring.run_id = "run-1"
+    node._runtime_wiring.task_id = 1
+    node._runtime_wiring.attempt = 0
+    node._runtime_wiring.active_target = _estimate("target-a", 0.9)
+    node._fsm.phase_entered_ns = NOW - 1
+    _set_active_fsm(node)
     calls = {"count": 0}
 
     def reject(*_args: object, **_kwargs: object) -> bool:
@@ -807,10 +1017,151 @@ def test_rejected_fsm_event_is_not_reported_as_transition() -> None:
     status = FSMStatus(1, GlobalPhase.SEARCH_TARGET, LocalPhase.IDLE, 0, False, "", NOW)
 
     assert not node._submit_fsm_event_once(
-        FSMEvent.TARGET_FOUND, status, NOW, target_identity="target-a"
+        FSMEvent.TARGET_FOUND,
+        status,
+        NOW,
+        source_timestamp_ns=NOW,
+        run_id="run-1",
+        task_id=1,
+        attempt=0,
+        object_id="target-a",
+        confirmed_by_real_feedback=True,
     )
     assert calls["count"] == 1
     assert "拒绝" in node._runtime_wiring.phase_entry_failure_reason
+
+
+@pytest.mark.parametrize(
+    ("source_timestamp_ns", "reason_fragment"),
+    [(NOW - 11, "早于当前阶段"), (NOW + 1, "晚于当前控制周期")],
+)
+def test_event_submission_rejects_stale_and_future_feedback(
+    source_timestamp_ns: int, reason_fragment: str
+) -> None:
+    node, status = _event_ready_node()
+
+    assert not node._submit_fsm_event_once(
+        FSMEvent.TARGET_FOUND,
+        status,
+        NOW,
+        source_timestamp_ns=source_timestamp_ns,
+        run_id="run-1",
+        task_id=1,
+        attempt=0,
+        object_id="target-a",
+        confirmed_by_real_feedback=True,
+    )
+    assert reason_fragment in node._runtime_wiring.phase_entry_failure_reason
+
+
+@pytest.mark.parametrize(
+    ("run_id", "task_id", "attempt"),
+    [("run-old", 1, 0), ("run-1", 2, 0), ("run-1", 1, 1)],
+)
+def test_event_submission_rejects_runtime_identity_mismatch(
+    run_id: str, task_id: int, attempt: int
+) -> None:
+    node, status = _event_ready_node()
+
+    assert not node._submit_fsm_event_once(
+        FSMEvent.TARGET_FOUND,
+        status,
+        NOW,
+        source_timestamp_ns=NOW,
+        run_id=run_id,
+        task_id=task_id,
+        attempt=attempt,
+        object_id="target-a",
+        confirmed_by_real_feedback=True,
+    )
+    assert "run/task/attempt" in node._runtime_wiring.phase_entry_failure_reason
+
+
+@pytest.mark.parametrize(
+    ("event", "phase", "identity_field", "failure_fragment"),
+    [
+        (FSMEvent.TARGET_FOUND, GlobalPhase.SEARCH_TARGET, "object_id", "object_id"),
+        (FSMEvent.PICK_NAV_REACHED, GlobalPhase.NAV_TO_PICK, "goal_id", "goal_id"),
+        (FSMEvent.PICK_PLAN_READY, GlobalPhase.PLAN_PICK, "trajectory_id", "trajectory_id"),
+    ],
+)
+def test_event_submission_rejects_result_identity_mismatch(
+    event: FSMEvent,
+    phase: GlobalPhase,
+    identity_field: str,
+    failure_fragment: str,
+) -> None:
+    node, status = _event_ready_node(phase)
+    identities = {
+        "object_id": "target-a",
+        "goal_id": "goal-a",
+        "trajectory_id": "trajectory-a",
+    }
+    identities[identity_field] = "wrong"
+
+    assert not node._submit_fsm_event_once(
+        event,
+        status,
+        NOW,
+        source_timestamp_ns=NOW,
+        run_id="run-1",
+        task_id=1,
+        attempt=0,
+        confirmed_by_real_feedback=True,
+        **identities,
+    )
+    assert failure_fragment in node._runtime_wiring.phase_entry_failure_reason
+
+
+def test_event_submission_requires_real_feedback_and_string_reason() -> None:
+    node, status = _event_ready_node()
+    assert not node._submit_fsm_event_once(
+        FSMEvent.TARGET_FOUND,
+        status,
+        NOW,
+        source_timestamp_ns=NOW,
+        run_id="run-1",
+        task_id=1,
+        attempt=0,
+        object_id="target-a",
+    )
+    assert "真实反馈" in node._runtime_wiring.phase_entry_failure_reason
+
+    node, status = _event_ready_node()
+    with pytest.raises(TypeError, match="reason"):
+        node._submit_fsm_event_once(
+            FSMEvent.TARGET_FOUND,
+            status,
+            NOW,
+            source_timestamp_ns=NOW,
+            run_id="run-1",
+            task_id=1,
+            attempt=0,
+            reason=object(),  # type: ignore[arg-type]
+            object_id="target-a",
+            confirmed_by_real_feedback=True,
+        )
+
+
+def test_event_deduplication_table_is_bounded() -> None:
+    node, status = _event_ready_node()
+    node._runtime_wiring.phase_event_keys.update(
+        {("existing", index) for index in range(32)}
+    )
+
+    assert not node._submit_fsm_event_once(
+        FSMEvent.TARGET_FOUND,
+        status,
+        NOW,
+        source_timestamp_ns=NOW,
+        run_id="run-1",
+        task_id=1,
+        attempt=0,
+        object_id="target-a",
+        confirmed_by_real_feedback=True,
+    )
+    assert len(node._runtime_wiring.phase_event_keys) == 32
+    assert "有界容量" in node._runtime_wiring.phase_entry_failure_reason
 
 
 def test_reset_event_clears_runtime_identity_and_payload() -> None:
@@ -821,7 +1172,16 @@ def test_reset_event_clears_runtime_identity_and_payload() -> None:
     _dirty_runtime_wiring(node)
     status = node._fsm.status(NOW)
 
-    assert node._submit_fsm_event_once(FSMEvent.RESET, status, NOW)
+    assert node._submit_fsm_event_once(
+        FSMEvent.RESET,
+        status,
+        NOW,
+        source_timestamp_ns=NOW,
+        run_id="run-old",
+        task_id=1,
+        attempt=2,
+        confirmed_by_real_feedback=True,
+    )
 
     _assert_runtime_payload_cleared(node)
     assert node._runtime_wiring.run_id == ""
@@ -859,6 +1219,15 @@ def test_target_selection_is_deterministic_and_refine_requires_new_geometry() ->
         phase_entered_ns=NOW - 50,
         require_geometry=True,
     ) is None
+    rejected = (
+        replace(tied_a, valid=False, failure_reason="invalid"),
+        replace(tied_a, frame_id="camera_link"),
+        replace(tied_a, class_id="brown"),
+        replace(tied_a, timestamp_ns=NOW + 1),
+        replace(tied_a, timestamp_ns=NOW - 1_001),
+        replace(tied_a, object_id=None),
+    )
+    assert _select_target_estimate(rejected, task, NOW, 1_000) is None
 
 
 def test_planar_transform_snapshot_has_explicit_inverse_direction_and_time() -> None:
@@ -990,6 +1359,55 @@ def test_internal_fsm_publish_authorization_is_pure_and_fail_closed() -> None:
         manipulation_source="external_candidate",
     )
 
+    common = {
+        "observe_only": False,
+        "enable_official_publish": True,
+        "context": context,
+        "snapshot": snapshot,
+        "fsm_status": status,
+        "base_command": base_command,
+        "manipulation_command": None,
+        "final_action": final_action,
+        "now_ns": NOW,
+    }
+    assert not _internal_fsm_publish_authorization(
+        **{**common, "context": replace(context, finished=True)}
+    )
+    assert not _internal_fsm_publish_authorization(
+        **{
+            **common,
+            "snapshot": replace(
+                snapshot, valid=False, failure_reason="snapshot invalid"
+            ),
+        }
+    )
+    assert not _internal_fsm_publish_authorization(
+        **{**common, "snapshot": replace(snapshot, joints=None)}
+    )
+    assert not _internal_fsm_publish_authorization(
+        **{
+            **common,
+            "fsm_status": replace(status, global_phase=GlobalPhase.SAFE_HOLD),
+        }
+    )
+    assert not _internal_fsm_publish_authorization(
+        **{
+            **common,
+            "final_action": replace(
+                final_action,
+                global_phase=GlobalPhase.PLAN_PICK,
+            ),
+        }
+    )
+    assert not _internal_fsm_publish_authorization(
+        **{
+            **common,
+            "final_action": replace(
+                final_action, valid=False, failure_reason="invalid action"
+            ),
+        }
+    )
+
 
 def test_unwired_business_tick_never_advances_fsm_without_real_feedback() -> None:
     node = _node()
@@ -1003,6 +1421,85 @@ def test_unwired_business_tick_never_advances_fsm_without_real_feedback() -> Non
     node._control_tick()
 
     assert node._fsm.phase is GlobalPhase.SEARCH_TARGET
+
+
+def test_control_tick_processes_real_feedback_before_timeout() -> None:
+    node = _node()
+    node._system_ready_submitted = True
+    _prime_control_state(node)
+    state = node._runtime_wiring
+    state.run_id = "run-1"
+    state.task_id = 1
+    state.attempt = 0
+    state.last_handled_phase = GlobalPhase.SEARCH_TARGET
+    state.active_target = _estimate("target-a", 0.9)
+    node._fsm.phase_entered_ns = NOW - 10
+    transitioned = {"value": False}
+    status_before = FSMStatus(
+        1, GlobalPhase.SEARCH_TARGET, LocalPhase.IDLE, 0, False, "", NOW
+    )
+    status_after = replace(status_before, global_phase=GlobalPhase.NAV_TO_PICK)
+    node._fsm.status = lambda _now: status_after if transitioned["value"] else status_before
+
+    def handle_event(*_args: object, **_kwargs: object) -> bool:
+        transitioned["value"] = True
+        return True
+
+    node._fsm.handle_event = handle_event
+    node._fsm.check_timeout = lambda _now: pytest.fail(
+        "真实事件已转换时不得再检查旧阶段超时"
+    )
+    feedback = ros_nodes_module._RuntimeFSMFeedback(
+        event=FSMEvent.TARGET_FOUND,
+        source_timestamp_ns=NOW,
+        run_id="run-1",
+        task_id=1,
+        attempt=0,
+        object_id="target-a",
+        confirmed_by_real_feedback=True,
+    )
+    node._run_current_phase = lambda *_args: (None, None, feedback)
+
+    node._control_tick()
+
+    assert transitioned["value"]
+
+
+def test_control_tick_checks_timeout_when_feedback_is_rejected() -> None:
+    node = _node()
+    node._system_ready_submitted = True
+    _prime_control_state(node)
+    state = node._runtime_wiring
+    state.run_id = "run-1"
+    state.task_id = 1
+    state.attempt = 0
+    state.last_handled_phase = GlobalPhase.SEARCH_TARGET
+    state.active_target = _estimate("target-a", 0.9)
+    node._fsm.phase_entered_ns = NOW - 10
+    status = FSMStatus(
+        1, GlobalPhase.SEARCH_TARGET, LocalPhase.IDLE, 0, False, "", NOW
+    )
+    node._fsm.status = lambda _now: status
+    node._fsm.handle_event = lambda *_args, **_kwargs: False
+    timeout_calls = {"count": 0}
+    node._fsm.check_timeout = lambda _now: timeout_calls.__setitem__(
+        "count", timeout_calls["count"] + 1
+    ) or False
+    feedback = ros_nodes_module._RuntimeFSMFeedback(
+        event=FSMEvent.TARGET_FOUND,
+        source_timestamp_ns=NOW,
+        run_id="run-1",
+        task_id=1,
+        attempt=0,
+        object_id="target-a",
+        confirmed_by_real_feedback=True,
+    )
+    node._run_current_phase = lambda *_args: (None, None, feedback)
+
+    node._control_tick()
+
+    assert timeout_calls["count"] == 1
+    assert "FSM拒绝" in state.phase_entry_failure_reason
 
 
 def test_destroy_node_resets_runtime_wiring_and_execution_memory() -> None:

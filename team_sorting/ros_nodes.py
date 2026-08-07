@@ -175,6 +175,7 @@ class _RuntimeWiringState:
     active_trajectory_id: str = ""
     pick_observation_before_lift: Optional[ObjectEstimate3D] = None
     latest_grasp_verification: Optional[GraspVerification] = None
+    place_observation_before_release: Optional[ObjectEstimate3D] = None
     latest_place_verification_observation: Optional[ObjectEstimate3D] = None
     last_navigation_status: Optional[NavigationStatus] = None
     last_manipulation_status: Optional[ManipulationStatus] = None
@@ -182,6 +183,22 @@ class _RuntimeWiringState:
     phase_entry_failure_reason: str = ""
     last_event_tick_ns: Optional[int] = None
     event_attempted_this_tick: bool = False
+
+
+@dataclass(frozen=True)
+class _RuntimeFSMFeedback:
+    """业务模块真实回执的私有适配器，不扩展公共消息契约。"""
+
+    event: FSMEvent
+    source_timestamp_ns: int
+    run_id: str
+    task_id: Optional[int]
+    attempt: Optional[int]
+    reason: str = ""
+    object_id: str = ""
+    goal_id: str = ""
+    trajectory_id: str = ""
+    confirmed_by_real_feedback: bool = False
 
 
 _RUNTIME_ID_UNSET = object()
@@ -336,6 +353,8 @@ def _internal_fsm_publish_authorization(
         return False
     if not isinstance(snapshot, SensorSnapshot) or not snapshot.valid:
         return False
+    if snapshot.timestamp_ns != now_ns:
+        return False
     if snapshot.task is None or snapshot.task.task_id != context.current_task_id:
         return False
     if snapshot.base is None or not snapshot.base.valid:
@@ -344,9 +363,13 @@ def _internal_fsm_publish_authorization(
         return False
     if not isinstance(fsm_status, FSMStatus) or fsm_status.global_phase in _INTERNAL_STOP_PHASES:
         return False
+    if fsm_status.timestamp_ns != now_ns:
+        return False
     if fsm_status.task_id != context.current_task_id:
         return False
     if not isinstance(final_action, FinalAction) or not final_action.valid:
+        return False
+    if final_action.timestamp_ns != now_ns:
         return False
     if final_action.global_phase is not fsm_status.global_phase:
         return False
@@ -904,10 +927,17 @@ def _load_config() -> dict[str, Any]:
         validate_controller_config(data)
     except ValueError as exc:
         raise RuntimeError(f"配置与MMK2 Controller Manifest V1不一致 {path}: {exc}") from exc
-    try:
-        _arm_planning_config_from_config(data)
-    except ValueError as exc:
-        raise RuntimeError(f"机械臂规划配置无效 {path}: {exc}") from exc
+    arm_planning = data.get("arm_planning")
+    if not isinstance(arm_planning, Mapping):
+        raise RuntimeError(f"机械臂规划配置无效 {path}: arm_planning必须是Mapping")
+    arm_planning_enabled = arm_planning.get("enabled")
+    if type(arm_planning_enabled) is not bool:
+        raise RuntimeError(f"机械臂规划配置无效 {path}: enabled必须是严格bool")
+    if arm_planning_enabled:
+        try:
+            _arm_planning_config_from_config(data)
+        except ValueError as exc:
+            raise RuntimeError(f"机械臂规划配置无效 {path}: {exc}") from exc
     _validated_action_dispatch_topic(data.get("topics"))
     return data
 
@@ -1106,22 +1136,10 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             except (TypeError, ValueError) as exc:
                 self._navigation_unavailable_reason = str(exc)
 
-            official = config.get("official", {})
             self._kdl_adapter: Optional[OfficialKDLAdapter] = None
             self._arm_planning_config: Optional[ArmPlanningConfig] = None
             self._arm_planner: Optional[ArmPlanner] = None
             self._arm_planning_unavailable_reason = ""
-            try:
-                if not isinstance(official, Mapping):
-                    raise ValueError("config.official必须是Mapping")
-                self._kdl_adapter = OfficialKDLAdapter(
-                    official_root=str(official.get("root", "")),
-                    module_name=str(official.get("kdl_module", "mmk2_kdl")),
-                )
-            except (TypeError, ValueError) as exc:
-                self._arm_planning_unavailable_reason = (
-                    f"OfficialKDLAdapter构造失败：{exc}"
-                )
             try:
                 arm_planning_enabled, arm_planning_config = (
                     _arm_planning_config_from_config(config)
@@ -1136,7 +1154,7 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             if not arm_planning_enabled:
                 if not self._arm_planning_unavailable_reason:
                     self._arm_planning_unavailable_reason = "arm_planning disabled"
-            elif self._kdl_adapter is None or self._arm_planning_config is None:
+            elif self._arm_planning_config is None:
                 if not self._arm_planning_unavailable_reason:
                     self._arm_planning_unavailable_reason = "机械臂规划依赖不完整"
             else:
@@ -1144,6 +1162,13 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                     # 只有enabled=True且抓放两类正式配置都完整时才允许导入官方KDL。
                     self._arm_planning_config.validate_for_grasp()
                     self._arm_planning_config.validate_for_place()
+                    official = config.get("official", {})
+                    if not isinstance(official, Mapping):
+                        raise ValueError("config.official必须是Mapping")
+                    self._kdl_adapter = OfficialKDLAdapter(
+                        official_root=str(official.get("root", "")),
+                        module_name=str(official.get("kdl_module", "mmk2_kdl")),
+                    )
                     self._kdl_adapter.self_check()
                     self._arm_planner = ArmPlanner(
                         self._kdl_adapter, self._arm_planning_config
@@ -1409,6 +1434,7 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             state.active_trajectory_id = ""
             state.pick_observation_before_lift = None
             state.latest_grasp_verification = None
+            state.place_observation_before_release = None
             state.latest_place_verification_observation = None
             state.last_navigation_status = None
             state.last_manipulation_status = None
@@ -1420,6 +1446,102 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 self.get_logger().error(
                     f"runtime_wiring_reset_failed:{reason}:{reset_failure}"
                 )
+
+        def _prepare_phase_transition(
+            self,
+            previous_phase: Optional[GlobalPhase],
+            current_phase: GlobalPhase,
+        ) -> None:
+            """只清理新阶段已明确失效的业务缓存。"""
+
+            state = self._runtime_wiring
+            state.phase_generation += 1
+            state.phase_entry_failure_reason = ""
+            if current_phase is GlobalPhase.SAFE_HOLD or (
+                previous_phase is GlobalPhase.SAFE_HOLD
+                and current_phase not in {GlobalPhase.DONE, GlobalPhase.FAILED}
+            ):
+                # 安全暂停及恢复不能破坏被暂停阶段的业务生命周期。
+                return
+            if current_phase is GlobalPhase.SEARCH_TARGET:
+                state.active_target = None
+                state.active_nav_goal = None
+                state.planned_grasp_context = None
+                state.confirmed_grasp_context = None
+                state.active_pick_trajectory = None
+                state.active_place_trajectory = None
+                state.active_trajectory_id = ""
+                state.pick_observation_before_lift = None
+                state.latest_grasp_verification = None
+                state.place_observation_before_release = None
+                state.latest_place_verification_observation = None
+                state.last_navigation_status = None
+                state.last_manipulation_status = None
+            elif current_phase is GlobalPhase.NAV_TO_PICK:
+                state.active_nav_goal = None
+                state.last_navigation_status = None
+            elif current_phase is GlobalPhase.REFINE_TARGET:
+                state.active_nav_goal = None
+                state.active_pick_trajectory = None
+                state.active_trajectory_id = ""
+                state.planned_grasp_context = None
+                state.pick_observation_before_lift = None
+                state.latest_grasp_verification = None
+                state.last_navigation_status = None
+            elif current_phase is GlobalPhase.PLAN_PICK:
+                state.active_pick_trajectory = None
+                state.active_trajectory_id = ""
+                state.planned_grasp_context = None
+                state.pick_observation_before_lift = None
+                state.latest_grasp_verification = None
+            elif current_phase is GlobalPhase.EXECUTE_PICK:
+                state.last_manipulation_status = None
+            elif current_phase is GlobalPhase.VERIFY_PICK:
+                state.latest_grasp_verification = None
+            elif current_phase is GlobalPhase.NAV_TO_PLACE:
+                state.active_target = None
+                state.active_nav_goal = None
+                state.planned_grasp_context = None
+                state.active_pick_trajectory = None
+                state.active_place_trajectory = None
+                state.active_trajectory_id = ""
+                state.pick_observation_before_lift = None
+                state.latest_grasp_verification = None
+                state.place_observation_before_release = None
+                state.latest_place_verification_observation = None
+                state.last_navigation_status = None
+                state.last_manipulation_status = None
+            elif current_phase is GlobalPhase.PLAN_PLACE:
+                state.active_place_trajectory = None
+                state.active_trajectory_id = ""
+                state.place_observation_before_release = None
+                state.latest_place_verification_observation = None
+            elif current_phase is GlobalPhase.EXECUTE_PLACE:
+                state.last_manipulation_status = None
+            elif current_phase is GlobalPhase.VERIFY_PLACE:
+                state.latest_place_verification_observation = None
+            elif current_phase is GlobalPhase.RETURN_END:
+                state.active_target = None
+                state.active_nav_goal = None
+                state.planned_grasp_context = None
+                state.confirmed_grasp_context = None
+                state.active_pick_trajectory = None
+                state.active_place_trajectory = None
+                state.active_trajectory_id = ""
+                state.pick_observation_before_lift = None
+                state.latest_grasp_verification = None
+                state.place_observation_before_release = None
+                state.latest_place_verification_observation = None
+                state.last_navigation_status = None
+                state.last_manipulation_status = None
+            elif current_phase in {GlobalPhase.DONE, GlobalPhase.FAILED}:
+                state.active_target = None
+                state.active_nav_goal = None
+                state.active_pick_trajectory = None
+                state.active_place_trajectory = None
+                state.active_trajectory_id = ""
+                state.last_navigation_status = None
+                state.last_manipulation_status = None
 
         def _synchronize_runtime_context(
             self, context: Optional[CompetitionContext]
@@ -1482,21 +1604,35 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             context: Optional[CompetitionContext],
             now_ns: int,
         ) -> bool:
-            """只在GlobalPhase真实变化时清旧缓存并准备未来业务入口。"""
+            """只在GlobalPhase真实变化时清理并准备阶段入口。"""
 
-            del snapshot, context, now_ns  # 本轮不借准备入口伪造目标、轨迹或回执。
             state = self._runtime_wiring
             phase = fsm_status.global_phase
             if state.last_handled_phase is phase:
                 return False
-            self._reset_runtime_wiring(reason=f"phase_entry:{phase.value}")
+            previous_phase = state.last_handled_phase
+            self._prepare_phase_transition(previous_phase, phase)
             state.last_handled_phase = phase
+            if type(now_ns) is not int or now_ns < 0:
+                state.phase_entry_failure_reason = "阶段入口时间无效"
+                return True
+            if not isinstance(snapshot, SensorSnapshot):
+                state.phase_entry_failure_reason = "阶段入口缺少SensorSnapshot"
+                return True
+            if context is not None and (
+                not isinstance(context, CompetitionContext)
+                or not context.valid
+                or context.finished
+            ):
+                state.phase_entry_failure_reason = "CompetitionContext不允许普通业务入口"
+                return True
             if phase in {GlobalPhase.NAV_TO_PICK, GlobalPhase.NAV_TO_PLACE}:
                 if self._navigation is None:
                     state.phase_entry_failure_reason = (
                         self._navigation_unavailable_reason or "NavigationController不可用"
                     )
-                # 未来只在此处创建一次NavGoal；本轮接口未冻结，不创建假goal。
+                else:
+                    state.phase_entry_failure_reason = "导航真实结果接口尚未接线"
             elif phase is GlobalPhase.RETURN_END:
                 if self._navigation is None:
                     state.phase_entry_failure_reason = (
@@ -1506,19 +1642,35 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                     state.phase_entry_failure_reason = (
                         "NavigationController.build_return_goal不存在，返区失败关闭"
                     )
+                else:
+                    state.phase_entry_failure_reason = "返区真实结果接口尚未接线"
             elif phase in {GlobalPhase.PLAN_PICK, GlobalPhase.PLAN_PLACE}:
                 if self._arm_planner is None:
                     state.phase_entry_failure_reason = (
                         self._arm_planning_unavailable_reason or "ArmPlanner不可用"
                     )
-                # 未来只在此处规划一次抓取/放置并保存轨迹；本轮不提交PLAN_READY。
+                else:
+                    state.phase_entry_failure_reason = "规划真实结果接口尚未接线"
             elif phase in {GlobalPhase.EXECUTE_PICK, GlobalPhase.EXECUTE_PLACE}:
                 if self._arm_execution is None:
                     state.phase_entry_failure_reason = (
                         self._arm_execution_unavailable_reason
                         or "ArmExecutionController不可用"
                     )
-                # 未来只在此处装载一次已验证轨迹；本轮不启动空轨迹或伪造完成。
+                elif (
+                    phase is GlobalPhase.EXECUTE_PICK
+                    and state.active_pick_trajectory is None
+                ) or (
+                    phase is GlobalPhase.EXECUTE_PLACE
+                    and state.active_place_trajectory is None
+                ):
+                    state.phase_entry_failure_reason = "缺少当前阶段的有效轨迹，执行失败关闭"
+                else:
+                    state.phase_entry_failure_reason = "执行真实结果接口尚未接线"
+            elif phase in {GlobalPhase.SEARCH_TARGET, GlobalPhase.REFINE_TARGET}:
+                state.phase_entry_failure_reason = "视觉真实结果接口尚未接线"
+            elif phase in {GlobalPhase.VERIFY_PICK, GlobalPhase.VERIFY_PLACE}:
+                state.phase_entry_failure_reason = "抓放验证真实反馈接口尚未接线"
             return True
 
         def _run_current_phase(
@@ -1528,7 +1680,9 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             context: Optional[CompetitionContext],
             now_ns: int,
         ) -> tuple[
-            Optional[BaseCommand], Optional[ManipulationCommand], Optional[FSMEvent]
+            Optional[BaseCommand],
+            Optional[ManipulationCommand],
+            Optional[_RuntimeFSMFeedback],
         ]:
             """运行一个周期的当前阶段逻辑；尚未接线的业务始终失败关闭。"""
 
@@ -1545,7 +1699,7 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             base_command, manipulation_command = self._compute_candidate_commands(
                 snapshot, fsm_status, now_ns
             )
-            # 尚无视觉、导航或机械臂真实完成反馈，因此绝不主动构造FSM业务事件。
+            # 尚无视觉、导航或机械臂真实完成反馈，因此不构造业务事件。
             return base_command, manipulation_command, None
 
         def _submit_fsm_event_once(
@@ -1554,15 +1708,28 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             fsm_status: FSMStatus,
             now_ns: int,
             *,
+            source_timestamp_ns: int,
+            run_id: str,
+            task_id: Optional[int],
+            attempt: Optional[int],
             reason: str = "",
-            target_identity: str = "",
+            object_id: str = "",
+            goal_id: str = "",
+            trajectory_id: str = "",
+            confirmed_by_real_feedback: bool = False,
         ) -> bool:
-            """每周期最多向FSM提交一个有界去重的真实业务事件。"""
+            """校验真实反馈身份，并保证每周期最多向FSM尝试一个业务事件。"""
 
             if not isinstance(event, FSMEvent):
                 raise TypeError("event必须是FSMEvent")
+            if not isinstance(fsm_status, FSMStatus):
+                raise TypeError("fsm_status必须是FSMStatus")
+            if not isinstance(reason, str):
+                raise TypeError("reason必须是字符串")
             if type(now_ns) is not int or now_ns < 0:
                 raise ValueError("now_ns必须是真正非负整数")
+            if type(source_timestamp_ns) is not int or source_timestamp_ns < 0:
+                raise ValueError("source_timestamp_ns必须是真正非负整数")
             state = self._runtime_wiring
             if state.last_event_tick_ns != now_ns:
                 state.last_event_tick_ns = now_ns
@@ -1570,30 +1737,115 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             if state.event_attempted_this_tick:
                 return False
             state.event_attempted_this_tick = True
-            identity = target_identity.strip() if isinstance(target_identity, str) else ""
-            if not identity and state.active_target is not None:
-                identity = state.active_target.object_id or ""
+
+            def reject(detail: str) -> bool:
+                state.phase_entry_failure_reason = detail
+                return False
+
+            if source_timestamp_ns > now_ns:
+                return reject("事件来源时间晚于当前控制周期")
+            entered_ns = self._fsm.phase_entered_ns
+            if event is not FSMEvent.RESET and (
+                entered_ns is None or source_timestamp_ns < entered_ns
+            ):
+                return reject("事件来源时间早于当前阶段入口")
+            current_status = self._fsm.status(now_ns)
+            if (
+                fsm_status.global_phase is not current_status.global_phase
+                or fsm_status.task_id != current_status.task_id
+            ):
+                return reject("FSMStatus已过期，阶段或任务身份不一致")
+            if (
+                not isinstance(run_id, str)
+                or run_id != state.run_id
+                or (event is not FSMEvent.RESET and not run_id)
+                or (
+                    task_id is not None and type(task_id) is not int
+                )
+                or task_id != state.task_id
+                or (
+                    attempt is not None and type(attempt) is not int
+                )
+                or attempt != state.attempt
+            ):
+                return reject("事件run/task/attempt身份不一致")
+            if confirmed_by_real_feedback is not True:
+                return reject("事件未由真实反馈明确确认")
+
+            supplied_object_id = object_id.strip() if isinstance(object_id, str) else ""
+            supplied_goal_id = goal_id.strip() if isinstance(goal_id, str) else ""
+            supplied_trajectory_id = (
+                trajectory_id.strip() if isinstance(trajectory_id, str) else ""
+            )
+            expected_object_id = ""
+            if isinstance(state.active_target, ObjectEstimate3D):
+                expected_object_id = (state.active_target.object_id or "").strip()
+            elif isinstance(state.confirmed_grasp_context, GraspContext):
+                expected_object_id = state.confirmed_grasp_context.object_id.strip()
+            expected_goal_id = (
+                state.active_nav_goal.goal_id.strip()
+                if isinstance(state.active_nav_goal, NavGoal)
+                else ""
+            )
+            expected_trajectory_id = state.active_trajectory_id.strip()
+
+            object_events = {
+                FSMEvent.TARGET_FOUND,
+                FSMEvent.TARGET_REFINED,
+                FSMEvent.PICK_PLAN_READY,
+                FSMEvent.PICK_EXECUTED,
+                FSMEvent.PICK_VERIFIED,
+                FSMEvent.PICK_FAILED,
+                FSMEvent.PLACE_NAV_REACHED,
+                FSMEvent.PLACE_PLAN_READY,
+                FSMEvent.PLACE_EXECUTED,
+                FSMEvent.PLACE_VERIFIED,
+            }
+            goal_events = {
+                FSMEvent.PICK_NAV_REACHED,
+                FSMEvent.PLACE_NAV_REACHED,
+                FSMEvent.RETURN_REACHED,
+            }
+            trajectory_events = {
+                FSMEvent.PICK_PLAN_READY,
+                FSMEvent.PICK_EXECUTED,
+                FSMEvent.PLACE_PLAN_READY,
+                FSMEvent.PLACE_EXECUTED,
+            }
+            if event in object_events and (
+                not expected_object_id or supplied_object_id != expected_object_id
+            ):
+                return reject("事件object_id缺失或与当前目标不一致")
+            if event in goal_events and (
+                not expected_goal_id or supplied_goal_id != expected_goal_id
+            ):
+                return reject("事件goal_id缺失或与当前NavGoal不一致")
+            if event in trajectory_events and (
+                not expected_trajectory_id
+                or supplied_trajectory_id != expected_trajectory_id
+            ):
+                return reject("事件trajectory_id缺失或与当前活动轨迹不一致")
+
             key = (
                 state.run_id,
                 state.task_id,
                 state.attempt,
                 fsm_status.global_phase.value,
                 state.phase_generation,
-                identity,
+                source_timestamp_ns,
+                supplied_object_id,
+                supplied_goal_id,
+                supplied_trajectory_id,
                 event.value,
             )
             if key in state.phase_event_keys:
-                return False
+                return reject("同一真实反馈结果已提交")
             if len(state.phase_event_keys) >= _MAX_PHASE_EVENT_KEYS:
-                state.phase_entry_failure_reason = "阶段事件去重表达到有界容量，拒绝新事件"
-                return False
+                return reject("阶段事件去重表达到有界容量，拒绝新事件")
             state.phase_event_keys.add(key)
-            accepted = self._fsm.handle_event(event, now_ns, reason)
+            accepted = self._fsm.handle_event(event, source_timestamp_ns, reason)
             if not accepted:
-                state.phase_entry_failure_reason = (
-                    f"FSM拒绝事件{event.value}，未发生状态转换"
-                )
-                return False
+                return reject(f"FSM拒绝事件{event.value}，未发生状态转换")
             if event is FSMEvent.RESET:
                 self._reset_runtime_wiring(
                     run_id="",
@@ -1603,6 +1855,7 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                     reason="fsm_reset",
                 )
             return True
+
 
         def _check_readiness(
             self,
@@ -1616,9 +1869,8 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 return
             if base is None or joints is None or not base.valid or not joints.valid:
                 return
-            # Odom 和 JointState 是保持与安全判断的基础；没有新鲜反馈时“节点已构造”
-            # 不能等同于“系统已准备”。TODO(official-readiness)：感知节点心跳和官方
-            # Server心跳是否纳入门槛，待官方确认。
+            # Odom 和 JointState 是当前已冻结的就绪判据；没有新鲜反馈时
+            # “节点已构造”不能等同于“系统已准备”。
             if not self._fsm.handle_event(FSMEvent.SYSTEM_READY, now_ns):
                 _log_input_issue_on_change(
                     self,
@@ -1742,8 +1994,7 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             ``FinalAction``；是否允许发布由独立全局官方发布门决定。
             """
 
-            # TODO：未来在这里调用 navigation 和 arm_execution 组装候选；业务模块
-            # 只能返回候选，不能直接发布 ROS 话题，也不能在本函数实现算法。
+            # 接线前只保留可审计的零底盘候选；不实现业务算法或主动关节保持。
             if fsm_status.global_phase in {
                 GlobalPhase.SAFE_HOLD,
                 GlobalPhase.DONE,
@@ -1939,13 +2190,19 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             event_transitioned = False
             if business_event is not None:
                 event_transitioned = self._submit_fsm_event_once(
-                    business_event,
+                    business_event.event,
                     status_before,
                     now_ns,
-                    target_identity=(
-                        self._runtime_wiring.active_target.object_id or ""
-                        if self._runtime_wiring.active_target is not None
-                        else ""
+                    source_timestamp_ns=business_event.source_timestamp_ns,
+                    run_id=business_event.run_id,
+                    task_id=business_event.task_id,
+                    attempt=business_event.attempt,
+                    reason=business_event.reason,
+                    object_id=business_event.object_id,
+                    goal_id=business_event.goal_id,
+                    trajectory_id=business_event.trajectory_id,
+                    confirmed_by_real_feedback=(
+                        business_event.confirmed_by_real_feedback
                     ),
                 )
             timeout_transitioned = False
