@@ -2159,6 +2159,7 @@ def _perception_3d_estimator_from_config(
         "max_position_jump_m",
         "object_dimensions_m",
         "object_local_size_xyz_m",
+        "pose_refinement",
     }
     _require_exact_config_keys(values, required, "perception.estimator_3d")
     dimensions = _config_mapping(
@@ -2225,6 +2226,28 @@ def _perception_3d_estimator_from_config(
             for index, item in enumerate(raw)
         )
 
+    pose = _config_mapping(
+        values["pose_refinement"],
+        "perception.estimator_3d.pose_refinement",
+    )
+    _require_exact_config_keys(
+        pose,
+        {
+            "enabled",
+            "min_points",
+            "required_frames",
+            "depth_band_m",
+            "max_position_delta_m",
+            "max_angular_delta_rad",
+            "max_extent_error_ratio",
+        },
+        "perception.estimator_3d.pose_refinement",
+    )
+    if type(pose["enabled"]) is not bool:
+        raise RuntimeError(
+            "perception.estimator_3d.pose_refinement.enabled 必须是布尔值"
+        )
+
     max_input_skew_s = _positive_config_number(
         perception.get("sync_slop_s"), "perception.sync_slop_s"
     )
@@ -2239,6 +2262,13 @@ def _perception_3d_estimator_from_config(
             max_position_jump_m=values["max_position_jump_m"],
             object_dimensions_m=normalized_dimensions,
             object_local_size_xyz_m=normalized_local_sizes,
+            pose_refinement_enabled=pose["enabled"],
+            pose_min_points=pose["min_points"],
+            pose_required_frames=pose["required_frames"],
+            pose_depth_band_m=pose["depth_band_m"],
+            pose_max_position_delta_m=pose["max_position_delta_m"],
+            pose_max_angular_delta_rad=pose["max_angular_delta_rad"],
+            pose_max_extent_error_ratio=pose["max_extent_error_ratio"],
         )
     except (TypeError, ValueError) as exc:
         raise RuntimeError(f"perception.estimator_3d 配置无效：{exc}") from exc

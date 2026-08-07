@@ -294,7 +294,7 @@ Referee taskinfo / gameinfo / score
 | `RobotJointState` | `/joint_states` 映射出的 17 维**实际反馈**；它不是规划目标，也不是 IK 解。 |
 | `SensorSnapshot` | `team_client_node` 一个周期的轻量快照：任务、底盘、实际关节、三维目标；不含图像。 |
 | `Detection2D` | 图像像素坐标中的类别框、置信度、RGB frame 与时间；稳定器输出还携带非负 `track_id`，不带三维位置。 |
-| `ObjectEstimate3D` | 纯感知事实：目标**物体中心估计**及可选 `object_id`、观测姿态、明确提供的物体局部 XYZ 尺寸；有效中心估计不要求三个可选事实存在，也不携带 `target_body`。当前三维估计器从独立官方模型尺寸配置生产尺寸，实时姿态仍为未知。 |
+| `ObjectEstimate3D` | 纯感知事实：目标**物体中心估计**及可选 `object_id`、观测姿态、明确提供的物体局部 XYZ 尺寸；有效中心估计不要求三个可选事实存在，也不携带 `target_body`。当前三维估计器从独立官方模型尺寸配置生产尺寸，并仅在稳定ID的点云姿态多帧收敛后生产姿态。 |
 | `Pose3D` | 严格有效 Pose：向量项必须是非bool `numbers.Real`，三项位置有限、四元数归一化非零且 frame 非空；不接受数字字符串，不跨 frame 重命名。 |
 | `NavGoal` | 底盘在指定 frame 中的 XY、yaw 目标和容差；物体放置点不能直接当作停车点。 |
 | `BaseCommand` | 导航模块提交给 `ActionMux` 的短时有效速度**建议**，不是已经发送的动作。 |
@@ -518,7 +518,8 @@ orphan 规则见
 
 运行参数以 `config/config.yaml` 为准，可通过 `TEAM_SORTING_CONFIG` 指向另一份完整配置。
 `perception.estimator_3d` 使用精确字段校验：旧的外部完整配置必须以当前默认配置为基线，
-补齐 `object_local_size_xyz_m` 下严格覆盖 `pink`、`yellow`、`brown` 的三项映射；缺失、
+补齐 `object_local_size_xyz_m` 下严格覆盖 `pink`、`yellow`、`brown` 的三项映射及完整
+`pose_refinement` 参数；缺失、
 多余或非法值都会使 PerceptionNode 拒绝启动，且不会退回复用中心补偿专用的
 `object_dimensions_m`。这是有意的失败关闭配置迁移，不是局部覆盖或向后兼容默认值。
 当前传感器、团队和官方控制话题如下：
@@ -562,6 +563,7 @@ orphan 规则见
 | `perception.estimator_3d.max_position_jump_m` | `1.0` | 单轨迹相邻三维中心最大允许跳变 |
 | `perception.estimator_3d.object_dimensions_m.*` | `[0.24, 0.16, 0.19]` | 启发式中心补偿使用的宽、高、沿相机视线近似深度；不是物体局部XYZ尺寸 |
 | `perception.estimator_3d.object_local_size_xyz_m.*` | `[0.24, 0.16, 0.19]` | 官方模型确认的物体局部坐标系完整XYZ尺寸；只用于`size_xyz_m`，不推断姿态 |
+| `perception.estimator_3d.pose_refinement.*` | 见默认配置 | 框内点云深度带、最少点数、连续帧数及位置/角度/尺寸误差门限；均为待真实相机标定的团队初值 |
 | `recorder.enabled` | `false` | 默认不启动记录 |
 | `recorder.record_rosbag` | `true` | 启动 Recorder 时同时管理 rosbag |
 | `recorder.root_dir` | `./team_sorting_dataset` | Recorder schema v1 dataset root；旧扁平目录不自动迁移 |
@@ -586,8 +588,14 @@ orphan 规则见
 `object_local_size_xyz_m` 将逐轴两倍值作为物体局部 XYZ 完整尺寸，三维估计器按类别原样
 输出到 `size_xyz_m`。Server reset 随机的是颜色到槽位的分配，槽位 yaw 离散为 0 或
 π/2；这不会交换物体局部轴。箱体使用自由关节，运行中不能据此假设 roll/pitch 永远为
-零；该静态模型事实不能产生实时姿态。当前 `orientation_xyzw=None`，不得用单位四元数
-或 MJCF 初始姿态补造。外部明确提供的合法姿态和尺寸仍可通过团队 ROS 适配往返。
+零；该静态模型事实本身不能产生实时姿态。启用 `pose_refinement` 后，估计器只取二维框
+内靠近可见表面深度的点，反投影到相机点云并变换到输出 frame；随后以 PCA 主轴和已知
+局部尺寸筛选长方体 OBB，得到局部轴到输出 frame 的 `xyzw` 四元数候选。同一稳定
+`track_id` 必须连续满足位置、角度和尺寸误差门限达到 `required_frames`，才输出姿态；
+否则仍为 `None`。中心对称长方体无法仅凭点云区分局部轴的 180° 符号翻转，代码固定选择
+同一有向包围盒中最接近单位姿态的等价代表，不能把它描述为恢复了 MJCF body 轴符号。
+不得用单位四元数或 MJCF 初始姿态补造观测。该算法已有合成点云回归，但正式相机噪声、
+遮挡和动态翻滚仍待在线验证。
 
 `recorder.rosbag_topics` 当前逐项记录：
 
@@ -724,7 +732,7 @@ Run/Task/Attempt 层级；Segment 边界不被描述为正式训练 Episode 边�
 - 三个 ROS 2 节点入口、消息转换、时间缓存和官方发布出口骨架；
 - YOLO、MMK2FK、KDL 薄适配器及缺失依赖的清晰报错；
 - YOLO 检测的 RGB frame 传递、二维稳定轨迹 ID 与 PerceptionNode 接线；
-- 三维深度中位数、反投影、配置尺寸中心补偿、独立局部尺寸输出、稳定 ID EMA、跳变拒绝与三方时帧校验；
+- 三维深度中位数、反投影、配置尺寸中心补偿、独立局部尺寸输出、点云长方体姿态拟合、稳定 ID 多帧 refine、跳变拒绝与三方时帧校验；
 - Recorder schema v1 bootstrap/run-bound 生命周期、manifest/segment/event、只读恢复报告，
   以及兼容 metadata、FSM/动作 JSONL 和分段外部 rosbag 管理链；
 - 几何、任务解析、FSM、19 维动作、安全覆盖与 Recorder 的测试骨架。
@@ -732,12 +740,12 @@ Run/Task/Attempt 层级；Segment 边界不被描述为正式训练 Episode 边�
 ### 尚未完成
 
 - 正式 YOLO/相机环境中的检测与二维稳定器参数联调；
-- 实时物体姿态估计，以及正式 ROS/MMK2FK 环境中的三维坐标、时间同步和 planning frame 端到端验证；
+- 点云姿态/refine 在正式相机噪声与遮挡下的参数标定，以及正式 ROS/MMK2FK 环境中的三维坐标、时间同步和 planning frame 端到端验证；
 - 抓取/放置站位生成、航点导航、精对准和底盘控制；
 - 由物体中心生成抓取/放置末端位姿，以及完整 IK/轨迹规划；
 - ArmExecution与ROS/FSM的运行时接线及官方环境参数标定；
 - 真实抓取验证、confirmed GraspContext、放置验证和失败恢复；
-- 业务结果驱动 FSM、底盘与机械臂协同的完整比赛闭环；
+- 除“REFINE_TARGET收到阶段进入后新鲜、唯一、几何收敛目标才提交TARGET_REFINED”外，业务结果驱动 FSM、底盘与机械臂协同的完整比赛闭环；
 - ACT/VLA 数据处理、训练和推理。
 
 当前 `team_client_node` 在默认控制周期中只创建零速 `BaseCommand`，机械臂业务候选为
