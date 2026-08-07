@@ -147,7 +147,11 @@ from .navigation import (
     classify_slot_type,
 )
 from .perception_2d import Detection2DStabilizer, OfficialYoloAdapter
-from .perception_3d import CameraTransformProvider, Perception3DEstimator
+from .perception_3d import (
+    CameraTransformProvider,
+    Perception3DEstimator,
+    VisualObservationVerifier,
+)
 from .recording_contracts import ActionPairingConfig
 from .recorder_runtime import (
     RecorderRuntimeConfig,
@@ -167,6 +171,7 @@ class _RuntimeWiringState:
     last_handled_phase: Optional[GlobalPhase] = None
     phase_generation: int = 0
     active_target: Optional[ObjectEstimate3D] = None
+    preferred_object_id: str = ""
     active_nav_goal: Optional[NavGoal] = None
     planned_grasp_context: Optional[GraspContext] = None
     confirmed_grasp_context: Optional[GraspContext] = None
@@ -268,6 +273,22 @@ def _select_target_estimate(
             estimate.orientation_xyzw is None or estimate.size_xyz_m is None
         ):
             continue
+        if require_geometry:
+            try:
+                orientation = tuple(
+                    float(value) for value in estimate.orientation_xyzw
+                )
+                size = tuple(float(value) for value in estimate.size_xyz_m)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if (
+                len(orientation) != 4
+                or not all(math.isfinite(value) for value in orientation)
+                or math.sqrt(sum(value * value for value in orientation)) <= 1e-12
+                or len(size) != 3
+                or not all(math.isfinite(value) and value > 0.0 for value in size)
+            ):
+                continue
         candidates.append(estimate)
     if preferred and any(item.object_id.strip() == preferred for item in candidates):
         candidates = [
@@ -1126,6 +1147,15 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             self._mux = ActionMux(_action_mux_config(config))
             self._runtime_wiring = _RuntimeWiringState()
 
+            # config.yaml 当前没有视觉验证器所需的完整正式阈值。保持 Optional
+            # 不可用，避免采用算法构造器参数名背后的任何隐式或猜测默认值。
+            self._visual_observation_verifier: Optional[
+                VisualObservationVerifier
+            ] = None
+            self._visual_observation_verifier_unavailable_reason = (
+                "config缺少VisualObservationVerifier全部正式严格阈值"
+            )
+
             # 业务对象只在节点初始化时构造一次。默认配置没有正式navigation字段，
             # 因而不能偷偷采用NavigationConfig的模块默认值并宣称导航可用。
             self._navigation: Optional[NavigationController] = None
@@ -1426,6 +1456,7 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             state.last_handled_phase = None
             state.phase_generation += 1
             state.active_target = None
+            state.preferred_object_id = ""
             state.active_nav_goal = None
             state.planned_grasp_context = None
             state.confirmed_grasp_context = None
@@ -1457,6 +1488,9 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             state = self._runtime_wiring
             state.phase_generation += 1
             state.phase_entry_failure_reason = ""
+            # 去重键只在产生它的阶段内有效；新阶段必须重新武装，但SAFE_HOLD仍保留
+            # 业务载荷以便恢复被暂停阶段。
+            state.phase_event_keys.clear()
             if current_phase is GlobalPhase.SAFE_HOLD or (
                 previous_phase is GlobalPhase.SAFE_HOLD
                 and current_phase not in {GlobalPhase.DONE, GlobalPhase.FAILED}
@@ -1465,6 +1499,7 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 return
             if current_phase is GlobalPhase.SEARCH_TARGET:
                 state.active_target = None
+                state.preferred_object_id = ""
                 state.active_nav_goal = None
                 state.planned_grasp_context = None
                 state.confirmed_grasp_context = None
@@ -1481,6 +1516,14 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 state.active_nav_goal = None
                 state.last_navigation_status = None
             elif current_phase is GlobalPhase.REFINE_TARGET:
+                state.preferred_object_id = (
+                    state.active_target.object_id.strip()
+                    if isinstance(state.active_target, ObjectEstimate3D)
+                    and isinstance(state.active_target.object_id, str)
+                    else ""
+                )
+                # SEARCH_TARGET 的完整观测只能提供跨阶段身份，不能作为近距离精定位。
+                state.active_target = None
                 state.active_nav_goal = None
                 state.active_pick_trajectory = None
                 state.active_trajectory_id = ""
@@ -1500,6 +1543,7 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 state.latest_grasp_verification = None
             elif current_phase is GlobalPhase.NAV_TO_PLACE:
                 state.active_target = None
+                state.preferred_object_id = ""
                 state.active_nav_goal = None
                 state.planned_grasp_context = None
                 state.active_pick_trajectory = None
@@ -1522,6 +1566,7 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 state.latest_place_verification_observation = None
             elif current_phase is GlobalPhase.RETURN_END:
                 state.active_target = None
+                state.preferred_object_id = ""
                 state.active_nav_goal = None
                 state.planned_grasp_context = None
                 state.confirmed_grasp_context = None
@@ -1536,6 +1581,7 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 state.last_manipulation_status = None
             elif current_phase in {GlobalPhase.DONE, GlobalPhase.FAILED}:
                 state.active_target = None
+                state.preferred_object_id = ""
                 state.active_nav_goal = None
                 state.active_pick_trajectory = None
                 state.active_place_trajectory = None
@@ -1667,8 +1713,12 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                     state.phase_entry_failure_reason = "缺少当前阶段的有效轨迹，执行失败关闭"
                 else:
                     state.phase_entry_failure_reason = "执行真实结果接口尚未接线"
-            elif phase in {GlobalPhase.SEARCH_TARGET, GlobalPhase.REFINE_TARGET}:
-                state.phase_entry_failure_reason = "视觉真实结果接口尚未接线"
+            elif phase is GlobalPhase.SEARCH_TARGET:
+                state.phase_entry_failure_reason = "等待真实、新鲜且具有稳定身份的odom目标"
+            elif phase is GlobalPhase.REFINE_TARGET:
+                state.phase_entry_failure_reason = (
+                    "等待阶段入口后的同任务odom观测及真实orientation_xyzw/size_xyz_m"
+                )
             elif phase in {GlobalPhase.VERIFY_PICK, GlobalPhase.VERIFY_PLACE}:
                 state.phase_entry_failure_reason = "抓放验证真实反馈接口尚未接线"
             return True
@@ -1699,8 +1749,68 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             base_command, manipulation_command = self._compute_candidate_commands(
                 snapshot, fsm_status, now_ns
             )
-            # 尚无视觉、导航或机械臂真实完成反馈，因此不构造业务事件。
-            return base_command, manipulation_command, None
+            state = self._runtime_wiring
+            phase = fsm_status.global_phase
+            if phase not in {GlobalPhase.SEARCH_TARGET, GlobalPhase.REFINE_TARGET}:
+                return base_command, manipulation_command, None
+            if snapshot.task is None or snapshot.task.task_id != fsm_status.task_id:
+                state.phase_entry_failure_reason = "视觉目标选择缺少当前FSM任务身份"
+                return base_command, manipulation_command, None
+            if self._config.get("frames", {}).get("planning") != "odom":
+                state.phase_entry_failure_reason = (
+                    "frames.planning不是严格odom，视觉业务事件失败关闭"
+                )
+                return base_command, manipulation_command, None
+            if phase is GlobalPhase.REFINE_TARGET and (
+                type(self._fsm.phase_entered_ns) is not int
+                or self._fsm.phase_entered_ns < 0
+            ):
+                state.phase_entry_failure_reason = (
+                    "REFINE_TARGET缺少有效阶段入口时间，视觉事件失败关闭"
+                )
+                return base_command, manipulation_command, None
+
+            selected = _select_target_estimate(
+                snapshot.object_estimates,
+                snapshot.task,
+                now_ns,
+                self._state_max_delta_ns,
+                phase_entered_ns=(
+                    self._fsm.phase_entered_ns
+                    if phase is GlobalPhase.REFINE_TARGET
+                    else None
+                ),
+                preferred_object_id=(
+                    state.preferred_object_id
+                    if phase is GlobalPhase.REFINE_TARGET
+                    else None
+                ),
+                require_geometry=phase is GlobalPhase.REFINE_TARGET,
+            )
+            if selected is None:
+                state.phase_entry_failure_reason = (
+                    "未收到阶段入口后的完整目标几何，REFINE_TARGET保持等待"
+                    if phase is GlobalPhase.REFINE_TARGET
+                    else "未收到匹配任务且新鲜、稳定的odom目标"
+                )
+                return base_command, manipulation_command, None
+
+            state.active_target = selected
+            state.phase_entry_failure_reason = ""
+            return base_command, manipulation_command, _RuntimeFSMFeedback(
+                event=(
+                    FSMEvent.TARGET_FOUND
+                    if phase is GlobalPhase.SEARCH_TARGET
+                    else FSMEvent.TARGET_REFINED
+                ),
+                source_timestamp_ns=selected.timestamp_ns,
+                run_id=state.run_id,
+                task_id=state.task_id,
+                attempt=state.attempt,
+                object_id=selected.object_id or "",
+                reason="真实视觉目标观测通过严格任务、frame、时间和身份校验",
+                confirmed_by_real_feedback=True,
+            )
 
         def _submit_fsm_event_once(
             self,

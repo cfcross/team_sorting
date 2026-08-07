@@ -707,6 +707,7 @@ def test_complete_arm_execution_config_constructs_controller_only_once(
 def _dirty_runtime_wiring(node: Any) -> None:
     state = node._runtime_wiring
     state.active_target = _estimate("old", 0.8)
+    state.preferred_object_id = "old"
     state.active_nav_goal = object()
     state.planned_grasp_context = object()
     state.confirmed_grasp_context = object()
@@ -726,6 +727,7 @@ def _dirty_runtime_wiring(node: Any) -> None:
 def _assert_runtime_payload_cleared(node: Any) -> None:
     state = node._runtime_wiring
     assert state.active_target is None
+    assert state.preferred_object_id == ""
     assert state.active_nav_goal is None
     assert state.planned_grasp_context is None
     assert state.confirmed_grasp_context is None
@@ -813,6 +815,8 @@ def test_phase_entry_runs_once_per_phase_and_rearms_on_change() -> None:
     refine = FSMStatus(1, GlobalPhase.REFINE_TARGET, LocalPhase.IDLE, 0, False, "", NOW + 2)
     assert node._handle_phase_entry(snapshot, refine, None, NOW + 2)
     assert node._runtime_wiring.phase_generation == generation + 1
+    assert node._runtime_wiring.preferred_object_id == "selected-after-entry"
+    assert node._runtime_wiring.active_target is None
 
 
 def test_phase_specific_cleanup_preserves_cross_phase_pick_context() -> None:
@@ -835,13 +839,14 @@ def test_phase_specific_cleanup_preserves_cross_phase_pick_context() -> None:
     state.active_pick_trajectory = object()
     state.planned_grasp_context = object()
     node._prepare_phase_transition(GlobalPhase.NAV_TO_PICK, GlobalPhase.REFINE_TARGET)
-    assert state.active_target is target
+    assert state.preferred_object_id == "target-a"
+    assert state.active_target is None
     assert state.active_nav_goal is None
     assert state.active_pick_trajectory is None
     assert state.planned_grasp_context is None
 
     node._prepare_phase_transition(GlobalPhase.REFINE_TARGET, GlobalPhase.PLAN_PICK)
-    assert state.active_target is target
+    assert state.active_target is None
     state.active_pick_trajectory = pick_trajectory
     state.planned_grasp_context = planned_context
     node._prepare_phase_transition(GlobalPhase.PLAN_PICK, GlobalPhase.EXECUTE_PICK)
@@ -1228,6 +1233,221 @@ def test_target_selection_is_deterministic_and_refine_requires_new_geometry() ->
         replace(tied_a, object_id=None),
     )
     assert _select_target_estimate(rejected, task, NOW, 1_000) is None
+
+
+def _visual_phase_result(
+    phase: GlobalPhase,
+    estimates: tuple[ObjectEstimate3D, ...],
+    *,
+    phase_entered_ns: int = NOW - 100,
+) -> tuple[Any, Any]:
+    node = _node()
+    state = node._runtime_wiring
+    state.run_id = "run-1"
+    state.task_id = 1
+    state.attempt = 0
+    node._fsm.phase_entered_ns = phase_entered_ns
+    status = FSMStatus(1, phase, LocalPhase.IDLE, 0, False, "", NOW)
+    snapshot = SensorSnapshot(_task(), _base(), _joints(), estimates, NOW, True)
+    return node, node._run_current_phase(snapshot, status, None, NOW)[2]
+
+
+def test_search_target_builds_real_feedback_from_selected_observation() -> None:
+    lower = _estimate("target-b", 0.8, timestamp_ns=NOW - 20)
+    selected = _estimate("target-a", 0.9, timestamp_ns=NOW - 10)
+
+    node, feedback = _visual_phase_result(
+        GlobalPhase.SEARCH_TARGET, (lower, selected)
+    )
+
+    assert node._runtime_wiring.active_target is selected
+    assert feedback.event is FSMEvent.TARGET_FOUND
+    assert feedback.source_timestamp_ns == selected.timestamp_ns
+    assert feedback.object_id == "target-a"
+    assert feedback.confirmed_by_real_feedback is True
+    assert (feedback.run_id, feedback.task_id, feedback.attempt) == ("run-1", 1, 0)
+
+
+def test_real_search_feedback_advances_only_through_existing_event_adapter() -> None:
+    node = _node()
+    _prime_control_state(node)
+    node._control_tick()
+    node._on_instruction(_message(json.dumps(OFFICIAL_TASKS)))
+    _feed_official_context(node, task=1, attempt=0)
+    assert node._fsm.phase is GlobalPhase.SEARCH_TARGET
+    node._latest_estimates = (_estimate("stable:7", 0.9, timestamp_ns=NOW),)
+
+    node._control_tick()
+
+    assert node._fsm.phase is GlobalPhase.NAV_TO_PICK
+    assert node._runtime_wiring.active_target.object_id == "stable:7"
+
+
+@pytest.mark.parametrize(
+    "estimate",
+    [
+        replace(_estimate("id", 0.9), object_id=None),
+        replace(_estimate("id", 0.9), class_id="brown"),
+        replace(_estimate("id", 0.9), frame_id="world"),
+        replace(_estimate("id", 0.9), timestamp_ns=NOW + 1),
+        replace(_estimate("id", 0.9), timestamp_ns=NOW - 150_000_001),
+        replace(_estimate("id", 0.9), valid=False, failure_reason="invalid"),
+    ],
+    ids=("missing-id", "wrong-class", "wrong-frame", "future", "stale", "invalid"),
+)
+def test_search_target_rejects_unsafe_visual_candidates(
+    estimate: ObjectEstimate3D,
+) -> None:
+    node, feedback = _visual_phase_result(GlobalPhase.SEARCH_TARGET, (estimate,))
+
+    assert feedback is None
+    assert node._runtime_wiring.active_target is None
+
+
+def test_non_odom_planning_config_keeps_visual_event_closed() -> None:
+    node, _ = _visual_phase_result(
+        GlobalPhase.SEARCH_TARGET, (_estimate("target-a", 0.9),)
+    )
+    node._runtime_wiring.active_target = None
+    node._config["frames"]["planning"] = "world"
+    status = FSMStatus(
+        1, GlobalPhase.SEARCH_TARGET, LocalPhase.IDLE, 0, False, "", NOW
+    )
+    snapshot = SensorSnapshot(
+        _task(), _base(), _joints(), (_estimate("target-a", 0.9),), NOW, True
+    )
+
+    assert node._run_current_phase(snapshot, status, None, NOW)[2] is None
+    assert node._runtime_wiring.active_target is None
+    assert "不是严格odom" in node._runtime_wiring.phase_entry_failure_reason
+
+
+def test_same_search_observation_is_submitted_only_once() -> None:
+    estimate = _estimate("target-a", 0.9, timestamp_ns=NOW - 10)
+    node, feedback = _visual_phase_result(GlobalPhase.SEARCH_TARGET, (estimate,))
+    status = FSMStatus(1, GlobalPhase.SEARCH_TARGET, LocalPhase.IDLE, 0, False, "", NOW)
+    node._fsm.status = lambda _now: status
+    calls: list[FSMEvent] = []
+    node._fsm.handle_event = lambda event, *_args: calls.append(event) or True
+
+    assert node._submit_fsm_event_once(
+        feedback.event,
+        status,
+        NOW,
+        source_timestamp_ns=feedback.source_timestamp_ns,
+        run_id=feedback.run_id,
+        task_id=feedback.task_id,
+        attempt=feedback.attempt,
+        object_id=feedback.object_id,
+        confirmed_by_real_feedback=feedback.confirmed_by_real_feedback,
+    )
+    assert not node._submit_fsm_event_once(
+        feedback.event,
+        status,
+        NOW + 1,
+        source_timestamp_ns=feedback.source_timestamp_ns,
+        run_id=feedback.run_id,
+        task_id=feedback.task_id,
+        attempt=feedback.attempt,
+        object_id=feedback.object_id,
+        confirmed_by_real_feedback=feedback.confirmed_by_real_feedback,
+    )
+    assert calls == [FSMEvent.TARGET_FOUND]
+
+
+def test_refine_entry_preserves_only_identity_and_rejects_old_or_missing_geometry() -> None:
+    node = _node()
+    state = node._runtime_wiring
+    original = _estimate("target-a", 0.9, timestamp_ns=NOW - 200)
+    state.active_target = original
+    state.phase_event_keys.add(("search",))
+    node._fsm.phase_entered_ns = NOW - 100
+    status = FSMStatus(1, GlobalPhase.REFINE_TARGET, LocalPhase.IDLE, 0, False, "", NOW)
+    snapshot = SensorSnapshot(_task(), _base(), _joints(), (), NOW, True)
+
+    assert node._handle_phase_entry(snapshot, status, None, NOW)
+    assert state.preferred_object_id == "target-a"
+    assert state.active_target is None
+    assert state.phase_event_keys == set()
+
+    old_complete = _estimate("target-a", 1.0, timestamp_ns=NOW - 101)
+    missing_orientation = _estimate(
+        "target-a", 1.0, timestamp_ns=NOW - 10, orientation=False
+    )
+    missing_size = _estimate("target-a", 1.0, timestamp_ns=NOW - 10, size=False)
+    for estimate in (old_complete, missing_orientation, missing_size):
+        result = node._run_current_phase(
+            replace(snapshot, object_estimates=(estimate,)), status, None, NOW
+        )
+        assert result[2] is None
+        assert state.active_target is None
+
+
+def test_refine_prefers_original_identity_and_uses_only_new_complete_geometry() -> None:
+    node = _node()
+    state = node._runtime_wiring
+    state.run_id = "run-1"
+    state.task_id = 1
+    state.attempt = 0
+    state.preferred_object_id = "target-a"
+    node._fsm.phase_entered_ns = NOW - 100
+    status = FSMStatus(1, GlobalPhase.REFINE_TARGET, LocalPhase.IDLE, 0, False, "", NOW)
+    other = _estimate("target-b", 1.0, timestamp_ns=NOW - 5)
+    preferred = _estimate("target-a", 0.7, timestamp_ns=NOW - 4)
+    snapshot = SensorSnapshot(_task(), _base(), _joints(), (other, preferred), NOW, True)
+
+    _, _, feedback = node._run_current_phase(snapshot, status, None, NOW)
+
+    assert state.active_target is preferred
+    assert feedback.event is FSMEvent.TARGET_REFINED
+    assert feedback.object_id == "target-a"
+    assert feedback.source_timestamp_ns == preferred.timestamp_ns
+
+
+def test_current_perception_geometry_gap_keeps_refine_closed_and_never_plans() -> None:
+    node = _node()
+    node._fsm.phase_entered_ns = NOW - 100
+    node._arm_planner = SimpleNamespace(
+        plan_grasp=lambda *_args: pytest.fail("REFINE不得调用ArmPlanner.plan_grasp")
+    )
+    status = FSMStatus(1, GlobalPhase.REFINE_TARGET, LocalPhase.IDLE, 0, False, "", NOW)
+    current_output = _estimate(
+        "stable:7", 0.9, timestamp_ns=NOW - 10, orientation=False, size=False
+    )
+    snapshot = SensorSnapshot(_task(), _base(), _joints(), (current_output,), NOW, True)
+
+    assert node._run_current_phase(snapshot, status, None, NOW)[2] is None
+    assert node._runtime_wiring.active_target is None
+
+
+def test_missing_formal_thresholds_do_not_construct_visual_verifier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        ros_nodes_module,
+        "VisualObservationVerifier",
+        lambda **_kwargs: pytest.fail("缺少正式阈值时不得构造视觉验证器"),
+    )
+    node = _node()
+
+    assert node._visual_observation_verifier is None
+    assert "缺少" in node._visual_observation_verifier_unavailable_reason
+
+
+@pytest.mark.parametrize("phase", [GlobalPhase.VERIFY_PICK, GlobalPhase.VERIFY_PLACE])
+def test_visual_verification_phases_never_emit_business_success_alone(
+    phase: GlobalPhase,
+) -> None:
+    node = _node()
+    state = node._runtime_wiring
+    state.latest_grasp_verification = object()
+    state.latest_place_verification_observation = _estimate("target-a", 0.9)
+    snapshot = SensorSnapshot(
+        _task(), _base(), _joints(), (_estimate("target-a", 0.9),), NOW, True
+    )
+    status = FSMStatus(1, phase, LocalPhase.IDLE, 0, False, "", NOW)
+
+    assert node._run_current_phase(snapshot, status, None, NOW)[2] is None
 
 
 def test_planar_transform_snapshot_has_explicit_inverse_direction_and_time() -> None:
