@@ -113,6 +113,16 @@ perception:
       pink: [0.24, 0.16, 0.19]
       yellow: [0.24, 0.16, 0.19]
       brown: [0.24, 0.16, 0.19]
+    # 物体局部坐标系下的完整XYZ尺寸，单位米；这是size_xyz_m的独立事实来源，不参与
+    # 相机射线中心补偿。正式material_competition_layout.json把三类body稳定映射为
+    # pink/yellow/brown，并明确half_size=[0.12,0.08,0.095]m；MJCF中的三个box geom
+    # 也使用相同半尺寸，因此这里逐轴乘2。reset槽位yaw离散为0或π/2，只改变body
+    # 相对world/odom的姿态，不交换局部XYZ轴；自由关节运行时姿态仍必须由视觉估计，
+    # 不能从该静态尺寸配置推断。
+    object_local_size_xyz_m:
+      pink: [0.24, 0.16, 0.19]
+      yellow: [0.24, 0.16, 0.19]
+      brown: [0.24, 0.16, 0.19]
 
 # 提交1只冻结配置契约，不构造ArmPlanner。enabled默认关闭；null表示尚未标定，不能由
 # 代码补隐藏默认值。抓取与放置启用前分别调用ArmPlanningConfig的操作级验证。
