@@ -204,6 +204,7 @@ def _select_target_estimate(
     phase_entered_ns: Optional[int] = None,
     preferred_object_id: Optional[str] = None,
     require_geometry: bool = False,
+    require_unique_identity: bool = False,
 ) -> Optional[ObjectEstimate3D]:
     """确定性选择当前任务的odom目标，不产生FSM事件或补造感知事实。"""
 
@@ -245,7 +246,7 @@ def _select_target_estimate(
             or not 0.0 <= confidence <= 1.0
         ):
             continue
-        if phase_entered_ns is not None and estimate.timestamp_ns < phase_entered_ns:
+        if phase_entered_ns is not None and estimate.timestamp_ns <= phase_entered_ns:
             continue
         if require_geometry and (
             estimate.orientation_xyzw is None or estimate.size_xyz_m is None
@@ -256,6 +257,10 @@ def _select_target_estimate(
         candidates = [
             item for item in candidates if item.object_id.strip() == preferred
         ]
+    if require_unique_identity and len(
+        {item.object_id.strip() for item in candidates}
+    ) != 1:
+        return None
     if not candidates:
         return None
     return min(
@@ -1556,7 +1561,25 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             base_command, manipulation_command = self._compute_candidate_commands(
                 snapshot, fsm_status, now_ns
             )
-            # 尚无视觉、导航或机械臂真实完成反馈，因此绝不主动构造FSM业务事件。
+            if (
+                fsm_status.global_phase is GlobalPhase.REFINE_TARGET
+                and snapshot.valid
+                and snapshot.task is not None
+                and self._fsm.phase_entered_ns is not None
+            ):
+                refined = _select_target_estimate(
+                    snapshot.object_estimates,
+                    snapshot.task,
+                    now_ns,
+                    self._state_max_delta_ns,
+                    phase_entered_ns=self._fsm.phase_entered_ns,
+                    require_geometry=True,
+                    require_unique_identity=True,
+                )
+                if refined is not None:
+                    self._runtime_wiring.active_target = refined
+                    return base_command, manipulation_command, FSMEvent.TARGET_REFINED
+            # 导航和机械臂完成反馈仍未接线，不为这些阶段构造事件。
             return base_command, manipulation_command, None
 
         def _submit_fsm_event_once(
@@ -2794,6 +2817,7 @@ def _perception_3d_estimator_from_config(
         "max_position_jump_m",
         "object_dimensions_m",
         "object_local_size_xyz_m",
+        "pose_refinement",
     }
     _require_exact_config_keys(values, required, "perception.estimator_3d")
     dimensions = _config_mapping(
@@ -2860,6 +2884,28 @@ def _perception_3d_estimator_from_config(
             for index, item in enumerate(raw)
         )
 
+    pose = _config_mapping(
+        values["pose_refinement"],
+        "perception.estimator_3d.pose_refinement",
+    )
+    _require_exact_config_keys(
+        pose,
+        {
+            "enabled",
+            "min_points",
+            "required_frames",
+            "depth_band_m",
+            "max_position_delta_m",
+            "max_angular_delta_rad",
+            "max_extent_error_ratio",
+        },
+        "perception.estimator_3d.pose_refinement",
+    )
+    if type(pose["enabled"]) is not bool:
+        raise RuntimeError(
+            "perception.estimator_3d.pose_refinement.enabled 必须是布尔值"
+        )
+
     max_input_skew_s = _positive_config_number(
         perception.get("sync_slop_s"), "perception.sync_slop_s"
     )
@@ -2874,6 +2920,13 @@ def _perception_3d_estimator_from_config(
             max_position_jump_m=values["max_position_jump_m"],
             object_dimensions_m=normalized_dimensions,
             object_local_size_xyz_m=normalized_local_sizes,
+            pose_refinement_enabled=pose["enabled"],
+            pose_min_points=pose["min_points"],
+            pose_required_frames=pose["required_frames"],
+            pose_depth_band_m=pose["depth_band_m"],
+            pose_max_position_delta_m=pose["max_position_delta_m"],
+            pose_max_angular_delta_rad=pose["max_angular_delta_rad"],
+            pose_max_extent_error_ratio=pose["max_extent_error_ratio"],
         )
     except (TypeError, ValueError) as exc:
         raise RuntimeError(f"perception.estimator_3d 配置无效：{exc}") from exc

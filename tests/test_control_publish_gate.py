@@ -859,6 +859,52 @@ def test_target_selection_is_deterministic_and_refine_requires_new_geometry() ->
         phase_entered_ns=NOW - 50,
         require_geometry=True,
     ) is None
+    assert _select_target_estimate(
+        (_estimate("phase-boundary", 1.0, timestamp_ns=NOW - 50),),
+        task,
+        NOW,
+        1_000,
+        phase_entered_ns=NOW - 50,
+        require_geometry=True,
+    ) is None
+
+
+def test_refine_phase_emits_event_only_for_unique_fresh_converged_geometry() -> None:
+    node = _node()
+    node._fsm.phase_entered_ns = NOW - 50
+    status = FSMStatus(
+        1,
+        GlobalPhase.REFINE_TARGET,
+        LocalPhase.IDLE,
+        0,
+        False,
+        "",
+        NOW - 50,
+    )
+    refined = _estimate("stable:7", 0.8, timestamp_ns=NOW - 10)
+    snapshot = SensorSnapshot(_task(), _base(), _joints(), (refined,), NOW, True)
+
+    base_command, manipulation_command, event = node._run_current_phase(
+        snapshot, status, None, NOW
+    )
+    assert base_command is not None and base_command.v == base_command.w == 0.0
+    assert manipulation_command is None
+    assert event is FSMEvent.TARGET_REFINED
+    assert node._runtime_wiring.active_target is refined
+
+    ambiguous = SensorSnapshot(
+        _task(),
+        _base(),
+        _joints(),
+        (refined, _estimate("stable:8", 0.9, timestamp_ns=NOW - 9)),
+        NOW,
+        True,
+    )
+    _, manipulation_command, event = node._run_current_phase(
+        ambiguous, status, None, NOW
+    )
+    assert manipulation_command is None
+    assert event is None
 
 
 def test_planar_transform_snapshot_has_explicit_inverse_direction_and_time() -> None:
