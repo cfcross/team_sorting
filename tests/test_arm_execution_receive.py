@@ -1,5 +1,7 @@
 """ArmExecutionController 抓取验证接收骨架的专项回归测试。"""
 
+from fractions import Fraction
+
 import pytest
 
 from team_sorting.arm_execution import ArmExecutionController
@@ -139,6 +141,16 @@ def test_accept_grasp_verification_replaces_cache_and_reset_clears_it() -> None:
     assert controller._verification_received_ns is None
 
 
+def test_accept_grasp_verification_accepts_non_builtin_real_confidence() -> None:
+    controller = ArmExecutionController()
+    verification = _verification(confidence=Fraction(1, 2))
+
+    controller.accept_grasp_verification(verification)
+
+    assert controller._cached_verification is verification
+    assert controller._verification_received_ns == verification.timestamp_ns
+
+
 def test_cached_verification_does_not_unlock_or_advance_verify() -> None:
     controller = _execution_controller()
     assert controller.start_trajectory(_pick_trajectory()).state == "LOADED"
@@ -206,12 +218,14 @@ def test_accept_grasp_verification_rejects_incomplete_instance(
     verification = _damaged_verification()
     object.__delattr__(verification, missing_field)
     controller = ArmExecutionController()
+    accepted = _verification(timestamp_ns=99)
+    controller.accept_grasp_verification(accepted)
 
     with pytest.raises(ValueError, match="字段不完整"):
         controller.accept_grasp_verification(verification)
 
-    assert controller._cached_verification is None
-    assert controller._verification_received_ns is None
+    assert controller._cached_verification is accepted
+    assert controller._verification_received_ns == 99
 
 
 @pytest.mark.parametrize(
@@ -245,6 +259,7 @@ def test_accept_grasp_verification_rejects_invalid_is_grasped(
         float("-inf"),
         -0.01,
         1.01,
+        10 ** 1_000,
     ],
 )
 def test_accept_grasp_verification_rejects_invalid_confidence(
@@ -260,6 +275,8 @@ def test_accept_grasp_verification_rejects_invalid_confidence(
         )
 
     assert controller._cached_verification is accepted
+    assert controller._verification_received_ns == 99
+    assert controller._verification_received_ns == 99
 
 
 @pytest.mark.parametrize(
@@ -285,6 +302,7 @@ def test_accept_grasp_verification_rejects_non_str_evidence(
         )
 
     assert controller._cached_verification is accepted
+    assert controller._verification_received_ns == 99
 
 
 def test_accept_grasp_verification_rejects_stale_timestamp() -> None:
@@ -323,3 +341,4 @@ def test_accept_grasp_verification_rejects_conflicting_duplicate() -> None:
 
     assert controller._cached_verification is accepted
     assert controller._cached_verification.success is True
+    assert controller._verification_received_ns == 200
