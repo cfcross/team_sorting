@@ -107,6 +107,7 @@ def _execution_config(**overrides: object) -> ArmExecutionConfig:
         "trajectory_max_age_ns": 1_000_000_000,
         "command_ttl_ns": 100_000_000,
         "max_control_period_ns": 200_000_000,
+        "verification_timeout_ns": 1_000_000_000,
         "waypoint_timeout_margin_ns": 1_000_000_000,
         "total_timeout_margin_ns": 2_000_000_000,
         "max_slide_velocity_m_s": 0.2,
@@ -3370,7 +3371,7 @@ def test_arm_execution_same_phase_waypoints_still_require_settle_cycles() -> Non
     assert controller._waypoint_index == 1
 
 
-def test_arm_execution_verify_wait_never_enters_retreat_and_times_out() -> None:
+def test_arm_execution_verify_wait_without_completed_evidence_times_out() -> None:
     controller = _execution_controller(
         settle_cycles=1,
         max_control_period_ns=2_000_000_000,
@@ -3388,7 +3389,7 @@ def test_arm_execution_verify_wait_never_enters_retreat_and_times_out() -> None:
     )
     assert command.valid is False
     assert status.state == "FAILED"
-    assert "total_timeout_margin_ns" in status.failure_reason
+    assert "verification_timeout_ns" in status.failure_reason
     assert controller._cached_verification is None
 
 
@@ -3425,7 +3426,7 @@ def test_arm_execution_place_phase_mapping_and_completion() -> None:
     assert observed[:3] == [LocalPhase.MOVE_PREPLACE, LocalPhase.LOWER_OBJECT, LocalPhase.RELEASE]
     assert observed[-1] is LocalPhase.IDLE
     assert status.state == "MOTION_COMPLETED_PLACE_VERIFICATION_PENDING"
-    assert status.success is False
+    assert status.success is True
     assert "物体位置与裁判语义仍待外部验证" in status.failure_reason
     assert command.valid is False
 
@@ -3454,7 +3455,7 @@ def test_arm_execution_completed_terminal_survives_long_gap_and_bad_feedback() -
     assert repeated.timestamp_ns == original_timestamp
     assert repeated.max_joint_error == original_error
     assert repeated.state == "MOTION_COMPLETED_PLACE_VERIFICATION_PENDING"
-    assert repeated.success is False
+    assert repeated.success is True
 
     invalid_time_command, same_terminal = controller.step(
         SimpleNamespace(), "bad"  # type: ignore[arg-type]

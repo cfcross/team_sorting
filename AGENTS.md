@@ -143,9 +143,11 @@ ros_nodes 组装上述模块并连接 ROS2
 
 - `perception_3d` 禁止依赖 `perception_2d` 的内部实现，只通过 `Detection2D` 连接。
 - `arm_execution` 禁止依赖 `arm_planning` 的内部实现，只通过 `JointTrajectory` 连接。
-- ArmExecution已实现轨迹运动学执行，但真实抓取验证和confirmed GraspContext仍未实现，
-  等待提交3B/集成阶段的真实证据来源。提交3A抓取必须停在 `VERIFY`，放置完成也只能等待
-  外部验证；二者都不得以 `success=True` 表示尚未取得的验证。执行器不得持有、修改或确认
+- ArmExecution只在当前 `EXECUTE_PICK` 最后一个LIFT路点的显式VERIFY等待窗口内接收
+  `GraspVerification`；证据不足继续等待，明确抓住或明确未抓住都必须完成安全RETREAT。
+  抓取/放置运动完成态的 `success=True` 只表示整条JointTrajectory由不同时间戳的真实
+  JointState连续确认完成，不表示抓放业务验证成功。抓取结论通过只读公共属性供后续
+  `VERIFY_PICK` 使用，并在reset或新轨迹时清除。执行器不得持有、修改或确认
   `GraspContext`；ROS/FSM接线获批前保持关闭。
 - 夹爪位置范围是 `[0,1]`，速度单位是控制量/秒，最终速度仍须官方仿真标定。ArmExecution
   输出只是候选，不证明ActionMux接受或官方控制器执行。提交4接线前，组装层必须在候选
