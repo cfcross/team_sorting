@@ -140,7 +140,7 @@ def test_setup_installs_contract_document_and_cli() -> None:
     assert "team_sorting_dataset_index = team_sorting.dataset_indexer:main" in setup
 
 
-def test_installed_prefix_contract_and_dependencies_load_without_cwd(
+def test_installed_prefix_loading_is_cwd_and_ament_independent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     prefix = tmp_path / "prefix/local"
@@ -151,8 +151,10 @@ def test_installed_prefix_contract_and_dependencies_load_without_cwd(
     module.write_text("# installed", encoding="utf-8")
     for name in (*DEPENDENCIES, "dataset_index_v1.json"):
         (share / name).write_bytes((ROOT / "config/contracts" / name).read_bytes())
+    unrelated = tmp_path / "unrelated"
+    unrelated.mkdir()
+    monkeypatch.chdir(unrelated)
+    monkeypatch.delenv("AMENT_PREFIX_PATH", raising=False)
     monkeypatch.setattr(contract_module, "__file__", str(module))
-    monkeypatch.setattr(contract_module, "_ament_candidate", lambda: None)
-    monkeypatch.chdir(tmp_path)
     assert contract_module.dataset_index_contract_path() == share / "dataset_index_v1.json"
     assert contract_module.load_dataset_index_contract()["contract_id"] == "dataset_index_v1"
