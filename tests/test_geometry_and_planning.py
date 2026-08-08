@@ -4483,6 +4483,32 @@ class _FakePlannerKDL:
         return IKResult(slide, left, right, True)
 
 
+class _SlideSearchFakeKDL(_FakePlannerKDL):
+    """只模拟官方限位和特定高度可达；不代表真实机器人可达性。"""
+
+    def __init__(
+        self,
+        *,
+        success_slide: float | None,
+        limits: tuple[float, float] = (-0.04, 0.60),
+    ) -> None:
+        super().__init__()
+        self.success_slide = success_slide
+        self.limits = limits
+
+    def slide_limits(self) -> tuple[float, float]:
+        return self.limits
+
+    def solve_ik(self, **kwargs: object) -> IKResult:
+        self.calls.append(dict(kwargs))
+        slide = float(kwargs["target_slide"])
+        if self.success_slide is None or not math.isclose(
+            slide, self.success_slide, rel_tol=0.0, abs_tol=1e-12
+        ):
+            return IKResult(slide, None, None, False, f"slide={slide}无解")
+        return IKResult(slide, (0.01,) * 6, (-0.01,) * 6, True)
+
+
 def _run_grasp(
     adapter: _FakePlannerKDL | None = None,
     *, config: ArmPlanningConfig | None = None, task: TaskSpec | None = None,
@@ -4797,6 +4823,33 @@ def test_grasp_calls_four_unique_ik_stages_with_original_feedback_and_slide() ->
     assert [call["right_target"] for call in fake.calls] == [
         grasp.right_pregrasp, grasp.right_grasp, grasp.right_lift, grasp.right_retreat,
     ]
+
+
+def test_grasp_searches_nearby_official_slide_after_current_height_fails() -> None:
+    fake = _SlideSearchFakeKDL(success_slide=0.12)
+    grasp, trajectory, _ = _run_grasp(fake)
+    slides = [float(call["target_slide"]) for call in fake.calls]
+
+    assert grasp.valid and trajectory.valid
+    assert slides == pytest.approx([0.1, 0.12, 0.12, 0.12, 0.12])
+    assert all(fake.limits[0] <= slide <= fake.limits[1] for slide in slides)
+    assert all(
+        waypoint.joint_position[0] == pytest.approx(0.12)
+        for waypoint in trajectory.waypoints
+    )
+
+
+def test_grasp_slide_search_fails_atomically_when_all_official_candidates_fail() -> None:
+    fake = _SlideSearchFakeKDL(success_slide=None)
+    grasp, trajectory, _ = _run_grasp(fake)
+    slides = [float(call["target_slide"]) for call in fake.calls]
+
+    assert not grasp.valid and not trajectory.valid and trajectory.waypoints == ()
+    assert grasp.failure_reason == trajectory.failure_reason
+    assert "所有官方slide候选" in grasp.failure_reason
+    assert slides[0] == pytest.approx(0.1)
+    assert len(slides) > 1
+    assert all(fake.limits[0] <= slide <= fake.limits[1] for slide in slides)
 
 
 @pytest.mark.parametrize(("mode", "index"), [("fail_at", 2), ("half_at", 1), ("raise_at", 3)])
@@ -5116,6 +5169,20 @@ def test_place_calls_three_ik_stages_and_builds_four_waypoints() -> None:
     assert [waypoint.joint_position[9] for waypoint in trajectory.waypoints] == [0.2, 0.2, 0.8, 0.8]
     assert [waypoint.joint_position[16] for waypoint in trajectory.waypoints] == [0.2, 0.2, 0.8, 0.8]
     assert trajectory.trajectory_id == "place-7-box_pink-track-3-130"
+
+
+def test_place_searches_nearby_official_slide_after_current_height_fails() -> None:
+    fake = _SlideSearchFakeKDL(success_slide=0.12)
+    place, trajectory, _ = _run_place(fake)
+    slides = [float(call["target_slide"]) for call in fake.calls]
+
+    assert place.valid and trajectory.valid
+    assert slides == pytest.approx([0.1, 0.12, 0.12, 0.12])
+    assert all(fake.limits[0] <= slide <= fake.limits[1] for slide in slides)
+    assert all(
+        waypoint.joint_position[0] == pytest.approx(0.12)
+        for waypoint in trajectory.waypoints
+    )
 
 
 @pytest.mark.parametrize(("mode", "index"), [("fail_at", 0), ("half_at", 1), ("raise_at", 2)])
