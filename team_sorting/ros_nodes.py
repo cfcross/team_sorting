@@ -82,7 +82,7 @@ _create_recorder_node()
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import fields, replace
+from dataclasses import dataclass, field, fields, replace
 import importlib
 import json
 import math
@@ -95,6 +95,7 @@ from typing import Any, Mapping, Optional
 
 from .action_mux import ActionMux, ActionMuxConfig
 from .controller_manifest import validate_controller_config
+from .arm_planning import ArmPlanner, OfficialKDLAdapter
 from .arm_execution import ArmExecutionController
 from .competition_context import CompetitionContext, CompetitionRunCoordinator
 from .external_candidate import (
@@ -106,6 +107,7 @@ from .fsm import FSMEvent, GlobalFSM, InstructionParser
 from .interfaces import (
     ActionDispatchRecord,
     ActionMuxDecision,
+    ArmExecutionConfig,
     ArmPlanningConfig,
     BaseCommand,
     BaseState,
@@ -116,9 +118,17 @@ from .interfaces import (
     Float64MultiArrayExactPayload,
     FSMStatus,
     FinalAction,
+    GlobalPhase,
+    GraspContext,
+    GraspVerification,
+    JointTrajectory,
     ManipulationCommand,
+    ManipulationStatus,
+    NavGoal,
+    NavigationStatus,
     ObjectEstimate3D,
     RGBFrame,
+    RigidTransform3D,
     RobotJointState,
     SensorSnapshot,
     SlotType,
@@ -130,15 +140,289 @@ from .interfaces import (
     fsm_status_from_json,
     fsm_status_to_json,
 )
-from .navigation import Bounds3D, classify_slot_type
+from .navigation import (
+    Bounds3D,
+    NavigationConfig,
+    NavigationController,
+    classify_slot_type,
+)
 from .perception_2d import Detection2DStabilizer, OfficialYoloAdapter
-from .perception_3d import CameraTransformProvider, Perception3DEstimator
+from .perception_3d import (
+    CameraTransformProvider,
+    Perception3DEstimator,
+    VisualObservationVerifier,
+)
 from .recording_contracts import ActionPairingConfig
 from .recorder_runtime import (
     RecorderRuntimeConfig,
     RecorderRuntimeManager,
     resolve_rosbag_qos_overrides_path,
 )
+
+
+@dataclass
+class _RuntimeWiringState:
+    """TeamClient私有、可清理的接线状态；缓存存在不表示业务已经成功。"""
+
+    run_id: str = ""
+    task_id: Optional[int] = None
+    attempt: Optional[int] = None
+    context_finished: bool = False
+    last_handled_phase: Optional[GlobalPhase] = None
+    phase_generation: int = 0
+    active_target: Optional[ObjectEstimate3D] = None
+    preferred_object_id: str = ""
+    active_nav_goal: Optional[NavGoal] = None
+    planned_grasp_context: Optional[GraspContext] = None
+    confirmed_grasp_context: Optional[GraspContext] = None
+    active_pick_trajectory: Optional[JointTrajectory] = None
+    active_place_trajectory: Optional[JointTrajectory] = None
+    active_trajectory_id: str = ""
+    pick_observation_before_lift: Optional[ObjectEstimate3D] = None
+    latest_grasp_verification: Optional[GraspVerification] = None
+    place_observation_before_release: Optional[ObjectEstimate3D] = None
+    latest_place_verification_observation: Optional[ObjectEstimate3D] = None
+    last_navigation_status: Optional[NavigationStatus] = None
+    last_manipulation_status: Optional[ManipulationStatus] = None
+    phase_event_keys: set[tuple[object, ...]] = field(default_factory=set)
+    phase_entry_failure_reason: str = ""
+    last_event_tick_ns: Optional[int] = None
+    event_attempted_this_tick: bool = False
+
+
+@dataclass(frozen=True)
+class _RuntimeFSMFeedback:
+    """业务模块真实回执的私有适配器，不扩展公共消息契约。"""
+
+    event: FSMEvent
+    source_timestamp_ns: int
+    run_id: str
+    task_id: Optional[int]
+    attempt: Optional[int]
+    reason: str = ""
+    object_id: str = ""
+    goal_id: str = ""
+    trajectory_id: str = ""
+    confirmed_by_real_feedback: bool = False
+
+
+_RUNTIME_ID_UNSET = object()
+_MAX_PHASE_EVENT_KEYS = 32
+# 团队保守联调策略，不是赛事官方阈值：3cm试抬达到三倍1cm静止抖动，2cm水平
+# 漂移大于抖动但仍远小于当前24cm物体宽度；0.5s对应20Hz下10个控制周期。
+# 最低置信度复用部署配置perception.confidence_threshold，避免第二套置信门。
+_TEAM_VISUAL_VERIFIER_POLICY = {
+    "minimum_lift_delta_m": 0.03,
+    "max_horizontal_drift_m": 0.02,
+    "max_observation_gap_s": 0.5,
+    "required_frame_id": "odom",
+    "min_stationary_observations": 3,
+    "max_stationary_spread_m": 0.01,
+}
+_INTERNAL_STOP_PHASES = {
+    GlobalPhase.WAIT_READY,
+    GlobalPhase.LOAD_TASK,
+    GlobalPhase.SAFE_HOLD,
+    GlobalPhase.DONE,
+    GlobalPhase.FAILED,
+}
+
+
+def _select_target_estimate(
+    estimates: tuple[ObjectEstimate3D, ...],
+    task: TaskSpec,
+    now_ns: int,
+    max_age_ns: int,
+    *,
+    phase_entered_ns: Optional[int] = None,
+    preferred_object_id: Optional[str] = None,
+    require_geometry: bool = False,
+) -> Optional[ObjectEstimate3D]:
+    """确定性选择当前任务的odom目标，不产生FSM事件或补造感知事实。"""
+
+    if not isinstance(task, TaskSpec) or not task.valid:
+        return None
+    if type(now_ns) is not int or now_ns < 0:
+        raise ValueError("now_ns必须是真正非负整数")
+    if type(max_age_ns) is not int or max_age_ns < 0:
+        raise ValueError("max_age_ns必须是真正非负整数")
+    if phase_entered_ns is not None and (
+        type(phase_entered_ns) is not int or phase_entered_ns < 0
+    ):
+        raise ValueError("phase_entered_ns必须是真正非负整数或None")
+    preferred = (
+        preferred_object_id.strip()
+        if isinstance(preferred_object_id, str) and preferred_object_id.strip()
+        else ""
+    )
+    candidates: list[ObjectEstimate3D] = []
+    for estimate in estimates:
+        if not isinstance(estimate, ObjectEstimate3D) or not estimate.valid:
+            continue
+        if estimate.frame_id != "odom" or estimate.class_id != task.target_color:
+            continue
+        if not isinstance(estimate.object_id, str) or not estimate.object_id.strip():
+            continue
+        if type(estimate.timestamp_ns) is not int:
+            continue
+        age_ns = now_ns - estimate.timestamp_ns
+        if age_ns < 0 or age_ns > max_age_ns:
+            continue
+        try:
+            confidence = float(estimate.confidence)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if (
+            isinstance(estimate.confidence, bool)
+            or not math.isfinite(confidence)
+            or not 0.0 <= confidence <= 1.0
+        ):
+            continue
+        if phase_entered_ns is not None and estimate.timestamp_ns < phase_entered_ns:
+            continue
+        if require_geometry and (
+            estimate.orientation_xyzw is None or estimate.size_xyz_m is None
+        ):
+            continue
+        if require_geometry:
+            try:
+                orientation = tuple(
+                    float(value) for value in estimate.orientation_xyzw
+                )
+                size = tuple(float(value) for value in estimate.size_xyz_m)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if (
+                len(orientation) != 4
+                or not all(math.isfinite(value) for value in orientation)
+                or math.sqrt(sum(value * value for value in orientation)) <= 1e-12
+                or len(size) != 3
+                or not all(math.isfinite(value) and value > 0.0 for value in size)
+            ):
+                continue
+        candidates.append(estimate)
+    if preferred:
+        candidates = [
+            item for item in candidates if item.object_id.strip() == preferred
+        ]
+    if not candidates:
+        return None
+    return min(
+        candidates,
+        key=lambda item: (-float(item.confidence), item.object_id.strip()),
+    )
+
+
+def _base_planar_transform_snapshot(
+    base: BaseState,
+    *,
+    source_frame: str,
+    target_frame: str,
+) -> RigidTransform3D:
+    """由BaseState构造world/odom与footprint间的平面刚体变换快照。
+
+    当前冻结约定下world与odom数值原点及轴方向对齐；本辅助不发布TF。footprint只
+    使用BaseState的x、y、yaw，明确忽略base_link可能包含的z、roll和pitch。
+    """
+
+    if not isinstance(base, BaseState) or not base.valid:
+        raise ValueError("有效BaseState是构造footprint变换的必要条件")
+    if base.frame_id != "odom":
+        raise ValueError("当前冻结变换辅助只接受frame_id='odom'的BaseState")
+    if source_frame not in {"world", "odom", "footprint"} or target_frame not in {
+        "world",
+        "odom",
+        "footprint",
+    }:
+        raise ValueError("变换frame只允许world、odom和footprint")
+    if (source_frame == "footprint") == (target_frame == "footprint"):
+        raise ValueError("变换方向必须且只能有一端是footprint")
+    x, y = float(base.position_xyz[0]), float(base.position_xyz[1])
+    yaw = float(base.yaw)
+    if not all(math.isfinite(value) for value in (x, y, yaw)):
+        raise ValueError("BaseState平面位姿必须是有限数")
+    half_yaw = yaw / 2.0
+    if source_frame == "footprint":
+        translation = (x, y, 0.0)
+        rotation = (0.0, 0.0, math.sin(half_yaw), math.cos(half_yaw))
+    else:
+        cosine = math.cos(yaw)
+        sine = math.sin(yaw)
+        translation = (-cosine * x - sine * y, sine * x - cosine * y, 0.0)
+        rotation = (0.0, 0.0, -math.sin(half_yaw), math.cos(half_yaw))
+    return RigidTransform3D(
+        source_frame=source_frame,
+        target_frame=target_frame,
+        translation_xyz=translation,
+        rotation_xyzw=rotation,
+        timestamp_ns=base.timestamp_ns,
+        valid=True,
+    )
+
+
+def _internal_fsm_publish_authorization(
+    *,
+    observe_only: bool,
+    enable_official_publish: bool,
+    context: Optional[CompetitionContext],
+    snapshot: SensorSnapshot,
+    fsm_status: FSMStatus,
+    base_command: Optional[BaseCommand],
+    manipulation_command: Optional[ManipulationCommand],
+    final_action: FinalAction,
+    now_ns: int,
+    manipulation_source: str = "manipulation_command",
+) -> bool:
+    """纯判断未来内部FSM FULL发布资格；本轮控制链不会使用它打开发布。"""
+
+    if type(observe_only) is not bool or type(enable_official_publish) is not bool:
+        return False
+    if observe_only or not enable_official_publish:
+        return False
+    if not isinstance(context, CompetitionContext) or not context.valid or context.finished:
+        return False
+    if context.active_task is None or context.current_task_id != context.active_task.task_id:
+        return False
+    if not isinstance(snapshot, SensorSnapshot) or not snapshot.valid:
+        return False
+    if snapshot.timestamp_ns != now_ns:
+        return False
+    if snapshot.task is None or snapshot.task.task_id != context.current_task_id:
+        return False
+    if snapshot.base is None or not snapshot.base.valid:
+        return False
+    if snapshot.joints is None or not snapshot.joints.valid:
+        return False
+    if not isinstance(fsm_status, FSMStatus) or fsm_status.global_phase in _INTERNAL_STOP_PHASES:
+        return False
+    if fsm_status.timestamp_ns != now_ns:
+        return False
+    if fsm_status.task_id != context.current_task_id:
+        return False
+    if not isinstance(final_action, FinalAction) or not final_action.valid:
+        return False
+    if final_action.timestamp_ns != now_ns:
+        return False
+    if final_action.global_phase is not fsm_status.global_phase:
+        return False
+    if type(now_ns) is not int or now_ns < 0:
+        return False
+    if manipulation_source != "manipulation_command":
+        # External Candidate只保留既有head-only授权，不能借内部判断取得FULL权限。
+        return False
+    base_active = (
+        isinstance(base_command, BaseCommand)
+        and base_command.valid
+        and now_ns < base_command.valid_until_ns
+        and (base_command.v != 0.0 or base_command.w != 0.0)
+    )
+    manipulation_active = (
+        isinstance(manipulation_command, ManipulationCommand)
+        and manipulation_command.valid
+        and now_ns < manipulation_command.valid_until_ns
+        and any(manipulation_command.controlled_mask)
+    )
+    return base_active or manipulation_active
 
 
 class TimestampedCache:
@@ -686,10 +970,17 @@ def _load_config() -> dict[str, Any]:
         validate_controller_config(data)
     except ValueError as exc:
         raise RuntimeError(f"配置与MMK2 Controller Manifest V1不一致 {path}: {exc}") from exc
-    try:
-        _arm_planning_config_from_config(data)
-    except ValueError as exc:
-        raise RuntimeError(f"机械臂规划配置无效 {path}: {exc}") from exc
+    arm_planning = data.get("arm_planning")
+    if not isinstance(arm_planning, Mapping):
+        raise RuntimeError(f"机械臂规划配置无效 {path}: arm_planning必须是Mapping")
+    arm_planning_enabled = arm_planning.get("enabled")
+    if type(arm_planning_enabled) is not bool:
+        raise RuntimeError(f"机械臂规划配置无效 {path}: enabled必须是严格bool")
+    if arm_planning_enabled:
+        try:
+            _arm_planning_config_from_config(data)
+        except ValueError as exc:
+            raise RuntimeError(f"机械臂规划配置无效 {path}: {exc}") from exc
     _validated_action_dispatch_topic(data.get("topics"))
     return data
 
@@ -718,6 +1009,51 @@ def _arm_planning_config_from_config(
         raise ValueError(f"arm_planning 缺少显式字段：{missing}")
     values = {name: section[name] for name in config_fields}
     return enabled, ArmPlanningConfig(**values)
+
+
+def _navigation_config_from_config(config: Mapping[str, Any]) -> NavigationConfig:
+    """只接受完整显式navigation字段；仓库默认缺失时调用方保持Optional不可用。"""
+
+    if not isinstance(config, Mapping):
+        raise ValueError("config必须是Mapping")
+    section = config.get("navigation")
+    if not isinstance(section, Mapping):
+        raise ValueError("config.navigation缺失，不能采用NavigationConfig隐藏默认值")
+    config_fields = tuple(item.name for item in fields(NavigationConfig))
+    expected = set(config_fields)
+    actual = set(section)
+    if actual != expected:
+        raise ValueError(
+            "navigation字段不完整："
+            f"缺失={sorted(expected - actual)}，未知={sorted(actual - expected)}"
+        )
+    return NavigationConfig(**{name: section[name] for name in config_fields})
+
+
+def _arm_execution_config_from_config(
+    config: Mapping[str, Any],
+) -> ArmExecutionConfig:
+    """严格构造无隐藏默认值的ArmExecutionConfig；null或缺字段均拒绝。"""
+
+    if not isinstance(config, Mapping):
+        raise ValueError("config必须是Mapping")
+    section = config.get("arm_execution")
+    if not isinstance(section, Mapping):
+        raise ValueError("config.arm_execution必须是Mapping")
+    config_fields = tuple(item.name for item in fields(ArmExecutionConfig))
+    expected = set(config_fields)
+    actual = set(section)
+    if actual != expected:
+        raise ValueError(
+            "arm_execution字段不完整："
+            f"缺失={sorted(expected - actual)}，未知={sorted(actual - expected)}"
+        )
+    missing_values = tuple(name for name in config_fields if section[name] is None)
+    if missing_values:
+        raise ValueError(
+            f"ArmExecutionConfig仍有未标定null字段：{missing_values}"
+        )
+    return ArmExecutionConfig(**{name: section[name] for name in config_fields})
 
 
 def _resolve_config_path() -> Path:
@@ -831,7 +1167,83 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             self._parser = InstructionParser()
             self._fsm = GlobalFSM(max_pick_retries=int(config["fsm"]["max_pick_retries"]))
             self._mux = ActionMux(_action_mux_config(config))
-            self._arm_execution = ArmExecutionController()
+            self._runtime_wiring = _RuntimeWiringState()
+
+            self._visual_observation_verifier: Optional[
+                VisualObservationVerifier
+            ] = None
+            self._visual_observation_verifier_unavailable_reason = ""
+            try:
+                self._visual_observation_verifier = (
+                    _visual_observation_verifier_from_config(config)
+                )
+            except (RuntimeError, TypeError, ValueError) as exc:
+                self._visual_observation_verifier_unavailable_reason = (
+                    f"VisualObservationVerifier配置无效，失败关闭：{exc}"
+                )
+
+            # 业务对象只在节点初始化时构造一次。默认配置没有正式navigation字段，
+            # 因而不能偷偷采用NavigationConfig的模块默认值并宣称导航可用。
+            self._navigation: Optional[NavigationController] = None
+            self._navigation_unavailable_reason = ""
+            try:
+                navigation_config = _navigation_config_from_config(config)
+                self._navigation = NavigationController(navigation_config)
+            except (TypeError, ValueError) as exc:
+                self._navigation_unavailable_reason = str(exc)
+
+            self._kdl_adapter: Optional[OfficialKDLAdapter] = None
+            self._arm_planning_config: Optional[ArmPlanningConfig] = None
+            self._arm_planner: Optional[ArmPlanner] = None
+            self._arm_planning_unavailable_reason = ""
+            try:
+                arm_planning_enabled, arm_planning_config = (
+                    _arm_planning_config_from_config(config)
+                )
+                self._arm_planning_config = arm_planning_config
+            except (TypeError, ValueError) as exc:
+                arm_planning_enabled = False
+                if not self._arm_planning_unavailable_reason:
+                    self._arm_planning_unavailable_reason = (
+                        f"ArmPlanningConfig不可用：{exc}"
+                    )
+            if not arm_planning_enabled:
+                if not self._arm_planning_unavailable_reason:
+                    self._arm_planning_unavailable_reason = "arm_planning disabled"
+            elif self._arm_planning_config is None:
+                if not self._arm_planning_unavailable_reason:
+                    self._arm_planning_unavailable_reason = "机械臂规划依赖不完整"
+            else:
+                try:
+                    # 只有enabled=True且抓放两类正式配置都完整时才允许导入官方KDL。
+                    self._arm_planning_config.validate_for_grasp()
+                    self._arm_planning_config.validate_for_place()
+                    official = config.get("official", {})
+                    if not isinstance(official, Mapping):
+                        raise ValueError("config.official必须是Mapping")
+                    self._kdl_adapter = OfficialKDLAdapter(
+                        official_root=str(official.get("root", "")),
+                        module_name=str(official.get("kdl_module", "mmk2_kdl")),
+                    )
+                    self._kdl_adapter.self_check()
+                    self._arm_planner = ArmPlanner(
+                        self._kdl_adapter, self._arm_planning_config
+                    )
+                except Exception as exc:  # noqa: BLE001 - 可选模块失败必须收窄并关闭
+                    self._arm_planner = None
+                    self._arm_planning_unavailable_reason = (
+                        f"机械臂规划失败关闭：{exc}"
+                    )
+
+            self._arm_execution: Optional[ArmExecutionController] = None
+            self._arm_execution_unavailable_reason = ""
+            try:
+                arm_execution_config = _arm_execution_config_from_config(config)
+                self._arm_execution = ArmExecutionController(arm_execution_config)
+            except (TypeError, ValueError) as exc:
+                self._arm_execution_unavailable_reason = (
+                    f"ArmExecutionConfig不可用，执行失败关闭：{exc}"
+                )
             self._mapper = JointStateMapper(config.get("joint_aliases", {}))
             try:
                 self._external_candidate_config = ExternalCandidateConfig.from_mapping(
@@ -959,6 +1371,7 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             message.data = context.to_json()
             self._context_pub.publish(message)
             self._active_context = context
+            self._synchronize_runtime_context(context)
             if not context.valid or context.finished or context.active_task is None:
                 return
             active_instruction = json.dumps(
@@ -1038,6 +1451,553 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 task.failure_reason,
             )
 
+        def _reset_runtime_wiring(
+            self,
+            *,
+            run_id: object = _RUNTIME_ID_UNSET,
+            task_id: object = _RUNTIME_ID_UNSET,
+            attempt: object = _RUNTIME_ID_UNSET,
+            context_finished: object = _RUNTIME_ID_UNSET,
+            reason: str = "",
+        ) -> None:
+            """清除接线缓存；不会把软件reset描述成真实机器人已经停止。"""
+
+            state = self._runtime_wiring
+            reset_failure = ""
+            if self._arm_execution is not None:
+                try:
+                    # ArmExecution.reset只清除软件执行状态，不等于真实机器人已经停止；
+                    # 真实安全动作仍必须由ActionMux统一仲裁。
+                    self._arm_execution.reset()
+                except Exception as exc:  # noqa: BLE001 - 清理其余状态仍必须继续
+                    reset_failure = f"ArmExecutionController.reset失败：{exc}"
+            if run_id is not _RUNTIME_ID_UNSET:
+                state.run_id = "" if run_id is None else str(run_id)
+            if task_id is not _RUNTIME_ID_UNSET:
+                state.task_id = task_id if type(task_id) is int else None
+            if attempt is not _RUNTIME_ID_UNSET:
+                state.attempt = attempt if type(attempt) is int else None
+            if context_finished is not _RUNTIME_ID_UNSET:
+                state.context_finished = bool(context_finished)
+            state.last_handled_phase = None
+            state.phase_generation += 1
+            state.active_target = None
+            state.preferred_object_id = ""
+            state.active_nav_goal = None
+            state.planned_grasp_context = None
+            state.confirmed_grasp_context = None
+            state.active_pick_trajectory = None
+            state.active_place_trajectory = None
+            state.active_trajectory_id = ""
+            state.pick_observation_before_lift = None
+            state.latest_grasp_verification = None
+            state.place_observation_before_release = None
+            state.latest_place_verification_observation = None
+            state.last_navigation_status = None
+            state.last_manipulation_status = None
+            state.phase_event_keys.clear()
+            state.phase_entry_failure_reason = reset_failure
+            state.last_event_tick_ns = None
+            state.event_attempted_this_tick = False
+            if reset_failure and self._context_ok():
+                self.get_logger().error(
+                    f"runtime_wiring_reset_failed:{reason}:{reset_failure}"
+                )
+
+        def _prepare_phase_transition(
+            self,
+            previous_phase: Optional[GlobalPhase],
+            current_phase: GlobalPhase,
+        ) -> None:
+            """只清理新阶段已明确失效的业务缓存。"""
+
+            state = self._runtime_wiring
+            state.phase_generation += 1
+            state.phase_entry_failure_reason = ""
+            # 去重键只在产生它的阶段内有效；新阶段必须重新武装，但SAFE_HOLD仍保留
+            # 业务载荷以便恢复被暂停阶段。
+            state.phase_event_keys.clear()
+            if current_phase is GlobalPhase.SAFE_HOLD or (
+                previous_phase is GlobalPhase.SAFE_HOLD
+                and current_phase not in {GlobalPhase.DONE, GlobalPhase.FAILED}
+            ):
+                # 安全暂停及恢复不能破坏被暂停阶段的业务生命周期。
+                return
+            if current_phase is GlobalPhase.SEARCH_TARGET:
+                state.active_target = None
+                state.preferred_object_id = ""
+                state.active_nav_goal = None
+                state.planned_grasp_context = None
+                state.confirmed_grasp_context = None
+                state.active_pick_trajectory = None
+                state.active_place_trajectory = None
+                state.active_trajectory_id = ""
+                state.pick_observation_before_lift = None
+                state.latest_grasp_verification = None
+                state.place_observation_before_release = None
+                state.latest_place_verification_observation = None
+                state.last_navigation_status = None
+                state.last_manipulation_status = None
+            elif current_phase is GlobalPhase.NAV_TO_PICK:
+                state.active_nav_goal = None
+                state.last_navigation_status = None
+            elif current_phase is GlobalPhase.REFINE_TARGET:
+                state.preferred_object_id = (
+                    state.active_target.object_id.strip()
+                    if isinstance(state.active_target, ObjectEstimate3D)
+                    and isinstance(state.active_target.object_id, str)
+                    else ""
+                )
+                # SEARCH_TARGET 的完整观测只能提供跨阶段身份，不能作为近距离精定位。
+                state.active_target = None
+                state.active_nav_goal = None
+                state.active_pick_trajectory = None
+                state.active_trajectory_id = ""
+                state.planned_grasp_context = None
+                state.pick_observation_before_lift = None
+                state.latest_grasp_verification = None
+                state.last_navigation_status = None
+            elif current_phase is GlobalPhase.PLAN_PICK:
+                state.active_pick_trajectory = None
+                state.active_trajectory_id = ""
+                state.planned_grasp_context = None
+                state.pick_observation_before_lift = None
+                state.latest_grasp_verification = None
+            elif current_phase is GlobalPhase.EXECUTE_PICK:
+                state.last_manipulation_status = None
+            elif current_phase is GlobalPhase.VERIFY_PICK:
+                state.latest_grasp_verification = None
+            elif current_phase is GlobalPhase.NAV_TO_PLACE:
+                state.active_target = None
+                state.preferred_object_id = ""
+                state.active_nav_goal = None
+                state.planned_grasp_context = None
+                state.active_pick_trajectory = None
+                state.active_place_trajectory = None
+                state.active_trajectory_id = ""
+                state.pick_observation_before_lift = None
+                state.latest_grasp_verification = None
+                state.place_observation_before_release = None
+                state.latest_place_verification_observation = None
+                state.last_navigation_status = None
+                state.last_manipulation_status = None
+            elif current_phase is GlobalPhase.PLAN_PLACE:
+                state.active_place_trajectory = None
+                state.active_trajectory_id = ""
+                state.place_observation_before_release = None
+                state.latest_place_verification_observation = None
+            elif current_phase is GlobalPhase.EXECUTE_PLACE:
+                state.last_manipulation_status = None
+            elif current_phase is GlobalPhase.VERIFY_PLACE:
+                state.latest_place_verification_observation = None
+            elif current_phase is GlobalPhase.RETURN_END:
+                state.active_target = None
+                state.preferred_object_id = ""
+                state.active_nav_goal = None
+                state.planned_grasp_context = None
+                state.confirmed_grasp_context = None
+                state.active_pick_trajectory = None
+                state.active_place_trajectory = None
+                state.active_trajectory_id = ""
+                state.pick_observation_before_lift = None
+                state.latest_grasp_verification = None
+                state.place_observation_before_release = None
+                state.latest_place_verification_observation = None
+                state.last_navigation_status = None
+                state.last_manipulation_status = None
+            elif current_phase in {GlobalPhase.DONE, GlobalPhase.FAILED}:
+                state.active_target = None
+                state.preferred_object_id = ""
+                state.active_nav_goal = None
+                state.active_pick_trajectory = None
+                state.active_place_trajectory = None
+                state.active_trajectory_id = ""
+                state.pick_observation_before_lift = None
+                state.latest_grasp_verification = None
+                state.place_observation_before_release = None
+                state.latest_place_verification_observation = None
+                state.last_navigation_status = None
+                state.last_manipulation_status = None
+
+        def _synchronize_runtime_context(
+            self, context: Optional[CompetitionContext]
+        ) -> None:
+            """在run/task/attempt/finished身份变化时一次性丢弃旧业务缓存。"""
+
+            if context is None:
+                return
+            state = self._runtime_wiring
+            desired_run = context.run_id
+            if desired_run != state.run_id:
+                self._reset_runtime_wiring(
+                    run_id=desired_run,
+                    task_id=(
+                        context.current_task_id
+                        if context.valid and not context.finished
+                        else None
+                    ),
+                    attempt=(
+                        context.current_attempt_count
+                        if context.valid and not context.finished
+                        else None
+                    ),
+                    context_finished=context.finished,
+                    reason="new_run",
+                )
+                return
+            if context.finished:
+                if not state.context_finished:
+                    self._reset_runtime_wiring(
+                        task_id=None,
+                        attempt=None,
+                        context_finished=True,
+                        reason="context_finished",
+                    )
+                return
+            if not context.valid or context.active_task is None:
+                return
+            if (
+                state.context_finished
+                or state.task_id != context.current_task_id
+                or state.attempt != context.current_attempt_count
+            ):
+                reason = (
+                    "new_task"
+                    if state.task_id != context.current_task_id
+                    else "new_attempt"
+                )
+                self._reset_runtime_wiring(
+                    task_id=context.current_task_id,
+                    attempt=context.current_attempt_count,
+                    context_finished=False,
+                    reason=reason,
+                )
+
+        def _handle_phase_entry(
+            self,
+            snapshot: SensorSnapshot,
+            fsm_status: FSMStatus,
+            context: Optional[CompetitionContext],
+            now_ns: int,
+        ) -> bool:
+            """只在GlobalPhase真实变化时清理并准备阶段入口。"""
+
+            state = self._runtime_wiring
+            phase = fsm_status.global_phase
+            if state.last_handled_phase is phase:
+                return False
+            previous_phase = state.last_handled_phase
+            self._prepare_phase_transition(previous_phase, phase)
+            state.last_handled_phase = phase
+            if type(now_ns) is not int or now_ns < 0:
+                state.phase_entry_failure_reason = "阶段入口时间无效"
+                return True
+            if not isinstance(snapshot, SensorSnapshot):
+                state.phase_entry_failure_reason = "阶段入口缺少SensorSnapshot"
+                return True
+            if context is not None and (
+                not isinstance(context, CompetitionContext)
+                or not context.valid
+                or context.finished
+            ):
+                state.phase_entry_failure_reason = "CompetitionContext不允许普通业务入口"
+                return True
+            if phase in {GlobalPhase.NAV_TO_PICK, GlobalPhase.NAV_TO_PLACE}:
+                if self._navigation is None:
+                    state.phase_entry_failure_reason = (
+                        self._navigation_unavailable_reason or "NavigationController不可用"
+                    )
+                else:
+                    state.phase_entry_failure_reason = "导航真实结果接口尚未接线"
+            elif phase is GlobalPhase.RETURN_END:
+                if self._navigation is None:
+                    state.phase_entry_failure_reason = (
+                        self._navigation_unavailable_reason or "NavigationController不可用"
+                    )
+                elif not callable(getattr(self._navigation, "build_return_goal", None)):
+                    state.phase_entry_failure_reason = (
+                        "NavigationController.build_return_goal不存在，返区失败关闭"
+                    )
+                else:
+                    state.phase_entry_failure_reason = "返区真实结果接口尚未接线"
+            elif phase in {GlobalPhase.PLAN_PICK, GlobalPhase.PLAN_PLACE}:
+                if self._arm_planner is None:
+                    state.phase_entry_failure_reason = (
+                        self._arm_planning_unavailable_reason or "ArmPlanner不可用"
+                    )
+                else:
+                    state.phase_entry_failure_reason = "规划真实结果接口尚未接线"
+            elif phase in {GlobalPhase.EXECUTE_PICK, GlobalPhase.EXECUTE_PLACE}:
+                if self._arm_execution is None:
+                    state.phase_entry_failure_reason = (
+                        self._arm_execution_unavailable_reason
+                        or "ArmExecutionController不可用"
+                    )
+                elif (
+                    phase is GlobalPhase.EXECUTE_PICK
+                    and state.active_pick_trajectory is None
+                ) or (
+                    phase is GlobalPhase.EXECUTE_PLACE
+                    and state.active_place_trajectory is None
+                ):
+                    state.phase_entry_failure_reason = "缺少当前阶段的有效轨迹，执行失败关闭"
+                else:
+                    state.phase_entry_failure_reason = "执行真实结果接口尚未接线"
+            elif phase is GlobalPhase.SEARCH_TARGET:
+                state.phase_entry_failure_reason = "等待真实、新鲜且具有稳定身份的odom目标"
+            elif phase is GlobalPhase.REFINE_TARGET:
+                state.phase_entry_failure_reason = (
+                    "等待阶段入口后的同任务odom观测及真实orientation_xyzw/size_xyz_m"
+                )
+            elif phase in {GlobalPhase.VERIFY_PICK, GlobalPhase.VERIFY_PLACE}:
+                state.phase_entry_failure_reason = "抓放验证真实反馈接口尚未接线"
+            return True
+
+        def _run_current_phase(
+            self,
+            snapshot: SensorSnapshot,
+            fsm_status: FSMStatus,
+            context: Optional[CompetitionContext],
+            now_ns: int,
+        ) -> tuple[
+            Optional[BaseCommand],
+            Optional[ManipulationCommand],
+            Optional[_RuntimeFSMFeedback],
+        ]:
+            """运行一个周期的当前阶段逻辑；尚未接线的业务始终失败关闭。"""
+
+            if fsm_status.global_phase in {
+                GlobalPhase.SAFE_HOLD,
+                GlobalPhase.DONE,
+                GlobalPhase.FAILED,
+            }:
+                return None, None, None
+            if context is not None and (
+                not context.valid or context.finished or context.active_task is None
+            ):
+                return None, None, None
+            base_command, manipulation_command = self._compute_candidate_commands(
+                snapshot, fsm_status, now_ns
+            )
+            state = self._runtime_wiring
+            phase = fsm_status.global_phase
+            if phase not in {GlobalPhase.SEARCH_TARGET, GlobalPhase.REFINE_TARGET}:
+                return base_command, manipulation_command, None
+            if snapshot.task is None or snapshot.task.task_id != fsm_status.task_id:
+                state.phase_entry_failure_reason = "视觉目标选择缺少当前FSM任务身份"
+                return base_command, manipulation_command, None
+            if self._config.get("frames", {}).get("planning") != "odom":
+                state.phase_entry_failure_reason = (
+                    "frames.planning不是严格odom，视觉业务事件失败关闭"
+                )
+                return base_command, manipulation_command, None
+            if phase in {GlobalPhase.SEARCH_TARGET, GlobalPhase.REFINE_TARGET} and (
+                type(self._fsm.phase_entered_ns) is not int
+                or self._fsm.phase_entered_ns < 0
+            ):
+                state.phase_entry_failure_reason = (
+                    f"{phase.value}缺少有效阶段入口时间，视觉事件失败关闭"
+                )
+                return base_command, manipulation_command, None
+
+            selected = _select_target_estimate(
+                snapshot.object_estimates,
+                snapshot.task,
+                now_ns,
+                self._state_max_delta_ns,
+                phase_entered_ns=self._fsm.phase_entered_ns,
+                preferred_object_id=(
+                    state.preferred_object_id
+                    if phase is GlobalPhase.REFINE_TARGET
+                    else None
+                ),
+                require_geometry=phase is GlobalPhase.REFINE_TARGET,
+            )
+            if selected is None:
+                state.phase_entry_failure_reason = (
+                    (
+                        "未收到preferred_object_id="
+                        f"{state.preferred_object_id!r}的阶段入口后完整目标；"
+                        "禁止静默重绑定其他同类目标"
+                    )
+                    if phase is GlobalPhase.REFINE_TARGET
+                    and state.preferred_object_id
+                    else "未收到匹配任务且新鲜、稳定的odom目标"
+                )
+                return base_command, manipulation_command, None
+
+            state.active_target = selected
+            state.phase_entry_failure_reason = ""
+            return base_command, manipulation_command, _RuntimeFSMFeedback(
+                event=(
+                    FSMEvent.TARGET_FOUND
+                    if phase is GlobalPhase.SEARCH_TARGET
+                    else FSMEvent.TARGET_REFINED
+                ),
+                source_timestamp_ns=selected.timestamp_ns,
+                run_id=state.run_id,
+                task_id=state.task_id,
+                attempt=state.attempt,
+                object_id=selected.object_id or "",
+                reason="真实视觉目标观测通过严格任务、frame、时间和身份校验",
+                confirmed_by_real_feedback=True,
+            )
+
+        def _submit_fsm_event_once(
+            self,
+            event: FSMEvent,
+            fsm_status: FSMStatus,
+            now_ns: int,
+            *,
+            source_timestamp_ns: int,
+            run_id: str,
+            task_id: Optional[int],
+            attempt: Optional[int],
+            reason: str = "",
+            object_id: str = "",
+            goal_id: str = "",
+            trajectory_id: str = "",
+            confirmed_by_real_feedback: bool = False,
+        ) -> bool:
+            """校验真实反馈身份，并保证每周期最多向FSM尝试一个业务事件。"""
+
+            if not isinstance(event, FSMEvent):
+                raise TypeError("event必须是FSMEvent")
+            if not isinstance(fsm_status, FSMStatus):
+                raise TypeError("fsm_status必须是FSMStatus")
+            if not isinstance(reason, str):
+                raise TypeError("reason必须是字符串")
+            if type(now_ns) is not int or now_ns < 0:
+                raise ValueError("now_ns必须是真正非负整数")
+            if type(source_timestamp_ns) is not int or source_timestamp_ns < 0:
+                raise ValueError("source_timestamp_ns必须是真正非负整数")
+            state = self._runtime_wiring
+            if state.last_event_tick_ns != now_ns:
+                state.last_event_tick_ns = now_ns
+                state.event_attempted_this_tick = False
+            if state.event_attempted_this_tick:
+                return False
+            state.event_attempted_this_tick = True
+
+            def reject(detail: str) -> bool:
+                state.phase_entry_failure_reason = detail
+                return False
+
+            if source_timestamp_ns > now_ns:
+                return reject("事件来源时间晚于当前控制周期")
+            entered_ns = self._fsm.phase_entered_ns
+            if event is not FSMEvent.RESET and (
+                entered_ns is None or source_timestamp_ns < entered_ns
+            ):
+                return reject("事件来源时间早于当前阶段入口")
+            current_status = self._fsm.status(now_ns)
+            if (
+                fsm_status.global_phase is not current_status.global_phase
+                or fsm_status.task_id != current_status.task_id
+            ):
+                return reject("FSMStatus已过期，阶段或任务身份不一致")
+            if (
+                not isinstance(run_id, str)
+                or run_id != state.run_id
+                or (event is not FSMEvent.RESET and not run_id)
+                or (
+                    task_id is not None and type(task_id) is not int
+                )
+                or task_id != state.task_id
+                or (
+                    attempt is not None and type(attempt) is not int
+                )
+                or attempt != state.attempt
+            ):
+                return reject("事件run/task/attempt身份不一致")
+            if confirmed_by_real_feedback is not True:
+                return reject("事件未由真实反馈明确确认")
+
+            supplied_object_id = object_id.strip() if isinstance(object_id, str) else ""
+            supplied_goal_id = goal_id.strip() if isinstance(goal_id, str) else ""
+            supplied_trajectory_id = (
+                trajectory_id.strip() if isinstance(trajectory_id, str) else ""
+            )
+            expected_object_id = ""
+            if isinstance(state.active_target, ObjectEstimate3D):
+                expected_object_id = (state.active_target.object_id or "").strip()
+            elif isinstance(state.confirmed_grasp_context, GraspContext):
+                expected_object_id = state.confirmed_grasp_context.object_id.strip()
+            expected_goal_id = (
+                state.active_nav_goal.goal_id.strip()
+                if isinstance(state.active_nav_goal, NavGoal)
+                else ""
+            )
+            expected_trajectory_id = state.active_trajectory_id.strip()
+
+            object_events = {
+                FSMEvent.TARGET_FOUND,
+                FSMEvent.TARGET_REFINED,
+                FSMEvent.PICK_PLAN_READY,
+                FSMEvent.PICK_EXECUTED,
+                FSMEvent.PICK_VERIFIED,
+                FSMEvent.PICK_FAILED,
+                FSMEvent.PLACE_NAV_REACHED,
+                FSMEvent.PLACE_PLAN_READY,
+                FSMEvent.PLACE_EXECUTED,
+                FSMEvent.PLACE_VERIFIED,
+            }
+            goal_events = {
+                FSMEvent.PICK_NAV_REACHED,
+                FSMEvent.PLACE_NAV_REACHED,
+                FSMEvent.RETURN_REACHED,
+            }
+            trajectory_events = {
+                FSMEvent.PICK_PLAN_READY,
+                FSMEvent.PICK_EXECUTED,
+                FSMEvent.PLACE_PLAN_READY,
+                FSMEvent.PLACE_EXECUTED,
+            }
+            if event in object_events and (
+                not expected_object_id or supplied_object_id != expected_object_id
+            ):
+                return reject("事件object_id缺失或与当前目标不一致")
+            if event in goal_events and (
+                not expected_goal_id or supplied_goal_id != expected_goal_id
+            ):
+                return reject("事件goal_id缺失或与当前NavGoal不一致")
+            if event in trajectory_events and (
+                not expected_trajectory_id
+                or supplied_trajectory_id != expected_trajectory_id
+            ):
+                return reject("事件trajectory_id缺失或与当前活动轨迹不一致")
+
+            key = (
+                state.run_id,
+                state.task_id,
+                state.attempt,
+                fsm_status.global_phase.value,
+                state.phase_generation,
+                source_timestamp_ns,
+                supplied_object_id,
+                supplied_goal_id,
+                supplied_trajectory_id,
+                event.value,
+            )
+            if key in state.phase_event_keys:
+                return reject("同一真实反馈结果已提交")
+            if len(state.phase_event_keys) >= _MAX_PHASE_EVENT_KEYS:
+                return reject("阶段事件去重表达到有界容量，拒绝新事件")
+            state.phase_event_keys.add(key)
+            accepted = self._fsm.handle_event(event, source_timestamp_ns, reason)
+            if not accepted:
+                return reject(f"FSM拒绝事件{event.value}，未发生状态转换")
+            if event is FSMEvent.RESET:
+                self._reset_runtime_wiring(
+                    run_id="",
+                    task_id=None,
+                    attempt=None,
+                    context_finished=False,
+                    reason="fsm_reset",
+                )
+            return True
+
+
         def _check_readiness(
             self,
             now_ns: int,
@@ -1050,9 +2010,8 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 return
             if base is None or joints is None or not base.valid or not joints.valid:
                 return
-            # Odom 和 JointState 是保持与安全判断的基础；没有新鲜反馈时“节点已构造”
-            # 不能等同于“系统已准备”。TODO(official-readiness)：感知节点心跳和官方
-            # Server心跳是否纳入门槛，待官方确认。
+            # Odom 和 JointState 是当前已冻结的就绪判据；没有新鲜反馈时
+            # “节点已构造”不能等同于“系统已准备”。
             if not self._fsm.handle_event(FSMEvent.SYSTEM_READY, now_ns):
                 _log_input_issue_on_change(
                     self,
@@ -1153,6 +2112,11 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             base_command = BaseCommand(
                 0.0, 0.0, now_ns, now_ns + self._command_ttl_ns
             )
+            if self._arm_execution is None:
+                raise RuntimeError(
+                    self._arm_execution_unavailable_reason
+                    or "ArmExecutionController不可用，不能生成主动保持"
+                )
             hold = self._arm_execution.create_hold_command(
                 joints, now_ns, self._command_ttl_ns
             )
@@ -1171,8 +2135,13 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             ``FinalAction``；是否允许发布由独立全局官方发布门决定。
             """
 
-            # TODO：未来在这里调用 navigation 和 arm_execution 组装候选；业务模块
-            # 只能返回候选，不能直接发布 ROS 话题，也不能在本函数实现算法。
+            # 接线前只保留可审计的零底盘候选；不实现业务算法或主动关节保持。
+            if fsm_status.global_phase in {
+                GlobalPhase.SAFE_HOLD,
+                GlobalPhase.DONE,
+                GlobalPhase.FAILED,
+            }:
+                return None, None
             if snapshot.joints is None or not snapshot.joints.valid:
                 return None, None
             return BaseCommand(
@@ -1332,11 +2301,7 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             base = self._fresh_control_state(self._base_cache, now_ns)
             joints = self._fresh_control_state(self._joint_cache, now_ns)
             self._check_readiness(now_ns, base, joints)
-            status = self._fsm.status(now_ns)
-            fsm_message = self._ros.String()
-            fsm_message.data = fsm_status_to_json(status)
-            self._fsm_pub.publish(fsm_message)
-
+            context = self._active_context
             state_reasons: list[str] = []
             if base is None:
                 state_reasons.append("缺少新鲜 Odom")
@@ -1355,9 +2320,51 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 valid=not state_reasons,
                 failure_reason="；".join(state_reasons),
             )
-            base_command, manipulation_command = self._compute_candidate_commands(
-                snapshot, status, now_ns
+            status_before = self._fsm.status(now_ns)
+            self._synchronize_runtime_context(context)
+            self._handle_phase_entry(
+                snapshot, status_before, context, now_ns
             )
+            base_command, manipulation_command, business_event = (
+                self._run_current_phase(snapshot, status_before, context, now_ns)
+            )
+            event_transitioned = False
+            if business_event is not None:
+                event_transitioned = self._submit_fsm_event_once(
+                    business_event.event,
+                    status_before,
+                    now_ns,
+                    source_timestamp_ns=business_event.source_timestamp_ns,
+                    run_id=business_event.run_id,
+                    task_id=business_event.task_id,
+                    attempt=business_event.attempt,
+                    reason=business_event.reason,
+                    object_id=business_event.object_id,
+                    goal_id=business_event.goal_id,
+                    trajectory_id=business_event.trajectory_id,
+                    confirmed_by_real_feedback=(
+                        business_event.confirmed_by_real_feedback
+                    ),
+                )
+            timeout_transitioned = False
+            if not event_transitioned:
+                timeout_transitioned = self._fsm.check_timeout(now_ns)
+            status = self._fsm.status(now_ns)
+            if (
+                event_transitioned
+                or timeout_transitioned
+                or status.global_phase is not status_before.global_phase
+                or status.global_phase
+                in {GlobalPhase.SAFE_HOLD, GlobalPhase.DONE, GlobalPhase.FAILED}
+                or (context is not None and context.finished)
+            ):
+                # 旧阶段候选不能跨越本周期状态转换；新阶段入口留到下个周期执行一次。
+                base_command = None
+                manipulation_command = None
+
+            fsm_message = self._ros.String()
+            fsm_message.data = fsm_status_to_json(status)
+            self._fsm_pub.publish(fsm_message)
 
             if joints is None or not joints.valid:
                 # 没有可靠实际关节时绝不能伪造17维全零；此时只能尽力让底盘停车。
@@ -1366,13 +2373,18 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 )
                 return
 
-            external_decision = self._external_candidate.take(
-                now_ns=now_ns,
-                actual_joints=joints,
-                fsm_status=status,
-                actual_dt_s=actual_dt_s,
-                existing_command=manipulation_command,
-            )
+            if context is not None and context.finished:
+                external_decision = ExternalCandidateDecision(
+                    "no_pending_candidate", now_ns, False, "no_pending_candidate"
+                )
+            else:
+                external_decision = self._external_candidate.take(
+                    now_ns=now_ns,
+                    actual_joints=joints,
+                    fsm_status=status,
+                    actual_dt_s=actual_dt_s,
+                    existing_command=manipulation_command,
+                )
             if external_decision.accepted:
                 manipulation_command = external_decision.command
             elif external_decision.failure_reason != "no_pending_candidate":
@@ -1477,6 +2489,16 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                     self._control_timer.cancel()
             except Exception as exc:  # noqa: BLE001 - 仍必须继续清空pending并销毁
                 errors.append(f"取消control timer失败：{exc}")
+            try:
+                self._reset_runtime_wiring(
+                    run_id="",
+                    task_id=None,
+                    attempt=None,
+                    context_finished=True,
+                    reason="destroy_node",
+                )
+            except Exception as exc:  # noqa: BLE001 - 外部consumer和父节点仍必须清理
+                errors.append(f"清理TeamClient运行时接线失败：{exc}")
             try:
                 # context失效后不再调用ROS clock；consumer只需一个诊断时间戳。
                 now_ns = self.get_clock().now().nanoseconds if context_valid else 0
@@ -2071,6 +3093,43 @@ def _official_publish_enabled(control: dict[str, bool]) -> bool:
         and control["enable_official_publish"]
         and control["simulation_only"]
     )
+
+
+def _visual_observation_verifier_from_config(
+    config: dict[str, Any],
+) -> VisualObservationVerifier:
+    """一次性构造验证器；显式私有配置可严格覆盖团队保守联调策略。"""
+
+    perception = _config_mapping(config.get("perception"), "perception")
+    raw = perception.get("visual_observation_verifier")
+    if raw is None:
+        confidence = perception.get("confidence_threshold")
+        if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
+            raise RuntimeError(
+                "perception.confidence_threshold必须是有限数且不能是bool"
+            )
+        confidence_value = float(confidence)
+        if not math.isfinite(confidence_value):
+            raise RuntimeError("perception.confidence_threshold必须是有限数")
+        values = {
+            **_TEAM_VISUAL_VERIFIER_POLICY,
+            "minimum_observation_confidence": confidence_value,
+        }
+    else:
+        values = _config_mapping(raw, "perception.visual_observation_verifier")
+        required = {
+            "minimum_lift_delta_m",
+            "max_horizontal_drift_m",
+            "max_observation_gap_s",
+            "minimum_observation_confidence",
+            "required_frame_id",
+            "min_stationary_observations",
+            "max_stationary_spread_m",
+        }
+        _require_exact_config_keys(
+            values, required, "perception.visual_observation_verifier"
+        )
+    return VisualObservationVerifier(**values)
 
 
 def _rclpy_context_ok(ros: SimpleNamespace, node: Optional[Any]) -> bool:

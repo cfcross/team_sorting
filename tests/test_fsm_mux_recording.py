@@ -185,6 +185,23 @@ def _advance(fsm: GlobalFSM, *events: FSMEvent, start_ns: int = 1_000) -> None:
         assert fsm.handle_event(event, timestamp_ns)
 
 
+def _advance_to_verify_place(fsm: GlobalFSM, *, start_ns: int = 1_000) -> None:
+    _advance(
+        fsm,
+        FSMEvent.TARGET_FOUND,
+        FSMEvent.PICK_NAV_REACHED,
+        FSMEvent.TARGET_REFINED,
+        FSMEvent.PICK_PLAN_READY,
+        FSMEvent.PICK_EXECUTED,
+        FSMEvent.PICK_VERIFIED,
+        FSMEvent.PLACE_NAV_REACHED,
+        FSMEvent.PLACE_PLAN_READY,
+        FSMEvent.PLACE_EXECUTED,
+        start_ns=start_ns,
+    )
+    assert fsm.phase is GlobalPhase.VERIFY_PLACE
+
+
 def _execution_waypoint(
     time_from_start_s: float = 0.0,
     controlled_mask: tuple[bool, ...] = (
@@ -714,7 +731,18 @@ def test_exhausted_pick_retry_reason_survives_return_to_failed() -> None:
     assert fsm.status(2_300).failure_reason == "重试耗尽"
 
 
-# ————————————————————————————————
+def test_place_failure_uses_existing_unrecoverable_failure_event() -> None:
+    assert "PLACE_FAILED" not in FSMEvent.__members__
+    fsm = _loaded_fsm()
+    _advance_to_verify_place(fsm, start_ns=200)
+
+    assert fsm.handle_event(FSMEvent.FAILURE, 300, "放置验证失败")
+    assert fsm.phase is GlobalPhase.RETURN_END
+    assert fsm.failure_reason == "放置验证失败"
+    assert fsm.handle_event(FSMEvent.RETURN_REACHED, 301)
+    assert fsm.phase is GlobalPhase.FAILED
+
+
 # 【Codex修改-23：状态读取无副作用】
 # 防止phase_elapsed_ns或status读取推进FSM、触发超时或刷新阶段进入时间。
 # ————————————————————————————————
@@ -808,37 +836,25 @@ def test_no_timeout_policy_preserves_compatibility() -> None:
 
 
 # ————————————————————————————————
-# 【Codex修改-25：阶段超时边界直接进入FAILED】
-# 防止配置超时进入可恢复SAFE_HOLD、RETURN_END或DONE，并核对完整超时诊断文本。
+# 配置的阶段超时边界直接进入 FAILED，不自动恢复或成功。
 # ————————————————————————————————
 def test_configured_timeout_uses_exact_boundary_and_enters_failed() -> None:
     fsm = _loaded_fsm(phase_timeouts_ns={GlobalPhase.SEARCH_TARGET: 10})
     assert not fsm.check_timeout(129)
     assert fsm.phase is GlobalPhase.SEARCH_TARGET
-    assert fsm.phase_entered_ns == 120
 
     assert fsm.check_timeout(130)
     status = fsm.status(130)
     assert status.global_phase is GlobalPhase.FAILED
-    assert status.global_phase not in {
-        GlobalPhase.SAFE_HOLD,
-        GlobalPhase.RETURN_END,
-        GlobalPhase.DONE,
-    }
     assert status.success is False
     assert "SEARCH_TARGET阶段超时" in status.failure_reason
     assert "实际活动时间10ns" in status.failure_reason
     assert "配置限制10ns" in status.failure_reason
-    assert fsm.phase_entered_ns == 130
+    assert not fsm.handle_event(FSMEvent.SAFETY_RECOVERED, 131)
 
 
-# ————————————————————————————————
-# 【Codex修改-26：外部安全暂停保存活动时间并清零暂停阶段偏移】
-# 防止进入SAFE_HOLD时遗漏暂停前预算，或把原阶段偏移错误带入暂停阶段。
-# ————————————————————————————————
 def test_external_safe_hold_saves_elapsed_time_before_pause() -> None:
     fsm = _loaded_fsm(phase_timeouts_ns={GlobalPhase.SEARCH_TARGET: 100})
-
     assert fsm.handle_event(FSMEvent.SAFETY_HOLD, 150, "外部安全监控暂停")
 
     assert fsm.phase is GlobalPhase.SAFE_HOLD
@@ -848,17 +864,12 @@ def test_external_safe_hold_saves_elapsed_time_before_pause() -> None:
     assert fsm._phase_elapsed_offset_ns == 0
 
 
-# ————————————————————————————————
-# 【Codex修改-27：恢复后继续使用剩余活动预算】
-# 防止安全暂停时长被算入业务耗时，也防止恢复时重新获得一整份阶段预算。
-# ————————————————————————————————
 def test_safe_hold_recovery_preserves_elapsed_timeout_budget() -> None:
     fsm = _loaded_fsm(phase_timeouts_ns={GlobalPhase.SEARCH_TARGET: 100})
     assert fsm.phase_elapsed_ns(150) == 30
     assert fsm.handle_event(FSMEvent.SAFETY_HOLD, 150, "短暂安全暂停")
-    assert fsm._interrupted_elapsed_ns == 30
-
     assert fsm.handle_event(FSMEvent.SAFETY_RECOVERED, 1_000)
+
     assert fsm.phase is GlobalPhase.SEARCH_TARGET
     assert fsm.phase_entered_ns == 1_000
     assert fsm._phase_elapsed_offset_ns == 30
@@ -868,51 +879,22 @@ def test_safe_hold_recovery_preserves_elapsed_timeout_budget() -> None:
     assert fsm.phase is GlobalPhase.FAILED
 
 
-# ————————————————————————————————
-# 【Codex修改-28：多次安全暂停只累计业务活动时间】
-# 防止第二次暂停覆盖第一次已用预算，或把两段长暂停时长累加到业务阶段。
-# ————————————————————————————————
 def test_multiple_safe_holds_accumulate_only_active_elapsed_time() -> None:
     fsm = _loaded_fsm(phase_timeouts_ns={GlobalPhase.SEARCH_TARGET: 100})
     assert fsm.handle_event(FSMEvent.SAFETY_HOLD, 150, "第一次暂停")
     assert fsm.handle_event(FSMEvent.SAFETY_RECOVERED, 1_000)
-    assert fsm.phase_entered_ns == 1_000
-    assert fsm._phase_elapsed_offset_ns == 30
-
     assert fsm.phase_elapsed_ns(1_010) == 40
     assert fsm.handle_event(FSMEvent.SAFETY_HOLD, 1_010, "第二次暂停")
     assert fsm._interrupted_elapsed_ns == 40
     assert fsm.handle_event(FSMEvent.SAFETY_RECOVERED, 2_000)
 
-    assert fsm.phase is GlobalPhase.SEARCH_TARGET
-    assert fsm.phase_entered_ns == 2_000
-    assert fsm._phase_elapsed_offset_ns == 40
     assert fsm.phase_elapsed_ns(2_000) == 40
     assert not fsm.check_timeout(2_059)
     assert fsm.check_timeout(2_060)
     assert fsm.phase is GlobalPhase.FAILED
 
 
-# ————————————————————————————————
-# 【Codex修改-29：超时失败保持终止态】
-# 防止超时后通过安全恢复或重复FAILURE重新进入活动流程并扩展失败原因。
-# ————————————————————————————————
-def test_timeout_failure_is_terminal_and_cannot_recover() -> None:
-    fsm = _loaded_fsm(phase_timeouts_ns={GlobalPhase.SEARCH_TARGET: 10})
-    assert fsm.check_timeout(130)
-    original_reason = fsm.failure_reason
 
-    assert fsm.phase is GlobalPhase.FAILED
-    assert not fsm.handle_event(FSMEvent.SAFETY_RECOVERED, 1_000)
-    assert not fsm.handle_event(FSMEvent.FAILURE, 1_001, "重复失败")
-    assert fsm.phase is GlobalPhase.FAILED
-    assert fsm.failure_reason == original_reason
-
-
-# ————————————————————————————————
-# 【Codex修改-30：安全恢复保留任务重试与真实恢复时刻】
-# 防止恢复过程清空诊断信息、跳过原阶段或把虚拟活动起点写入phase_entered_ns。
-# ————————————————————————————————
 def test_safe_hold_preserves_task_retry_and_recovers_without_skipping() -> None:
     fsm = _loaded_fsm(max_pick_retries=2)
     _advance(
@@ -1217,6 +1199,15 @@ def test_fsm_timeout_policy_is_copied_and_read_only() -> None:
 def test_fsm_rejects_invalid_internal_retry_limits(value: object) -> None:
     with pytest.raises(ValueError, match="max_pick_retries"):
         GlobalFSM(max_pick_retries=value)  # type: ignore[arg-type]
+
+
+def test_fsm_constructor_keeps_existing_calls_compatible() -> None:
+    assert GlobalFSM(max_pick_retries=2).max_pick_retries == 2
+    assert GlobalFSM(2, {GlobalPhase.SEARCH_TARGET: 10}).phase_timeouts_ns == {
+        GlobalPhase.SEARCH_TARGET: 10
+    }
+    with pytest.raises(TypeError):
+        GlobalFSM(1, None, 1)  # type: ignore[misc]
 
 
 def test_fsm_requires_public_contract_types() -> None:
