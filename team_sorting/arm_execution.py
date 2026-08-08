@@ -14,6 +14,7 @@ from .interfaces import (
     ArmExecutionConfig,
     ArmMotionPhase,
     GlobalPhase,
+    GraspVerification,
     JOINT_NAMES,
     JointTrajectory,
     JointWaypoint,
@@ -175,6 +176,8 @@ class ArmExecutionController:
 
     正式执行必须显式注入 ``ArmExecutionConfig``。暂时允许无参构造，仅用于尚未获准修改
     的 ROS 骨架兼容；该实例不能装载或执行轨迹，并始终失败关闭，不含任何默认参数。
+    当前只提供 ``accept_grasp_verification`` 接收并缓存验证结果；是否据此解除
+    ``VERIFY`` 锁定，仍由后续 ROS/FSM 接线评审决定，本执行器默认保持关闭。
     """
 
     def __init__(self, config: ArmExecutionConfig | None = None) -> None:
@@ -191,7 +194,49 @@ class ArmExecutionController:
         self._last_command: tuple[float, ...] | None = None
         self._initial_position: tuple[float, ...] | None = None
         self._terminal_status: ManipulationStatus | None = None
-        self._cached_verification = None
+        self._cached_verification: GraspVerification | None = None
+        self._verification_received_ns: int | None = None
+
+    def accept_grasp_verification(
+        self, verification: "GraspVerification"
+    ) -> None:
+        """校验并缓存外部抓取验证，留待后续获批的 ROS/FSM 组装层消费。
+
+        本入口只负责接收，不确认 ``GraspContext``，也不会改变局部阶段或让
+        ``step`` 自动越过 ``VERIFY``。所有检查在写入前完成，避免非法输入
+        覆盖此前已经接收的有效验证。
+        """
+
+        if not isinstance(verification, GraspVerification):
+            raise ValueError("verification必须是GraspVerification实例")
+
+        required_fields = (
+            "is_grasped",
+            "confidence",
+            "visual_evidence",
+            "effort_evidence",
+            "success",
+            "failure_reason",
+            "timestamp_ns",
+        )
+        missing_fields = tuple(
+            name for name in required_fields if not hasattr(verification, name)
+        )
+        if missing_fields:
+            raise ValueError(
+                f"verification字段不完整，缺少：{', '.join(missing_fields)}"
+            )
+
+        timestamp_ns = verification.timestamp_ns
+        if type(timestamp_ns) is not int or timestamp_ns < 0:
+            raise ValueError("verification.timestamp_ns必须是非负整数且不能是bool")
+        if type(verification.success) is not bool:
+            raise ValueError("verification.success必须是严格bool")
+        if not isinstance(verification.failure_reason, str):
+            raise ValueError("verification.failure_reason必须是字符串")
+
+        self._cached_verification = verification
+        self._verification_received_ns = timestamp_ns
 
     def create_hold_command(
         self, actual_joints: RobotJointState, timestamp_ns: int, valid_for_ns: int
@@ -246,6 +291,7 @@ class ArmExecutionController:
         self._initial_position = None
         self._terminal_status = None
         self._cached_verification = None
+        self._verification_received_ns = None
         self.local_phase = LocalPhase.IDLE
 
     @staticmethod
