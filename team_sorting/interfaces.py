@@ -1817,6 +1817,68 @@ class GraspVerification:
     failure_reason: str
     timestamp_ns: int
 
+    def __post_init__(self) -> None:
+        """在公共接口构造边界拒绝类型或范围无效的抓取验证结果。"""
+
+        if type(self.is_grasped) is not bool:
+            raise ValueError(
+                "GraspVerification.is_grasped期望严格bool，"
+                f"实际收到{type(self.is_grasped).__name__}: {self.is_grasped!r}"
+            )
+
+        confidence = self.confidence
+        if type(confidence) is bool or not isinstance(confidence, Real):
+            raise ValueError(
+                "GraspVerification.confidence期望非bool的Real数值，"
+                f"实际收到{type(confidence).__name__}: {confidence!r}"
+            )
+        try:
+            confidence_value = float(confidence)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                "GraspVerification.confidence期望可转换为有限float的Real数值，"
+                f"实际收到{type(confidence).__name__}: {confidence!r}"
+            ) from exc
+        if not math.isfinite(confidence_value):
+            raise ValueError(
+                "GraspVerification.confidence期望有限数值，"
+                f"实际收到{type(confidence).__name__}: {confidence!r}"
+            )
+        if not 0.0 <= confidence_value <= 1.0:
+            raise ValueError(
+                "GraspVerification.confidence期望位于[0.0, 1.0]，"
+                f"实际收到{type(confidence).__name__}: {confidence!r}"
+            )
+
+        if not isinstance(self.visual_evidence, str):
+            raise ValueError(
+                "GraspVerification.visual_evidence期望str，"
+                f"实际收到{type(self.visual_evidence).__name__}: "
+                f"{self.visual_evidence!r}"
+            )
+        if not isinstance(self.effort_evidence, str):
+            raise ValueError(
+                "GraspVerification.effort_evidence期望str，"
+                f"实际收到{type(self.effort_evidence).__name__}: "
+                f"{self.effort_evidence!r}"
+            )
+        if type(self.success) is not bool:
+            raise ValueError(
+                "GraspVerification.success期望严格bool，"
+                f"实际收到{type(self.success).__name__}: {self.success!r}"
+            )
+        if not isinstance(self.failure_reason, str):
+            raise ValueError(
+                "GraspVerification.failure_reason期望str，"
+                f"实际收到{type(self.failure_reason).__name__}: "
+                f"{self.failure_reason!r}"
+            )
+        if type(self.timestamp_ns) is not int or self.timestamp_ns < 0:
+            raise ValueError(
+                "GraspVerification.timestamp_ns期望非负严格int，"
+                f"实际收到{type(self.timestamp_ns).__name__}: {self.timestamp_ns!r}"
+            )
+
 
 # FSM与最终动作
 
