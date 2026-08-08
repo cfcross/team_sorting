@@ -681,8 +681,10 @@ class CameraTransformProvider:
 
 @dataclass
 class _Track:
-    """单个稳定二维轨迹在输出 frame 中的米制三维 EMA 状态。"""
+    """稳定三维物体身份及其当前活跃观测片段。"""
 
+    object_id: str
+    observation_track_id: int
     class_id: str
     ema: list[float]
     count: int
@@ -690,6 +692,8 @@ class _Track:
     last_detection_ts_ns: int
     bbox_center_xy: tuple[float, float]
     last_surface_xyz: tuple[float, float, float]
+    size_xyz_m: Optional[tuple[float, float, float]] = None
+    active: bool = True
     pose_quaternion_xyzw: Optional[list[float]] = None
     pose_count: int = 0
     last_pose_position_xyz: Optional[tuple[float, float, float]] = None
@@ -723,10 +727,12 @@ class Perception3DEstimator:
     """把二维框转换为输出 frame 中的物体三维中心估计。
 
     每条检测独立执行中心窗口中位深度、针孔反投影、已知尺寸中心补偿和官方相机外参
-    变换。只使用 ``Detection2D.track_id`` 维持稳定的一对一三维 EMA；没有稳定
-    编号的兼容输入仍可生成当前帧估计，但不写入持久历史，绝不退回类别/固定像素
-    网格等不可靠身份。尺寸未知、输入不同步、frame 不一致、帧陈旧或三维跳变时
-    返回带明确原因的无效估计，绝不把可见表面点或旧 EMA 冒充当前物体中心。
+    变换。``Detection2D.track_id`` 只标识当前连续二维观测片段；私有身份层为可靠
+    三维观测分配独立 ``object_id``，并可在严格 Odom 三维门控和唯一一对一证据下
+    恢复休眠身份。没有二维编号的兼容输入仍可生成当前帧估计，但不写入持久历史，
+    绝不退回类别/固定像素网格等不可靠身份。尺寸未知、输入不同步、frame 不一致、
+    帧陈旧或三维跳变时返回带明确原因的无效估计，绝不把可见表面点、旧 EMA 或旧
+    点云姿态冒充当前物体几何。
     """
 
     def __init__(
@@ -755,6 +761,12 @@ class Perception3DEstimator:
         pose_max_position_delta_m: float = 0.03,
         pose_max_angular_delta_rad: float = 0.20,
         pose_max_extent_error_ratio: float = 0.45,
+        reassociation_enabled: bool = False,
+        reassociation_max_age_s: float = 30.0,
+        reassociation_max_distance_m: float = 0.5,
+        reassociation_size_tolerance_ratio: float = 0.25,
+        reassociation_ambiguity_ratio: float = 1.2,
+        max_identity_tracks: int = 128,
     ) -> None:
         """保存三维估计参数，构造阶段不加载任何官方依赖。
 
@@ -769,7 +781,9 @@ class Perception3DEstimator:
         同类历史轨迹的距离比判定。中心补偿默认是降级的启发式估计；``strict`` 模式
         会拒绝未经真值验证的中心补偿。``pose_*`` 参数控制框内点云深度带、最少点数、
         连续收敛帧数及位置/角度/尺寸门限；该能力默认关闭。失败：参数类型、范围或物体
-        尺寸不合法时抛出 ``ValueError``。
+        尺寸不合法时抛出 ``ValueError``。``reassociation_*`` 是普通 Python 重关联
+        配置，默认关闭；时间、距离、尺寸和歧义门控都必须由集成层显式批准后启用。
+        ``max_identity_tracks`` 对活跃片段与休眠身份的总数设置硬上限。
         """
 
         if isinstance(depth_radius_px, bool) or not isinstance(
@@ -786,6 +800,8 @@ class Perception3DEstimator:
             raise ValueError("converge_frames 必须是正整数")
         if type(pose_refinement_enabled) is not bool:
             raise ValueError("pose_refinement_enabled 必须是布尔值")
+        if type(reassociation_enabled) is not bool:
+            raise ValueError("reassociation_enabled 必须是布尔值")
         for value, name in (
             (pose_min_points, "pose_min_points"),
             (pose_required_frames, "pose_required_frames"),
@@ -815,6 +831,20 @@ class Perception3DEstimator:
         pose_extent_error = _finite_number(
             pose_max_extent_error_ratio, "pose_max_extent_error_ratio"
         )
+        reassociation_max_age = _finite_number(
+            reassociation_max_age_s, "reassociation_max_age_s"
+        )
+        reassociation_max_distance = _finite_number(
+            reassociation_max_distance_m, "reassociation_max_distance_m"
+        )
+        reassociation_size_tolerance = _finite_number(
+            reassociation_size_tolerance_ratio,
+            "reassociation_size_tolerance_ratio",
+        )
+        reassociation_ambiguity = _finite_number(
+            reassociation_ambiguity_ratio,
+            "reassociation_ambiguity_ratio",
+        )
         if not 0.0 < alpha <= 1.0:
             raise ValueError("ema_alpha 必须位于 (0, 1] 范围")
         if max_age_s <= 0.0:
@@ -842,6 +872,26 @@ class Perception3DEstimator:
             raise ValueError("pose_max_angular_delta_rad 必须位于 (0, pi] 范围")
         if not 0.0 < pose_extent_error < 1.0:
             raise ValueError("pose_max_extent_error_ratio 必须位于 (0, 1) 范围")
+        if reassociation_max_age <= 0.0:
+            raise ValueError("reassociation_max_age_s 必须是正的有限秒数")
+        if reassociation_enabled and reassociation_max_age < max_age_s:
+            raise ValueError(
+                "reassociation_max_age_s 不得小于 max_track_age_s"
+            )
+        if reassociation_max_distance <= 0.0:
+            raise ValueError("reassociation_max_distance_m 必须是正的有限米数")
+        if not 0.0 <= reassociation_size_tolerance <= 1.0:
+            raise ValueError(
+                "reassociation_size_tolerance_ratio 必须位于 [0, 1]"
+            )
+        if reassociation_ambiguity <= 1.0:
+            raise ValueError("reassociation_ambiguity_ratio 必须大于1")
+        if (
+            isinstance(max_identity_tracks, bool)
+            or not isinstance(max_identity_tracks, Integral)
+            or int(max_identity_tracks) <= 0
+        ):
+            raise ValueError("max_identity_tracks 必须是严格正整数")
 
         dimensions = dict(object_dimensions_m) if object_dimensions_m else {}
         normalized_dimensions: dict[str, tuple[float, float, float]] = {}
@@ -899,9 +949,17 @@ class Perception3DEstimator:
         self.pose_max_position_delta_m = pose_position_delta
         self.pose_max_angular_delta_rad = pose_angular_delta
         self.pose_max_extent_error_ratio = pose_extent_error
+        self.reassociation_enabled = reassociation_enabled
+        self.reassociation_max_age_s = reassociation_max_age
+        self.reassociation_max_distance_m = reassociation_max_distance
+        self.reassociation_size_tolerance_ratio = reassociation_size_tolerance
+        self.reassociation_ambiguity_ratio = reassociation_ambiguity
+        self.max_identity_tracks = int(max_identity_tracks)
         self._dims = normalized_dimensions
         self._local_sizes = normalized_local_sizes
         self._tracks: dict[str, _Track] = {}
+        self._observation_to_object: dict[int, str] = {}
+        self._next_identity_id = 0
         self._last_frame_ts_ns: Optional[int] = None
         self._last_detection_frame_ts_ns: Optional[int] = None
 
@@ -1085,6 +1143,15 @@ class Perception3DEstimator:
             joints,
             legacy_point_transform,
         )
+        reassociated_indices, reassociation_errors = self._resolve_reassociation(
+            detections,
+            associations,
+            context_errors,
+            association_errors,
+            identity_candidates,
+            identity_errors,
+            timestamp_ns,
+        )
         self._last_frame_ts_ns = timestamp_ns
         if current_detection_timestamps:
             self._last_detection_frame_ts_ns = next(
@@ -1097,6 +1164,7 @@ class Perception3DEstimator:
                 context_errors[index]
                 or association_errors.get(index, "")
                 or identity_errors.get(index, "")
+                or reassociation_errors.get(index, "")
             )
             if context_error:
                 results.append(
@@ -1122,14 +1190,17 @@ class Perception3DEstimator:
                     base,
                     joints,
                     legacy_point_transform,
+                    index in reassociated_indices,
                 )
             )
         return tuple(results)
 
     def reset_tracks(self) -> None:
-        """清空全部三维 EMA 轨迹，用于切换场景或确认长时间失跟后重置。"""
+        """清空活跃片段、休眠身份、映射、编号、姿态和时间上下文。"""
 
         self._tracks.clear()
+        self._observation_to_object.clear()
+        self._next_identity_id = 0
         self._last_frame_ts_ns = None
         self._last_detection_frame_ts_ns = None
 
@@ -1147,6 +1218,7 @@ class Perception3DEstimator:
         base: BaseState,
         joints: RobotJointState,
         legacy_point_transform: bool,
+        restart_active_segment: bool,
     ) -> ObjectEstimate3D:
         """独立处理一条检测，并把预期的数据错误转换为无效估计。"""
 
@@ -1240,6 +1312,7 @@ class Perception3DEstimator:
             world_point,
             timestamp_ns,
             identity_candidate,
+            restart_active_segment,
         )
         if track_error:
             return self._failure(
@@ -1581,11 +1654,11 @@ class Perception3DEstimator:
         detections: tuple[Detection2D, ...],
         context_errors: list[str],
     ) -> tuple[dict[int, Optional[str]], dict[int, str]]:
-        """按稳定ID做同帧一对一关联；无ID输入明确不建立持久轨迹。"""
+        """只恢复仍活跃的二维片段绑定；新二维ID留给三维重关联。"""
 
         associations: dict[int, Optional[str]] = {}
         errors: dict[int, str] = {}
-        reserved_indices: dict[str, int] = {}
+        reserved_indices: dict[int, int] = {}
 
         for index, detection in enumerate(detections):
             if context_errors[index]:
@@ -1596,9 +1669,9 @@ class Perception3DEstimator:
             if detection.track_id is None:
                 associations[index] = None
                 continue
-            key = f"stable:{detection.track_id}"
-            if key in reserved_indices:
-                previous_index = reserved_indices[key]
+            observation_id = int(detection.track_id)
+            if observation_id in reserved_indices:
+                previous_index = reserved_indices[observation_id]
                 reason = (
                     "二维稳定轨迹ID重复：同一帧中 "
                     f"track_id={detection.track_id} "
@@ -1608,8 +1681,12 @@ class Perception3DEstimator:
                 errors[index] = reason
                 associations.pop(previous_index, None)
                 continue
+            key = self._observation_to_object.get(observation_id)
+            if key is not None and key not in self._tracks:
+                del self._observation_to_object[observation_id]
+                key = None
             associations[index] = key
-            reserved_indices[key] = index
+            reserved_indices[observation_id] = index
         return associations, errors
 
     def _identity_consistency(
@@ -1631,12 +1708,11 @@ class Perception3DEstimator:
         if head_pose is None and not legacy_point_transform:
             return candidates, errors
         for index, detection in enumerate(detections):
-            key = associations.get(index)
             if (
-                key is None
-                or context_errors[index]
+                context_errors[index]
                 or index in association_errors
                 or not detection.valid
+                or detection.track_id is None
                 or index not in probes
             ):
                 continue
@@ -1719,6 +1795,186 @@ class Perception3DEstimator:
                 )
         return candidates, errors
 
+    def _resolve_reassociation(
+        self,
+        detections: tuple[Detection2D, ...],
+        associations: dict[int, Optional[str]],
+        context_errors: list[str],
+        association_errors: dict[int, str],
+        identity_candidates: dict[int, _IdentityCandidate],
+        identity_errors: dict[int, str],
+        timestamp_ns: int,
+    ) -> tuple[set[int], dict[int, str]]:
+        """为未绑定二维片段确定性恢复或创建稳定三维身份。"""
+
+        errors: dict[int, str] = {}
+        reassociated: set[int] = set()
+        occupied = {
+            key for key in associations.values() if isinstance(key, str)
+        }
+        pending = [
+            index
+            for index, detection in enumerate(detections)
+            if (
+                associations.get(index) is None
+                and detection.track_id is not None
+                and detection.valid
+                and not context_errors[index]
+                and index not in association_errors
+                and index not in identity_errors
+                and index in identity_candidates
+                and detection.class_id in self._dims
+                and self.center_compensation_mode == "degraded"
+            )
+        ]
+        costs: dict[int, list[tuple[float, str]]] = {}
+        if self.reassociation_enabled:
+            max_age_ns = self.reassociation_max_age_s * 1_000_000_000.0
+            for index in pending:
+                detection = detections[index]
+                current_size = self._local_sizes.get(detection.class_id)
+                current_surface = identity_candidates[index].surface_xyz
+                candidates: list[tuple[float, str]] = []
+                for object_id, track in self._tracks.items():
+                    if object_id in occupied or track.class_id != detection.class_id:
+                        continue
+                    age_ns = timestamp_ns - track.last_ts_ns
+                    if age_ns < 0 or age_ns > max_age_ns:
+                        continue
+                    if int(detection.timestamp_ns) <= track.last_detection_ts_ns:
+                        continue
+                    distance_m = math.dist(current_surface, track.last_surface_xyz)
+                    if (
+                        not math.isfinite(distance_m)
+                        or distance_m > self.reassociation_max_distance_m
+                    ):
+                        continue
+                    size_error = self._relative_size_error(
+                        current_size, track.size_xyz_m
+                    )
+                    if (
+                        size_error is not None
+                        and size_error > self.reassociation_size_tolerance_ratio
+                    ):
+                        continue
+                    cost = distance_m / self.reassociation_max_distance_m
+                    cost += age_ns / max_age_ns
+                    if size_error is not None:
+                        denominator = max(
+                            self.reassociation_size_tolerance_ratio, 1e-12
+                        )
+                        cost += size_error / denominator
+                    candidates.append((cost, object_id))
+                costs[index] = sorted(candidates, key=lambda item: (item[0], item[1]))
+
+        contenders: dict[int, set[str]] = {}
+        for index, candidates in costs.items():
+            if not candidates:
+                continue
+            best_cost = candidates[0][0]
+            limit = best_cost * self.reassociation_ambiguity_ratio
+            if best_cost == 0.0:
+                limit = 0.0
+            contenders[index] = {
+                object_id for cost, object_id in candidates if cost <= limit
+            }
+            if len(contenders[index]) > 1:
+                errors[index] = (
+                    "三维身份重关联候选歧义：最佳与次佳候选代价过于接近"
+                )
+
+        by_identity: dict[str, list[int]] = {}
+        for index, object_ids in contenders.items():
+            for object_id in object_ids:
+                by_identity.setdefault(object_id, []).append(index)
+        for object_id, indices in by_identity.items():
+            if len(indices) <= 1:
+                continue
+            reason = (
+                "三维身份重关联失败：同一历史身份 "
+                f"{object_id!r} 被多个当前观测竞争"
+            )
+            for index in indices:
+                errors[index] = reason
+
+        protected = occupied | {
+            object_id
+            for candidates in costs.values()
+            for _, object_id in candidates
+        }
+        for index in sorted(
+            pending,
+            key=lambda item: self._new_identity_sort_key(
+                detections[item], identity_candidates[item]
+            ),
+        ):
+            if index in errors:
+                continue
+            candidates = costs.get(index, ())
+            if candidates:
+                object_id = candidates[0][1]
+                associations[index] = object_id
+                occupied.add(object_id)
+                protected.add(object_id)
+                reassociated.add(index)
+                continue
+            object_id = self._allocate_identity(
+                detections[index].class_id, protected
+            )
+            if object_id is None:
+                errors[index] = (
+                    "稳定三维身份缓存已满，且无可安全淘汰的非当前帧身份"
+                )
+                continue
+            associations[index] = object_id
+            occupied.add(object_id)
+            protected.add(object_id)
+        return reassociated, errors
+
+    @staticmethod
+    def _relative_size_error(
+        current: Optional[tuple[float, float, float]],
+        historical: Optional[tuple[float, float, float]],
+    ) -> Optional[float]:
+        if current is None or historical is None:
+            return None
+        return max(
+            abs(left - right) / max(left, right)
+            for left, right in zip(current, historical)
+        )
+
+    @staticmethod
+    def _new_identity_sort_key(
+        detection: Detection2D,
+        candidate: _IdentityCandidate,
+    ) -> tuple[Any, ...]:
+        return (
+            detection.class_id,
+            *candidate.surface_xyz,
+            *candidate.bbox_center_xy,
+            int(detection.track_id),
+        )
+
+    def _allocate_identity(
+        self, class_id: str, occupied: set[str]
+    ) -> Optional[str]:
+        retained_or_reserved = set(self._tracks) | occupied
+        if len(retained_or_reserved) >= self.max_identity_tracks:
+            evictable = sorted(
+                (
+                    (track.last_ts_ns, object_id)
+                    for object_id, track in self._tracks.items()
+                    if object_id not in occupied
+                )
+            )
+            if not evictable:
+                return None
+            self._delete_identity(evictable[0][1])
+        del class_id
+        object_id = f"odom-object:{self._next_identity_id}"
+        self._next_identity_id += 1
+        return object_id
+
     def _update_track(
         self,
         key: Optional[str],
@@ -1726,6 +1982,7 @@ class Perception3DEstimator:
         world_point: tuple[float, float, float],
         timestamp_ns: int,
         identity_candidate: Optional[_IdentityCandidate],
+        restart_active_segment: bool,
     ) -> tuple[tuple[float, float, float], int, str]:
         """以严格递增时间戳更新三维 EMA，并拒绝离群大跳变。"""
 
@@ -1741,7 +1998,15 @@ class Perception3DEstimator:
         detection_timestamp_ns = int(detection.timestamp_ns)
         track = self._tracks.get(key)
         if track is None:
+            if detection.track_id is None:
+                return (
+                    (0.0, 0.0, 0.0),
+                    0,
+                    "稳定三维身份创建失败：二维观测缺少track_id",
+                )
             track = _Track(
+                object_id=key,
+                observation_track_id=int(detection.track_id),
                 class_id=detection.class_id,
                 ema=list(world_point),
                 count=1,
@@ -1749,8 +2014,10 @@ class Perception3DEstimator:
                 last_detection_ts_ns=detection_timestamp_ns,
                 bbox_center_xy=identity_candidate.bbox_center_xy,
                 last_surface_xyz=identity_candidate.surface_xyz,
+                size_xyz_m=self._local_sizes.get(detection.class_id),
             )
             self._tracks[key] = track
+            self._observation_to_object[track.observation_track_id] = key
             return tuple(track.ema), track.count, ""
 
         if track.class_id != detection.class_id:
@@ -1781,6 +2048,22 @@ class Perception3DEstimator:
                     f"{track.last_detection_ts_ns}"
                 ),
             )
+        if restart_active_segment or not track.active:
+            self._observation_to_object.pop(track.observation_track_id, None)
+            track.observation_track_id = int(detection.track_id)
+            self._observation_to_object[track.observation_track_id] = key
+            track.ema = list(world_point)
+            track.count = 1
+            track.last_ts_ns = timestamp_ns
+            track.last_detection_ts_ns = detection_timestamp_ns
+            track.bbox_center_xy = identity_candidate.bbox_center_xy
+            track.last_surface_xyz = identity_candidate.surface_xyz
+            track.size_xyz_m = self._local_sizes.get(detection.class_id)
+            track.active = True
+            track.pose_quaternion_xyzw = None
+            track.pose_count = 0
+            track.last_pose_position_xyz = None
+            return tuple(track.ema), track.count, ""
         jump_m = math.dist(tuple(track.ema), world_point)
         if jump_m > self.max_position_jump_m:
             return (
@@ -1802,20 +2085,44 @@ class Perception3DEstimator:
         track.last_detection_ts_ns = detection_timestamp_ns
         track.bbox_center_xy = identity_candidate.bbox_center_xy
         track.last_surface_xyz = identity_candidate.surface_xyz
+        track.size_xyz_m = self._local_sizes.get(detection.class_id)
+        track.active = True
         return tuple(track.ema), track.count, ""
 
     def _remove_expired_tracks(self, timestamp_ns: int) -> None:
-        """删除相对当前正序帧已超时的轨迹。"""
+        """短窗结束活跃片段，长窗结束稳定身份历史。"""
 
-        max_age_ns = self.max_track_age_s * 1_000_000_000.0
+        active_age_ns = self.max_track_age_s * 1_000_000_000.0
+        identity_age_ns = (
+            self.reassociation_max_age_s
+            if self.reassociation_enabled
+            else self.max_track_age_s
+        ) * 1_000_000_000.0
         expired = [
             key
             for key, track in self._tracks.items()
             if timestamp_ns > track.last_ts_ns
-            and timestamp_ns - track.last_ts_ns > max_age_ns
+            and timestamp_ns - track.last_ts_ns > identity_age_ns
         ]
         for key in expired:
-            del self._tracks[key]
+            self._delete_identity(key)
+        for track in self._tracks.values():
+            if (
+                track.active
+                and timestamp_ns > track.last_ts_ns
+                and timestamp_ns - track.last_ts_ns > active_age_ns
+            ):
+                self._observation_to_object.pop(track.observation_track_id, None)
+                track.active = False
+                track.count = 0
+                track.pose_quaternion_xyzw = None
+                track.pose_count = 0
+                track.last_pose_position_xyz = None
+
+    def _delete_identity(self, object_id: str) -> None:
+        track = self._tracks.pop(object_id, None)
+        if track is not None:
+            self._observation_to_object.pop(track.observation_track_id, None)
 
     def _validate_batch_inputs(
         self,

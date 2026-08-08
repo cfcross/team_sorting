@@ -169,7 +169,10 @@ class _RuntimeWiringState:
     attempt: Optional[int] = None
     context_finished: bool = False
     last_handled_phase: Optional[GlobalPhase] = None
+    phase_entered_ns: Optional[int] = None
     phase_generation: int = 0
+    search_target: Optional[ObjectEstimate3D] = None
+    refined_target: Optional[ObjectEstimate3D] = None
     active_target: Optional[ObjectEstimate3D] = None
     preferred_object_id: str = ""
     active_nav_goal: Optional[NavGoal] = None
@@ -183,6 +186,9 @@ class _RuntimeWiringState:
     place_observation_before_release: Optional[ObjectEstimate3D] = None
     latest_place_verification_observation: Optional[ObjectEstimate3D] = None
     last_navigation_status: Optional[NavigationStatus] = None
+    navigation_success_submitted: bool = False
+    navigation_failure_submitted: bool = False
+    navigation_diagnostic: str = ""
     last_manipulation_status: Optional[ManipulationStatus] = None
     phase_event_keys: set[tuple[object, ...]] = field(default_factory=set)
     phase_entry_failure_reason: str = ""
@@ -373,7 +379,7 @@ def _internal_fsm_publish_authorization(
     now_ns: int,
     manipulation_source: str = "manipulation_command",
 ) -> bool:
-    """纯判断未来内部FSM FULL发布资格；本轮控制链不会使用它打开发布。"""
+    """纯判断内部FSM候选是否可取得本控制周期FULL发布资格。"""
 
     if type(observe_only) is not bool or type(enable_official_publish) is not bool:
         return False
@@ -411,18 +417,30 @@ def _internal_fsm_publish_authorization(
         # External Candidate只保留既有head-only授权，不能借内部判断取得FULL权限。
         return False
     base_active = (
+        fsm_status.global_phase
+        in {
+            GlobalPhase.NAV_TO_PICK,
+            GlobalPhase.NAV_TO_PLACE,
+            GlobalPhase.RETURN_END,
+        }
+        and
         isinstance(base_command, BaseCommand)
         and base_command.valid
         and now_ns < base_command.valid_until_ns
-        and (base_command.v != 0.0 or base_command.w != 0.0)
+        and manipulation_command is None
     )
-    manipulation_active = (
-        isinstance(manipulation_command, ManipulationCommand)
-        and manipulation_command.valid
-        and now_ns < manipulation_command.valid_until_ns
-        and any(manipulation_command.controlled_mask)
-    )
-    return base_active or manipulation_active
+    if (
+        base_active
+        and base_command.v == 0.0
+        and base_command.w == 0.0
+        and (final_action.values[0] != 0.0 or final_action.values[1] != 0.0)
+    ):
+        # 到达/失败切换周期允许发布显式零速，但不能拿零速候选给另一份非零
+        # FinalAction授权。非零候选可能由ActionMux按配置限幅，因此不做反向等值要求。
+        base_active = False
+    # 本轮只授权已接线的导航闭环；机械臂规划/执行尚未取得运行时发布授权，不能因
+    # 这个导航变更顺带打开其FULL出口。
+    return base_active
 
 
 class TimestampedCache:
@@ -981,6 +999,10 @@ def _load_config() -> dict[str, Any]:
             _arm_planning_config_from_config(data)
         except ValueError as exc:
             raise RuntimeError(f"机械臂规划配置无效 {path}: {exc}") from exc
+    try:
+        _navigation_config_from_config(data)
+    except ValueError as exc:
+        raise RuntimeError(f"导航配置无效 {path}: {exc}") from exc
     _validated_action_dispatch_topic(data.get("topics"))
     return data
 
@@ -1182,8 +1204,8 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                     f"VisualObservationVerifier配置无效，失败关闭：{exc}"
                 )
 
-            # 业务对象只在节点初始化时构造一次。默认配置没有正式navigation字段，
-            # 因而不能偷偷采用NavigationConfig的模块默认值并宣称导航可用。
+            # 业务对象只在节点初始化时构造一次；navigation必须完整显式映射，不能
+            # 偷偷采用NavigationConfig的模块默认值并宣称导航可用。
             self._navigation: Optional[NavigationController] = None
             self._navigation_unavailable_reason = ""
             try:
@@ -1480,8 +1502,11 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             if context_finished is not _RUNTIME_ID_UNSET:
                 state.context_finished = bool(context_finished)
             state.last_handled_phase = None
+            state.phase_entered_ns = None
             state.phase_generation += 1
             state.active_target = None
+            state.search_target = None
+            state.refined_target = None
             state.preferred_object_id = ""
             state.active_nav_goal = None
             state.planned_grasp_context = None
@@ -1494,11 +1519,15 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             state.place_observation_before_release = None
             state.latest_place_verification_observation = None
             state.last_navigation_status = None
+            state.navigation_success_submitted = False
+            state.navigation_failure_submitted = False
+            state.navigation_diagnostic = ""
             state.last_manipulation_status = None
             state.phase_event_keys.clear()
             state.phase_entry_failure_reason = reset_failure
             state.last_event_tick_ns = None
             state.event_attempted_this_tick = False
+            self._latest_estimates = ()
             if reset_failure and self._context_ok():
                 self.get_logger().error(
                     f"runtime_wiring_reset_failed:{reason}:{reset_failure}"
@@ -1523,8 +1552,13 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             ):
                 # 安全暂停及恢复不能破坏被暂停阶段的业务生命周期。
                 return
+            state.navigation_success_submitted = False
+            state.navigation_failure_submitted = False
+            state.navigation_diagnostic = ""
             if current_phase is GlobalPhase.SEARCH_TARGET:
                 state.active_target = None
+                state.search_target = None
+                state.refined_target = None
                 state.preferred_object_id = ""
                 state.active_nav_goal = None
                 state.planned_grasp_context = None
@@ -1569,6 +1603,8 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 state.latest_grasp_verification = None
             elif current_phase is GlobalPhase.NAV_TO_PLACE:
                 state.active_target = None
+                state.search_target = None
+                state.refined_target = None
                 state.preferred_object_id = ""
                 state.active_nav_goal = None
                 state.planned_grasp_context = None
@@ -1582,6 +1618,8 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 state.last_navigation_status = None
                 state.last_manipulation_status = None
             elif current_phase is GlobalPhase.PLAN_PLACE:
+                state.active_nav_goal = None
+                state.last_navigation_status = None
                 state.active_place_trajectory = None
                 state.active_trajectory_id = ""
                 state.place_observation_before_release = None
@@ -1592,6 +1630,8 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 state.latest_place_verification_observation = None
             elif current_phase is GlobalPhase.RETURN_END:
                 state.active_target = None
+                state.search_target = None
+                state.refined_target = None
                 state.preferred_object_id = ""
                 state.active_nav_goal = None
                 state.planned_grasp_context = None
@@ -1607,6 +1647,8 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 state.last_manipulation_status = None
             elif current_phase in {GlobalPhase.DONE, GlobalPhase.FAILED}:
                 state.active_target = None
+                state.search_target = None
+                state.refined_target = None
                 state.preferred_object_id = ""
                 state.active_nav_goal = None
                 state.active_pick_trajectory = None
@@ -1689,6 +1731,12 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             previous_phase = state.last_handled_phase
             self._prepare_phase_transition(previous_phase, phase)
             state.last_handled_phase = phase
+            state.phase_entered_ns = (
+                self._fsm.phase_entered_ns
+                if type(self._fsm.phase_entered_ns) is int
+                and self._fsm.phase_entered_ns >= 0
+                else now_ns
+            )
             if type(now_ns) is not int or now_ns < 0:
                 state.phase_entry_failure_reason = "阶段入口时间无效"
                 return True
@@ -1702,24 +1750,58 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             ):
                 state.phase_entry_failure_reason = "CompetitionContext不允许普通业务入口"
                 return True
-            if phase in {GlobalPhase.NAV_TO_PICK, GlobalPhase.NAV_TO_PLACE}:
+            if phase in {
+                GlobalPhase.NAV_TO_PICK,
+                GlobalPhase.NAV_TO_PLACE,
+                GlobalPhase.RETURN_END,
+            }:
                 if self._navigation is None:
                     state.phase_entry_failure_reason = (
-                        self._navigation_unavailable_reason or "NavigationController不可用"
+                        self._navigation_unavailable_reason
+                        or "NavigationController不可用"
                     )
+                elif snapshot.base is None or not snapshot.base.valid:
+                    state.phase_entry_failure_reason = "导航阶段入口缺少新鲜有效Odom"
                 else:
-                    state.phase_entry_failure_reason = "导航真实结果接口尚未接线"
-            elif phase is GlobalPhase.RETURN_END:
-                if self._navigation is None:
-                    state.phase_entry_failure_reason = (
-                        self._navigation_unavailable_reason or "NavigationController不可用"
-                    )
-                elif not callable(getattr(self._navigation, "build_return_goal", None)):
-                    state.phase_entry_failure_reason = (
-                        "NavigationController.build_return_goal不存在，返区失败关闭"
-                    )
-                else:
-                    state.phase_entry_failure_reason = "返区真实结果接口尚未接线"
+                    try:
+                        if phase is GlobalPhase.NAV_TO_PICK:
+                            if snapshot.task is None:
+                                raise ValueError("NAV_TO_PICK缺少当前TaskSpec")
+                            if (
+                                state.search_target is None
+                                and isinstance(state.active_target, ObjectEstimate3D)
+                            ):
+                                state.search_target = state.active_target
+                            if state.search_target is None:
+                                raise ValueError("NAV_TO_PICK缺少SEARCH锁定目标")
+                            state.active_nav_goal = self._navigation.build_pick_goal(
+                                snapshot.task,
+                                state.search_target,
+                                snapshot.base,
+                                now_ns,
+                            )
+                        elif phase is GlobalPhase.NAV_TO_PLACE:
+                            if snapshot.task is None:
+                                raise ValueError("NAV_TO_PLACE缺少当前TaskSpec")
+                            state.active_nav_goal = self._navigation.build_place_goal(
+                                snapshot.task, snapshot.base, now_ns
+                            )
+                        else:
+                            state.active_nav_goal = self._navigation.build_return_goal(
+                                snapshot.base, now_ns
+                            )
+                        if not state.active_nav_goal.valid:
+                            raise ValueError(
+                                state.active_nav_goal.failure_reason
+                                or "NavigationController生成无效NavGoal"
+                            )
+                        state.phase_entry_failure_reason = ""
+                    except (TypeError, ValueError, RuntimeError) as exc:
+                        state.active_nav_goal = None
+                        state.phase_entry_failure_reason = (
+                            f"{phase.value}导航目标构建失败：{exc}"
+                        )
+                        state.navigation_diagnostic = state.phase_entry_failure_reason
             elif phase in {GlobalPhase.PLAN_PICK, GlobalPhase.PLAN_PLACE}:
                 if self._arm_planner is None:
                     state.phase_entry_failure_reason = (
@@ -1781,6 +1863,104 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             )
             state = self._runtime_wiring
             phase = fsm_status.global_phase
+            if phase in {
+                GlobalPhase.NAV_TO_PICK,
+                GlobalPhase.NAV_TO_PLACE,
+                GlobalPhase.RETURN_END,
+            }:
+                status = state.last_navigation_status
+                goal = state.active_nav_goal
+                failure = state.phase_entry_failure_reason
+                if not failure and not isinstance(goal, NavGoal):
+                    failure = "导航阶段缺少活动NavGoal"
+                if not failure and not isinstance(status, NavigationStatus):
+                    failure = "导航阶段尚未获得NavigationStatus"
+                if (
+                    not failure
+                    and isinstance(goal, NavGoal)
+                    and isinstance(status, NavigationStatus)
+                    and status.goal_id != goal.goal_id
+                ):
+                    failure = (
+                        "NavigationStatus.goal_id与当前NavGoal不一致："
+                        f"{status.goal_id!r} != {goal.goal_id!r}"
+                    )
+                if (
+                    not failure
+                    and isinstance(status, NavigationStatus)
+                    and status.state in {"failed", "timeout"}
+                ):
+                    failure = status.failure_reason or f"导航状态为{status.state}"
+                if (
+                    not failure
+                    and isinstance(base_command, BaseCommand)
+                    and not base_command.valid
+                ):
+                    failure = base_command.failure_reason or "导航BaseCommand无效"
+                if failure:
+                    state.navigation_diagnostic = failure
+                    state.phase_entry_failure_reason = failure
+                    base_command = BaseCommand(
+                        0.0,
+                        0.0,
+                        now_ns,
+                        now_ns,
+                        False,
+                        failure,
+                    )
+                    if state.navigation_failure_submitted:
+                        return base_command, manipulation_command, None
+                    state.navigation_failure_submitted = True
+                    return base_command, manipulation_command, _RuntimeFSMFeedback(
+                        event=FSMEvent.FAILURE,
+                        source_timestamp_ns=(
+                            status.timestamp_ns
+                            if isinstance(status, NavigationStatus)
+                            else now_ns
+                        ),
+                        run_id=state.run_id,
+                        task_id=state.task_id,
+                        attempt=state.attempt,
+                        goal_id=goal.goal_id if isinstance(goal, NavGoal) else "",
+                        reason=f"{phase.value}失败：{failure}",
+                        confirmed_by_real_feedback=True,
+                    )
+                if not isinstance(status, NavigationStatus) or not isinstance(
+                    goal, NavGoal
+                ):
+                    return base_command, manipulation_command, None
+                if not (status.success and status.state == "arrived"):
+                    state.navigation_diagnostic = status.failure_reason
+                    return base_command, manipulation_command, None
+                if state.navigation_success_submitted:
+                    return base_command, manipulation_command, None
+                state.navigation_success_submitted = True
+                event = {
+                    GlobalPhase.NAV_TO_PICK: FSMEvent.PICK_NAV_REACHED,
+                    GlobalPhase.NAV_TO_PLACE: FSMEvent.PLACE_NAV_REACHED,
+                    GlobalPhase.RETURN_END: FSMEvent.RETURN_REACHED,
+                }[phase]
+                return base_command, manipulation_command, _RuntimeFSMFeedback(
+                    event=event,
+                    source_timestamp_ns=status.timestamp_ns,
+                    run_id=state.run_id,
+                    task_id=state.task_id,
+                    attempt=state.attempt,
+                    object_id=(
+                        state.confirmed_grasp_context.object_id
+                        if phase is GlobalPhase.NAV_TO_PLACE
+                        and isinstance(state.confirmed_grasp_context, GraspContext)
+                        else (
+                            (state.active_target.object_id or "")
+                            if phase is GlobalPhase.NAV_TO_PLACE
+                            and isinstance(state.active_target, ObjectEstimate3D)
+                            else ""
+                        )
+                    ),
+                    goal_id=goal.goal_id,
+                    reason=f"真实Odom确认{phase.value}目标到达",
+                    confirmed_by_real_feedback=True,
+                )
             if phase not in {GlobalPhase.SEARCH_TARGET, GlobalPhase.REFINE_TARGET}:
                 return base_command, manipulation_command, None
             if snapshot.task is None or snapshot.task.task_id != fsm_status.task_id:
@@ -1827,6 +2007,11 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 return base_command, manipulation_command, None
 
             state.active_target = selected
+            if phase is GlobalPhase.SEARCH_TARGET:
+                state.search_target = selected
+                state.preferred_object_id = selected.object_id or ""
+            else:
+                state.refined_target = selected
             state.phase_entry_failure_reason = ""
             return base_command, manipulation_command, _RuntimeFSMFeedback(
                 event=(
@@ -2128,14 +2313,8 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             fsm_status: FSMStatus,
             now_ns: int,
         ) -> tuple[BaseCommand | None, ManipulationCommand | None]:
-            """把同周期快照交给唯一业务组装入口，返回两类候选命令。
+            """生成本周期导航候选；非导航阶段保持零速且不主动保持机械臂。"""
 
-            当前完整业务尚未接线，只产生短TTL零底盘候选，不把“没有机械臂业务候选”
-            错误解释成17维主动位置保持。``ActionMux`` 仍基于实际反馈生成诊断
-            ``FinalAction``；是否允许发布由独立全局官方发布门决定。
-            """
-
-            # 接线前只保留可审计的零底盘候选；不实现业务算法或主动关节保持。
             if fsm_status.global_phase in {
                 GlobalPhase.SAFE_HOLD,
                 GlobalPhase.DONE,
@@ -2144,6 +2323,46 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 return None, None
             if snapshot.joints is None or not snapshot.joints.valid:
                 return None, None
+            if fsm_status.global_phase in {
+                GlobalPhase.NAV_TO_PICK,
+                GlobalPhase.NAV_TO_PLACE,
+                GlobalPhase.RETURN_END,
+            }:
+                state = self._runtime_wiring
+                if self._navigation is None:
+                    reason = (
+                        self._navigation_unavailable_reason
+                        or "NavigationController不可用"
+                    )
+                    state.navigation_diagnostic = reason
+                    return BaseCommand(
+                        0.0, 0.0, now_ns, now_ns, False, reason
+                    ), None
+                if not isinstance(state.active_nav_goal, NavGoal):
+                    reason = state.phase_entry_failure_reason or "缺少活动NavGoal"
+                    state.navigation_diagnostic = reason
+                    return BaseCommand(
+                        0.0, 0.0, now_ns, now_ns, False, reason
+                    ), None
+                if snapshot.base is None or not snapshot.base.valid:
+                    reason = "缺少新鲜有效Odom，导航失败关闭"
+                    state.navigation_diagnostic = reason
+                    return BaseCommand(
+                        0.0, 0.0, now_ns, now_ns, False, reason
+                    ), None
+                try:
+                    command, navigation_status = self._navigation.update(
+                        snapshot.base, state.active_nav_goal, now_ns
+                    )
+                except (TypeError, ValueError, RuntimeError) as exc:
+                    reason = f"NavigationController.update异常：{exc}"
+                    state.navigation_diagnostic = reason
+                    return BaseCommand(
+                        0.0, 0.0, now_ns, now_ns, False, reason
+                    ), None
+                state.last_navigation_status = navigation_status
+                state.navigation_diagnostic = navigation_status.failure_reason
+                return command, None
             return BaseCommand(
                 0.0, 0.0, now_ns, now_ns + self._command_ttl_ns
             ), None
@@ -2188,6 +2407,7 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             *,
             decision: ActionMuxDecision,
             head_publish_authorized: bool = False,
+            internal_fsm_publish_authorized: bool = False,
             safety_exit_authorized: bool = False,
             diagnostic_only: bool = False,
         ) -> bool:
@@ -2226,7 +2446,7 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 )
                 published = False
                 dispatch_failure_reason = "invalid_final_action"
-            elif safety_exit_authorized:
+            elif safety_exit_authorized or internal_fsm_publish_authorized:
                 dispatch_mode = DispatchMode.FULL
                 try:
                     group_records = self._official_publisher.publish_with_trace(action)
@@ -2419,10 +2639,41 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 self._log_control_warning_on_change(
                     "External Candidate不是严格head_yaw-only mask，禁止官方发布"
                 )
+            internal_publish_authorized = _internal_fsm_publish_authorization(
+                observe_only=self._observe_only,
+                enable_official_publish=self._publish_enabled,
+                context=context,
+                snapshot=snapshot,
+                fsm_status=status,
+                base_command=base_command,
+                manipulation_command=manipulation_command,
+                final_action=final_action,
+                now_ns=now_ns,
+                manipulation_source=(
+                    "external_candidate"
+                    if external_decision.accepted
+                    else "manipulation_command"
+                ),
+            )
+            navigation_transition_stop_authorized = (
+                self._publish_enabled
+                and snapshot.valid
+                and event_transitioned
+                and status_before.global_phase
+                in {
+                    GlobalPhase.NAV_TO_PICK,
+                    GlobalPhase.NAV_TO_PLACE,
+                    GlobalPhase.RETURN_END,
+                }
+                and final_action.valid
+                and final_action.values[0:2] == (0.0, 0.0)
+            )
             published = self._publish_final_action(
                 final_action,
                 decision=mux_decision,
                 head_publish_authorized=candidate_publish_authorized,
+                internal_fsm_publish_authorized=internal_publish_authorized,
+                safety_exit_authorized=navigation_transition_stop_authorized,
                 diagnostic_only=(
                     external_decision.accepted and not candidate_publish_authorized
                 ),
@@ -2586,6 +2837,10 @@ def _create_perception_node(ros: SimpleNamespace) -> type:
             self._stabilizer, self._estimator = _perception_pipeline_from_config(
                 config, self._transform
             )
+            self._identity_context_key: Optional[
+                tuple[str, Optional[int], int, bool]
+            ] = None
+            self._last_identity_fsm_phase: Optional[GlobalPhase] = None
             self._publisher = self.create_publisher(
                 ros.Detection3DArray, topics["object_estimates"], 10
             )
@@ -2595,6 +2850,15 @@ def _create_perception_node(ros: SimpleNamespace) -> type:
             )
             self.create_subscription(ros.Odometry, topics["odom"], self._on_odom, 30)
             self.create_subscription(ros.JointState, topics["joint_states"], self._on_joints, 30)
+            self.create_subscription(
+                ros.String,
+                topics["competition_context"],
+                self._on_competition_context,
+                10,
+            )
+            self.create_subscription(
+                ros.String, topics["fsm_status"], self._on_fsm_status, 10
+            )
             self._rgb_sub = ros_deps.message_filters.Subscriber(self, ros.Image, topics["rgb"])
             self._depth_sub = ros_deps.message_filters.Subscriber(self, ros.Image, topics["depth"])
             self._sync = ros_deps.message_filters.ApproximateTimeSynchronizer(
@@ -2603,6 +2867,50 @@ def _create_perception_node(ros: SimpleNamespace) -> type:
                 slop=float(config["perception"]["sync_slop_s"]),
             )
             self._sync.registerCallback(self._on_rgb_depth)
+
+        def _reset_visual_identity(self, reason: str) -> None:
+            """同步清除二维片段和三维身份；不声称官方场景已复位。"""
+
+            self._stabilizer.reset()
+            self._estimator.reset_tracks()
+            self._log_frame_issue_on_change(
+                f"视觉身份生命周期已重置：{reason}"
+            )
+
+        def _on_competition_context(self, message: Any) -> None:
+            try:
+                context = CompetitionContext.from_json(message.data)
+            except (AttributeError, TypeError, ValueError) as exc:
+                self._reset_visual_identity(f"CompetitionContext无效：{exc}")
+                self._identity_context_key = None
+                return
+            key = (
+                context.run_id,
+                context.current_task_id,
+                context.current_attempt_count,
+                context.finished or not context.valid,
+            )
+            previous_key = self._identity_context_key
+            if previous_key is not None and key != previous_key:
+                self._reset_visual_identity("run/task/attempt/context边界变化")
+            elif previous_key is None and key[3]:
+                self._reset_visual_identity("competition context已结束或无效")
+            self._identity_context_key = key
+
+        def _on_fsm_status(self, message: Any) -> None:
+            try:
+                status = fsm_status_from_json(message.data)
+            except (AttributeError, TypeError, ValueError) as exc:
+                self._log_frame_issue_on_change(f"FSMStatus解析失败：{exc}")
+                return
+            previous = self._last_identity_fsm_phase
+            self._last_identity_fsm_phase = status.global_phase
+            if (
+                status.global_phase is GlobalPhase.WAIT_READY
+                and previous is not None
+                and previous is not GlobalPhase.WAIT_READY
+            ):
+                self._reset_visual_identity("FSM RESET回到WAIT_READY")
 
         def _on_camera_info(self, message: Any) -> None:
             try:
@@ -3216,6 +3524,12 @@ def _perception_3d_estimator_from_config(
         "converge_frames",
         "max_track_age_s",
         "max_position_jump_m",
+        "reassociation_enabled",
+        "reassociation_max_age_s",
+        "reassociation_max_distance_m",
+        "reassociation_size_tolerance_ratio",
+        "reassociation_ambiguity_ratio",
+        "max_identity_tracks",
         "object_dimensions_m",
         "object_local_size_xyz_m",
         "pose_refinement",
@@ -3319,6 +3633,18 @@ def _perception_3d_estimator_from_config(
             max_track_age_s=values["max_track_age_s"],
             max_input_skew_s=max_input_skew_s,
             max_position_jump_m=values["max_position_jump_m"],
+            reassociation_enabled=values["reassociation_enabled"],
+            reassociation_max_age_s=values["reassociation_max_age_s"],
+            reassociation_max_distance_m=values[
+                "reassociation_max_distance_m"
+            ],
+            reassociation_size_tolerance_ratio=values[
+                "reassociation_size_tolerance_ratio"
+            ],
+            reassociation_ambiguity_ratio=values[
+                "reassociation_ambiguity_ratio"
+            ],
+            max_identity_tracks=values["max_identity_tracks"],
             object_dimensions_m=normalized_dimensions,
             object_local_size_xyz_m=normalized_local_sizes,
             pose_refinement_enabled=pose["enabled"],

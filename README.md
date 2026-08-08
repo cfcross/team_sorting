@@ -8,7 +8,7 @@
 旁路记录后续 ACT（动作分块 Transformer）/VLA（视觉—语言—动作模型）需要的数据。
 
 > 当前定位是“可导入、可测试、边界清晰的客户端骨架”，不是已经能完成比赛的成品。
-> 真实相机/YOLO/MMK2FK 联调、导航、抓放规划、机械臂执行和比赛闭环仍未完成。
+> 真实相机/YOLO/MMK2FK 联调、导航参数实测标定与全局路径规划、抓放规划、机械臂执行和比赛闭环仍未完成。
 
 ### Stage 2.2 Interface v1
 
@@ -135,10 +135,11 @@ Candidate 已执行、已发布或已被机器人采用。
                  rosbag + JSONL + metadata
 ```
 
-图中 Navigation、Arm Planning 和 Arm Execution 表示目标架构。当前 `team_client_node`
-尚未把完整导航与抓放算法接入控制循环；默认只生成底盘零速候选，不生成主动17维关节
-保持候选。ActionMux仍可基于实际反馈形成诊断FinalAction，但observe-only全局门禁止
-将其发布到官方控制话题。
+图中 Arm Planning 和 Arm Execution 仍主要表示目标架构。`team_client_node` 已在
+`NAV_TO_PICK`、`NAV_TO_PLACE`、`RETURN_END` 阶段把阶段入口生成的同一 `NavGoal`、
+新鲜 Odom、`NavigationController.update()`、`BaseCommand`、`ActionMux` 和真实
+`NavigationStatus` 串联；非导航阶段仍生成底盘零速候选，且不生成主动17维关节保持候选。
+默认 observe-only 全局门仍禁止把 `FinalAction` 发布到官方控制话题。
 
 ## 4. 三个 ROS2 节点
 
@@ -518,8 +519,9 @@ orphan 规则见
 
 运行参数以 `config/config.yaml` 为准，可通过 `TEAM_SORTING_CONFIG` 指向另一份完整配置。
 `perception.estimator_3d` 使用精确字段校验：旧的外部完整配置必须以当前默认配置为基线，
-补齐 `object_local_size_xyz_m` 下严格覆盖 `pink`、`yellow`、`brown` 的三项映射及完整
-`pose_refinement` 参数；缺失、
+补齐稳定身份重关联字段、`object_local_size_xyz_m` 下严格覆盖 `pink`、`yellow`、`brown`
+的三项映射及完整 `pose_refinement` 参数；`navigation` 同样必须精确覆盖当前
+`NavigationConfig` 的全部字段。缺失、
 多余或非法值都会使 PerceptionNode 拒绝启动，且不会退回复用中心补偿专用的
 `object_dimensions_m`。这是有意的失败关闭配置迁移，不是局部覆盖或向后兼容默认值。
 当前传感器、团队和官方控制话题如下：
@@ -561,9 +563,12 @@ orphan 规则见
 | `perception.stabilizer_2d.min_confirmed_hits` | `2` | 轨迹连续命中两帧后才输出稳定 `track_id` |
 | `perception.estimator_3d.ema_alpha` | `0.5` | 同一稳定 `track_id` 的三维中心 EMA 当前样本权重 |
 | `perception.estimator_3d.max_position_jump_m` | `1.0` | 单轨迹相邻三维中心最大允许跳变 |
+| `perception.estimator_3d.reassociation_*` | 见默认配置 | 二维可见片段中断后按 odom 三维事实恢复稳定 `object_id` 的年龄、距离、尺寸和歧义门限；均为早期仿真初值 |
+| `perception.estimator_3d.max_identity_tracks` | `128` | 活跃片段与休眠稳定身份缓存的硬上限 |
 | `perception.estimator_3d.object_dimensions_m.*` | `[0.24, 0.16, 0.19]` | 启发式中心补偿使用的宽、高、沿相机视线近似深度；不是物体局部XYZ尺寸 |
 | `perception.estimator_3d.object_local_size_xyz_m.*` | `[0.24, 0.16, 0.19]` | 官方模型确认的物体局部坐标系完整XYZ尺寸；只用于`size_xyz_m`，不推断姿态 |
 | `perception.estimator_3d.pose_refinement.*` | `enabled: false`，其余见默认配置 | 框内点云深度带、最少点数、连续帧数及位置/角度/尺寸误差门限；均为待真实相机标定的团队初值，正式联调前默认关闭 |
+| `navigation.*` | 见默认配置 | `NavigationConfig` 的完整显式映射；米、弧度、m/s、rad/s 与 ns 参数均为待官方仿真实测标定的保守初值 |
 | `recorder.enabled` | `false` | 默认不启动记录 |
 | `recorder.record_rosbag` | `true` | 启动 Recorder 时同时管理 rosbag |
 | `recorder.root_dir` | `./team_sorting_dataset` | Recorder schema v1 dataset root；旧扁平目录不自动迁移 |
@@ -591,8 +596,9 @@ orphan 规则见
 零；该静态模型事实本身不能产生实时姿态。启用 `pose_refinement` 后，估计器只取二维框
 内靠近可见表面深度的点，反投影到相机点云并变换到输出 frame；随后以 PCA 主轴和已知
 局部尺寸筛选长方体 OBB，得到点云拟合中心和局部轴到输出 frame 的 `xyzw` 四元数候选；
-只观测到单个表面时，结合相机位置与已知半尺寸从可见面恢复中心。同一稳定 `track_id`
-必须连续满足中心位置、角度和尺寸误差门限达到 `required_frames`，才原子输出 refined
+只观测到单个表面时，结合相机位置与已知半尺寸从可见面恢复中心。同一稳定 `object_id`
+对应的当前可见片段必须连续满足中心位置、角度和尺寸误差门限达到 `required_frames`，
+才原子输出 refined
 中心与姿态；否则继续输出原快速启发式中心且姿态为 `None`。中心对称长方体无法仅凭点云
 区分局部轴的 180° 符号翻转，代码固定选择
 同一有向包围盒中最接近单位姿态的等价代表，不能把它描述为恢复了 MJCF body 轴符号。
@@ -743,15 +749,16 @@ Run/Task/Attempt 层级；Segment 边界不被描述为正式训练 Episode 边�
 
 - 正式 YOLO/相机环境中的检测与二维稳定器参数联调；
 - 点云中心/姿态 refine 在正式相机噪声与遮挡下的参数标定，以及正式 ROS/MMK2FK 环境中的三维坐标、时间同步和 planning frame 端到端验证（通过前默认关闭）；
-- 抓取/放置站位生成、航点导航、精对准和底盘控制；
+- 导航参数的官方仿真实测标定、障碍物检测与全局路径规划；当前只有站位生成、局部精对准和比例控制闭环；
 - 由物体中心生成抓取/放置末端位姿，以及完整 IK/轨迹规划；
 - ArmExecution与ROS/FSM的运行时接线及官方环境参数标定；
 - 真实抓取验证、confirmed GraspContext、放置验证和失败恢复；
 - 除“REFINE_TARGET收到阶段进入后新鲜、唯一、几何收敛目标才提交TARGET_REFINED”外，业务结果驱动 FSM、底盘与机械臂协同的完整比赛闭环；
 - ACT/VLA 数据处理、训练和推理。
 
-当前 `team_client_node` 在默认控制周期中只创建零速 `BaseCommand`，机械臂业务候选为
-`None`；ActionMux基于实际反馈生成诊断FinalAction。默认observe-only不创建官方发布器，
+当前 `team_client_node` 在三个导航阶段使用导航控制器返回的短 TTL `BaseCommand`，其他
+普通阶段创建零速 `BaseCommand`，机械臂业务候选为 `None`；所有候选均经 ActionMux。
+默认observe-only不创建官方发布器，
 因此“生成诊断FinalAction”不等于“发送位置保持命令”。`create_hold_command()`仍保留给
 未来明确授权的主动保持场景。“仓库骨架完成”绝不等于“比赛代码完成”。
 
