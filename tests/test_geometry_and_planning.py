@@ -24,7 +24,7 @@ MMK2Kdl 适配与规划骨架；同时静态检查少量 config/launch 约定。
 """
 
 import math
-from dataclasses import replace
+from dataclasses import fields, replace
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -78,6 +78,7 @@ from team_sorting.ros_nodes import (
     _arm_planning_config_from_config,
     _estimates_from_vision,
     _estimates_to_vision,
+    _navigation_config_from_config,
     _perception_pipeline_from_config,
     _validate_vision_schema,
 )
@@ -1005,10 +1006,12 @@ def test_config_numeric_types_finiteness_and_ranges() -> None:
     perception = config["perception"]
     fsm = config["fsm"]
     action_mux = config["action_mux"]
+    navigation = config["navigation"]
     assert isinstance(timing, dict)
     assert isinstance(perception, dict)
     assert isinstance(fsm, dict)
     assert isinstance(action_mux, dict)
+    assert isinstance(navigation, dict)
 
     assert _strict_finite_number(timing["control_rate_hz"]) > 0.0
     assert _strict_finite_number(timing["command_ttl_s"]) > 0.0
@@ -1037,6 +1040,12 @@ def test_config_numeric_types_finiteness_and_ranges() -> None:
         "converge_frames",
         "max_track_age_s",
         "max_position_jump_m",
+        "reassociation_enabled",
+        "reassociation_max_age_s",
+        "reassociation_max_distance_m",
+        "reassociation_size_tolerance_ratio",
+        "reassociation_ambiguity_ratio",
+        "max_identity_tracks",
         "object_dimensions_m",
         "object_local_size_xyz_m",
         "pose_refinement",
@@ -1046,6 +1055,20 @@ def test_config_numeric_types_finiteness_and_ranges() -> None:
     assert _strict_finite_number(estimator["ema_alpha"]) > 0.0
     assert _strict_finite_number(estimator["max_track_age_s"]) > 0.0
     assert _strict_finite_number(estimator["max_position_jump_m"]) > 0.0
+    assert estimator["reassociation_enabled"] is True
+    assert _strict_finite_number(estimator["reassociation_max_age_s"]) > 0.0
+    assert _strict_finite_number(estimator["reassociation_max_distance_m"]) > 0.0
+    reassociation_size_tolerance = _strict_finite_number(
+        estimator["reassociation_size_tolerance_ratio"]
+    )
+    assert 0.0 <= reassociation_size_tolerance <= 1.0
+    assert _strict_finite_number(estimator["reassociation_ambiguity_ratio"]) > 1.0
+    max_identity_tracks = estimator["max_identity_tracks"]
+    assert (
+        isinstance(max_identity_tracks, int)
+        and not isinstance(max_identity_tracks, bool)
+        and max_identity_tracks > 0
+    )
     dimensions = estimator["object_dimensions_m"]
     assert isinstance(dimensions, dict)
     assert set(dimensions) == set(OfficialYoloAdapter.CLASS_NAMES)
@@ -1088,6 +1111,24 @@ def test_config_numeric_types_finiteness_and_ranges() -> None:
     assert isinstance(retry_count, int) and not isinstance(retry_count, bool) and retry_count >= 0
     assert _strict_finite_number(action_mux["max_abs_base_v"]) >= 0.0
     assert _strict_finite_number(action_mux["max_abs_base_w"]) >= 0.0
+    assert set(navigation) == {field.name for field in fields(NavigationConfig)}
+    parsed_navigation = _navigation_config_from_config(config)
+    assert parsed_navigation.max_abs_v_mps == pytest.approx(0.25)
+    assert parsed_navigation.max_abs_w_radps == pytest.approx(0.5)
+    assert parsed_navigation.settled_required_cycles == 3
+
+
+def test_navigation_config_mapping_rejects_missing_and_unknown_fields() -> None:
+    config = _project_config()
+    missing = {**config, "navigation": dict(config["navigation"])}
+    missing["navigation"].pop("command_ttl_ns")
+    with pytest.raises(ValueError, match="command_ttl_ns"):
+        _navigation_config_from_config(missing)
+
+    unknown = {**config, "navigation": dict(config["navigation"])}
+    unknown["navigation"]["hidden_default"] = 1
+    with pytest.raises(ValueError, match="hidden_default"):
+        _navigation_config_from_config(unknown)
 
 
 @pytest.mark.parametrize(
@@ -1989,6 +2030,8 @@ def test_perception_3d_multiframe_ema_and_confidence_converge() -> None:
     assert [result.confidence for result in outputs] == pytest.approx(
         [0.1, 0.2, 0.3, 0.4]
     )
+    assert len({result.object_id for result in outputs}) == 1
+    assert outputs[0].object_id == "odom-object:0"
 
 
 def test_perception_3d_confidence_uses_valid_depth_fraction_and_stays_in_range() -> None:
@@ -2079,6 +2122,7 @@ def test_perception_3d_untracked_inputs_never_share_persistent_ema() -> None:
 
     assert first.position_xyz[2] == pytest.approx(1.1)
     assert second.position_xyz[2] == pytest.approx(2.1)
+    assert first.object_id is None and second.object_id is None
     assert estimator._tracks == {}
 
 
@@ -2198,7 +2242,9 @@ def test_perception_3d_same_region_same_class_targets_keep_distinct_tracks() -> 
     assert first.valid and second.valid
     assert first.position_xyz[2] == pytest.approx(1.1)
     assert second.position_xyz[2] == pytest.approx(2.1)
-    assert set(estimator._tracks) == {"stable:21", "stable:22"}
+    assert first.object_id != second.object_id
+    assert first.object_id == "odom-object:0"
+    assert second.object_id == "odom-object:1"
 
 
 def test_perception_3d_order_reversal_keeps_moderately_moving_tracks_distinct() -> None:
@@ -2706,8 +2752,7 @@ def test_perception_3d_detects_track_id_swap_on_crossing() -> None:
         _base(),
         _actual_joints(),
     )
-    old_left = tuple(estimator._tracks["stable:31"].ema)
-    old_right = tuple(estimator._tracks["stable:32"].ema)
+    old_ids = tuple(result.object_id for result in first)
 
     swapped = estimator.estimate(
         (
@@ -2734,8 +2779,25 @@ def test_perception_3d_detects_track_id_swap_on_crossing() -> None:
         "ID交换" in result.failure_reason or "一致性校验失败" in result.failure_reason
         for result in swapped
     )
-    assert estimator._tracks["stable:31"].ema == pytest.approx(old_left)
-    assert estimator._tracks["stable:32"].ema == pytest.approx(old_right)
+    resumed = estimator.estimate(
+        (
+            _estimator_detection(
+                bbox_xyxy=(279.0, 239.0, 283.0, 243.0),
+                timestamp_ns=102,
+                track_id=31,
+            ),
+            _estimator_detection(
+                bbox_xyxy=(357.0, 239.0, 361.0, 243.0),
+                timestamp_ns=102,
+                track_id=32,
+            ),
+        ),
+        _estimator_depth(1000.0, 102),
+        _intrinsics(timestamp_ns=102),
+        _base(),
+        _actual_joints(),
+    )
+    assert tuple(result.object_id for result in resumed) == old_ids
 
 
 def test_perception_3d_occlusion_recovery_keeps_track() -> None:
@@ -2779,7 +2841,8 @@ def test_perception_3d_occlusion_recovery_keeps_track() -> None:
     assert first.valid and recovered.valid
     assert recovered.position_xyz[2] == pytest.approx(1.15)
     assert "ID交换" not in recovered.failure_reason
-    assert estimator._tracks["stable:41"].count == 2
+    assert recovered.object_id == first.object_id
+    assert recovered.confidence == pytest.approx(first.confidence * 2.0)
 
 
 def test_perception_3d_complete_overlap_is_fail_closed() -> None:
@@ -2835,6 +2898,441 @@ def test_perception_3d_duplicate_track_id_fails_both_detections_closed() -> None
     assert all(not result.valid for result in results)
     assert all("轨迹ID重复" in result.failure_reason for result in results)
     assert estimator._tracks == {}
+
+
+def _reassociation_estimator(**overrides: object) -> Perception3DEstimator:
+    parameters: dict[str, object] = {
+        "converge_frames": 1,
+        "max_track_age_s": 0.5,
+        "object_dimensions_m": {
+            "pink": (0.1, 0.1, 0.2),
+            "yellow": (0.1, 0.1, 0.2),
+        },
+        "object_local_size_xyz_m": {
+            "pink": (0.1, 0.1, 0.2),
+            "yellow": (0.1, 0.1, 0.2),
+        },
+        "reassociation_enabled": True,
+        "reassociation_max_age_s": 10.0,
+        "reassociation_max_distance_m": 0.3,
+        "reassociation_size_tolerance_ratio": 0.25,
+        "reassociation_ambiguity_ratio": 1.2,
+        "max_identity_tracks": 16,
+    }
+    parameters.update(overrides)
+    return Perception3DEstimator(
+        _OffsetTransformProvider(),
+        **parameters,  # type: ignore[arg-type]
+    )
+
+
+def test_perception_3d_changed_2d_id_recovers_stable_3d_identity() -> None:
+    estimator = _reassociation_estimator()
+    first = estimator.estimate(
+        (_estimator_detection(timestamp_ns=1_000_000_000, track_id=1),),
+        _estimator_depth(1000.0, 1_000_000_000),
+        _intrinsics(timestamp_ns=1_000_000_000),
+        _base(),
+        _actual_joints(),
+    )[0]
+    assert estimator.estimate(
+        (),
+        _estimator_depth(0.0, 2_000_000_000),
+        _intrinsics(timestamp_ns=2_000_000_000),
+        _base(),
+        _actual_joints(),
+    ) == ()
+    recovered = estimator.estimate(
+        (_estimator_detection(timestamp_ns=3_000_000_000, track_id=99),),
+        _estimator_depth(1200.0, 3_000_000_000),
+        _intrinsics(timestamp_ns=3_000_000_000),
+        _base(),
+        _actual_joints(),
+    )[0]
+
+    assert first.valid and recovered.valid
+    assert recovered.object_id == first.object_id
+    assert recovered.object_id != "stable:99"
+    # 新片段必须从当前帧中心重建，不能把旧EMA混入1.3m结果。
+    assert recovered.position_xyz[2] == pytest.approx(1.3)
+    assert recovered.confidence == pytest.approx(first.confidence)
+
+
+def test_perception_3d_reassociation_restarts_point_cloud_pose_convergence() -> None:
+    estimator = _reassociation_estimator(
+        pose_refinement_enabled=True,
+        pose_required_frames=2,
+    )
+    candidate = ((0.0, 0.0, 1.1), (0.0, 0.0, 0.0, 1.0))
+    estimator._point_cloud_pose_candidate = lambda *args: candidate  # type: ignore[method-assign]
+    first = estimator.estimate(
+        (_estimator_detection(timestamp_ns=1_000_000_000, track_id=1),),
+        _estimator_depth(1000.0, 1_000_000_000),
+        _intrinsics(timestamp_ns=1_000_000_000),
+        _base(),
+        _actual_joints(),
+    )[0]
+    converged = estimator.estimate(
+        (_estimator_detection(timestamp_ns=1_100_000_000, track_id=1),),
+        _estimator_depth(1000.0, 1_100_000_000),
+        _intrinsics(timestamp_ns=1_100_000_000),
+        _base(),
+        _actual_joints(),
+    )[0]
+    estimator.estimate(
+        (),
+        _estimator_depth(0.0, 2_000_000_000),
+        _intrinsics(timestamp_ns=2_000_000_000),
+        _base(),
+        _actual_joints(),
+    )
+    recovered = estimator.estimate(
+        (_estimator_detection(timestamp_ns=3_000_000_000, track_id=2),),
+        _estimator_depth(1000.0, 3_000_000_000),
+        _intrinsics(timestamp_ns=3_000_000_000),
+        _base(),
+        _actual_joints(),
+    )[0]
+
+    assert first.orientation_xyzw is None
+    assert converged.orientation_xyzw == pytest.approx((0.0, 0.0, 0.0, 1.0))
+    assert recovered.object_id == first.object_id
+    assert recovered.orientation_xyzw is None
+    assert "pending (1/2)" in recovered.failure_reason
+
+
+def test_perception_3d_reassociates_two_separated_objects_one_to_one_order_independent() -> None:
+    def run(reverse: bool) -> dict[float, str | None]:
+        estimator = _reassociation_estimator()
+        first = (
+            _estimator_detection(
+                bbox_xyxy=(279.0, 239.0, 283.0, 243.0),
+                timestamp_ns=1_000_000_000,
+                track_id=1,
+            ),
+            _estimator_detection(
+                bbox_xyxy=(357.0, 239.0, 361.0, 243.0),
+                timestamp_ns=1_000_000_000,
+                track_id=2,
+            ),
+        )
+        estimator.estimate(
+            tuple(reversed(first)) if reverse else first,
+            _estimator_depth(1000.0, 1_000_000_000),
+            _intrinsics(timestamp_ns=1_000_000_000),
+            _base(),
+            _actual_joints(),
+        )
+        estimator.estimate(
+            (),
+            _estimator_depth(0.0, 2_000_000_000),
+            _intrinsics(timestamp_ns=2_000_000_000),
+            _base(),
+            _actual_joints(),
+        )
+        current = (
+            _estimator_detection(
+                bbox_xyxy=(357.0, 239.0, 361.0, 243.0),
+                timestamp_ns=3_000_000_000,
+                track_id=102,
+            ),
+            _estimator_detection(
+                bbox_xyxy=(279.0, 239.0, 283.0, 243.0),
+                timestamp_ns=3_000_000_000,
+                track_id=101,
+            ),
+        )
+        supplied = tuple(reversed(current)) if reverse else current
+        results = estimator.estimate(
+            supplied,
+            _estimator_depth(1000.0, 3_000_000_000),
+            _intrinsics(timestamp_ns=3_000_000_000),
+            _base(),
+            _actual_joints(),
+        )
+        assert all(result.valid for result in results)
+        return {
+            round(result.position_xyz[0], 6): result.object_id
+            for result in results
+        }
+
+    assert run(False) == run(True)
+
+
+def test_perception_3d_reassociation_ambiguous_histories_fail_closed() -> None:
+    estimator = _reassociation_estimator()
+    estimator.estimate(
+        (
+            _estimator_detection(
+                bbox_xyxy=(299.0, 239.0, 303.0, 243.0),
+                timestamp_ns=1_000_000_000,
+                track_id=1,
+            ),
+            _estimator_detection(
+                bbox_xyxy=(337.0, 239.0, 341.0, 243.0),
+                timestamp_ns=1_000_000_000,
+                track_id=2,
+            ),
+        ),
+        _estimator_depth(1000.0, 1_000_000_000),
+        _intrinsics(timestamp_ns=1_000_000_000),
+        _base(),
+        _actual_joints(),
+    )
+    estimator.estimate(
+        (),
+        _estimator_depth(0.0, 2_000_000_000),
+        _intrinsics(timestamp_ns=2_000_000_000),
+        _base(),
+        _actual_joints(),
+    )
+    ambiguous = estimator.estimate(
+        (_estimator_detection(timestamp_ns=3_000_000_000, track_id=3),),
+        _estimator_depth(1000.0, 3_000_000_000),
+        _intrinsics(timestamp_ns=3_000_000_000),
+        _base(),
+        _actual_joints(),
+    )[0]
+
+    assert not ambiguous.valid
+    assert ambiguous.object_id is None
+    assert "候选歧义" in ambiguous.failure_reason
+
+
+def test_perception_3d_two_observations_competing_for_history_fail_closed() -> None:
+    estimator = _reassociation_estimator()
+    first = estimator.estimate(
+        (_estimator_detection(timestamp_ns=1_000_000_000, track_id=1),),
+        _estimator_depth(1000.0, 1_000_000_000),
+        _intrinsics(timestamp_ns=1_000_000_000),
+        _base(),
+        _actual_joints(),
+    )[0]
+    estimator.estimate(
+        (),
+        _estimator_depth(0.0, 2_000_000_000),
+        _intrinsics(timestamp_ns=2_000_000_000),
+        _base(),
+        _actual_joints(),
+    )
+    results = estimator.estimate(
+        (
+            _estimator_detection(
+                bbox_xyxy=(317.0, 239.0, 319.0, 241.0),
+                timestamp_ns=3_000_000_000,
+                track_id=2,
+            ),
+            _estimator_detection(
+                bbox_xyxy=(321.0, 239.0, 323.0, 241.0),
+                timestamp_ns=3_000_000_000,
+                track_id=3,
+            ),
+        ),
+        _estimator_depth(1000.0, 3_000_000_000),
+        _intrinsics(timestamp_ns=3_000_000_000),
+        _base(),
+        _actual_joints(),
+    )
+
+    assert first.valid
+    assert all(not result.valid for result in results)
+    assert all("多个当前观测竞争" in result.failure_reason for result in results)
+
+
+@pytest.mark.parametrize("gate", ("class", "distance", "age", "size"))
+def test_perception_3d_reassociation_gates_create_new_identity(gate: str) -> None:
+    estimator = _reassociation_estimator(
+        reassociation_max_age_s=2.0 if gate == "age" else 10.0,
+        reassociation_max_distance_m=0.1 if gate == "distance" else 0.3,
+    )
+    first = estimator.estimate(
+        (_estimator_detection(timestamp_ns=1_000_000_000, track_id=1),),
+        _estimator_depth(1000.0, 1_000_000_000),
+        _intrinsics(timestamp_ns=1_000_000_000),
+        _base(),
+        _actual_joints(),
+    )[0]
+    estimator.estimate(
+        (),
+        _estimator_depth(0.0, 2_000_000_000),
+        _intrinsics(timestamp_ns=2_000_000_000),
+        _base(),
+        _actual_joints(),
+    )
+    if gate == "size":
+        # 模拟后续经批准的运行时尺寸来源发生明显变化；只观察公开输出身份。
+        estimator._local_sizes["pink"] = (0.2, 0.2, 0.4)
+    timestamp_ns = 4_000_000_000 if gate == "age" else 3_000_000_000
+    current_class = "yellow" if gate == "class" else "pink"
+    depth_mm = 1500.0 if gate == "distance" else 1000.0
+    current = estimator.estimate(
+        (
+            _estimator_detection(
+                current_class, timestamp_ns=timestamp_ns, track_id=2
+            ),
+        ),
+        _estimator_depth(depth_mm, timestamp_ns),
+        _intrinsics(timestamp_ns=timestamp_ns),
+        _base(),
+        _actual_joints(),
+    )[0]
+
+    assert first.valid and current.valid
+    assert current.object_id != first.object_id
+
+
+def test_perception_3d_stale_frame_does_not_change_identity_history() -> None:
+    estimator = _reassociation_estimator()
+    first = estimator.estimate(
+        (_estimator_detection(timestamp_ns=2_000_000_000, track_id=1),),
+        _estimator_depth(1000.0, 2_000_000_000),
+        _intrinsics(timestamp_ns=2_000_000_000),
+        _base(),
+        _actual_joints(),
+    )[0]
+    stale = estimator.estimate(
+        (_estimator_detection(timestamp_ns=1_000_000_000, track_id=2),),
+        _estimator_depth(1000.0, 1_000_000_000),
+        _intrinsics(timestamp_ns=1_000_000_000),
+        _base(),
+        _actual_joints(),
+    )[0]
+    resumed = estimator.estimate(
+        (_estimator_detection(timestamp_ns=3_000_000_000, track_id=1),),
+        _estimator_depth(1000.0, 3_000_000_000),
+        _intrinsics(timestamp_ns=3_000_000_000),
+        _base(),
+        _actual_joints(),
+    )[0]
+
+    assert not stale.valid and "陈旧感知帧" in stale.failure_reason
+    assert resumed.object_id == first.object_id
+
+
+def test_perception_3d_identity_capacity_fails_without_evicting_current_frame() -> None:
+    estimator = _reassociation_estimator(max_identity_tracks=1)
+    results = estimator.estimate(
+        (
+            _estimator_detection(
+                bbox_xyxy=(279.0, 239.0, 283.0, 243.0), track_id=1
+            ),
+            _estimator_detection(
+                bbox_xyxy=(357.0, 239.0, 361.0, 243.0), track_id=2
+            ),
+        ),
+        _estimator_depth(1000.0, 100),
+        _intrinsics(timestamp_ns=100),
+        _base(),
+        _actual_joints(),
+    )
+
+    assert sum(result.valid for result in results) == 1
+    assert any("缓存已满" in result.failure_reason for result in results)
+
+
+def test_perception_3d_identity_capacity_evicts_oldest_noncurrent_history() -> None:
+    estimator = _reassociation_estimator(
+        max_identity_tracks=2,
+        reassociation_max_distance_m=0.1,
+    )
+    first = estimator.estimate(
+        (_estimator_detection(timestamp_ns=1_000_000_000, track_id=1),),
+        _estimator_depth(1000.0, 1_000_000_000),
+        _intrinsics(timestamp_ns=1_000_000_000),
+        _base(),
+        _actual_joints(),
+    )[0]
+    second = estimator.estimate(
+        (
+            _estimator_detection(
+                "yellow", timestamp_ns=1_100_000_000, track_id=2
+            ),
+        ),
+        _estimator_depth(1000.0, 1_100_000_000),
+        _intrinsics(timestamp_ns=1_100_000_000),
+        _base(),
+        _actual_joints(),
+    )[0]
+    estimator.estimate(
+        (),
+        _estimator_depth(0.0, 2_000_000_000),
+        _intrinsics(timestamp_ns=2_000_000_000),
+        _base(),
+        _actual_joints(),
+    )
+    third = estimator.estimate(
+        (_estimator_detection(timestamp_ns=3_000_000_000, track_id=3),),
+        _estimator_depth(1500.0, 3_000_000_000),
+        _intrinsics(timestamp_ns=3_000_000_000),
+        _base(),
+        _actual_joints(),
+    )[0]
+    old_location_again = estimator.estimate(
+        (_estimator_detection(timestamp_ns=4_000_000_000, track_id=4),),
+        _estimator_depth(1000.0, 4_000_000_000),
+        _intrinsics(timestamp_ns=4_000_000_000),
+        _base(),
+        _actual_joints(),
+    )[0]
+
+    assert first.valid and second.valid and third.valid and old_location_again.valid
+    assert third.object_id not in {first.object_id, second.object_id}
+    assert old_location_again.object_id != first.object_id
+
+
+def test_perception_3d_reset_starts_new_identity_lifecycle_and_smaller_time() -> None:
+    estimator = _reassociation_estimator()
+    first = estimator.estimate(
+        (_estimator_detection(timestamp_ns=5_000_000_000, track_id=7),),
+        _estimator_depth(1000.0, 5_000_000_000),
+        _intrinsics(timestamp_ns=5_000_000_000),
+        _base(),
+        _actual_joints(),
+    )[0]
+    estimator.reset_tracks()
+    restarted = estimator.estimate(
+        (_estimator_detection(timestamp_ns=100, track_id=8),),
+        _estimator_depth(1200.0, 100),
+        _intrinsics(timestamp_ns=100),
+        _base(),
+        _actual_joints(),
+    )[0]
+
+    assert first.valid and restarted.valid
+    assert restarted.object_id == "odom-object:0"
+    assert restarted.position_xyz[2] == pytest.approx(1.3)
+
+
+@pytest.mark.parametrize(
+    ("keyword", "value"),
+    (
+        ("reassociation_enabled", 1),
+        ("reassociation_max_age_s", float("nan")),
+        ("reassociation_max_distance_m", True),
+        ("reassociation_size_tolerance_ratio", 1.1),
+        ("reassociation_ambiguity_ratio", 1.0),
+        ("max_identity_tracks", True),
+        ("max_identity_tracks", 0),
+    ),
+)
+def test_perception_3d_rejects_invalid_reassociation_parameters(
+    keyword: str, value: object
+) -> None:
+    with pytest.raises(ValueError, match=keyword):
+        Perception3DEstimator(
+            _OffsetTransformProvider(),
+            **{keyword: value},
+        )
+
+
+def test_perception_3d_rejects_reassociation_window_shorter_than_active_window() -> None:
+    with pytest.raises(ValueError, match="reassociation_max_age_s"):
+        Perception3DEstimator(
+            _OffsetTransformProvider(),
+            reassociation_enabled=True,
+            max_track_age_s=1.0,
+            reassociation_max_age_s=0.1,
+        )
 
 
 def test_camera_transform_rejects_frame_id_mismatch() -> None:

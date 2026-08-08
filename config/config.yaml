@@ -105,6 +105,14 @@ perception:
     max_track_age_s: 1.0
     # 相邻稳定轨迹的三维中心若跳变超过该值则作为离群值拒绝，不污染EMA。
     max_position_jump_m: 1.0
+    # Odom三维稳定身份重关联；以下均为团队早期仿真初值，不是赛事正式阈值。
+    # 二维track_id仅代表连续可见片段，稳定object_id由Perception3DEstimator生成。
+    reassociation_enabled: true
+    reassociation_max_age_s: 30.0       # s，休眠身份参与重关联的最长时间
+    reassociation_max_distance_m: 0.5   # m，当前Odom表面点与历史位置的最大距离
+    reassociation_size_tolerance_ratio: 0.25  # 无单位，局部XYZ尺寸最大相对误差
+    reassociation_ambiguity_ratio: 1.2  # 无单位，最佳/次佳代价过近时失败关闭
+    max_identity_tracks: 128            # 活跃片段与休眠身份总数硬上限
     # 顺序为[width_m,height_m,camera_ray_depth_extent_m]，当前只服务启发式中心补偿。
     # 它不是随机yaw下经过frame语义确认的物体局部XYZ尺寸，不得写入size_xyz_m。数值来自正式
     # material_sorting/mjcf/material_competition.xml：三类movable_box的MuJoCo
@@ -200,6 +208,26 @@ arm_execution:
 fsm:
   # 客户端在抓取失败后重新进入REFINE_TARGET的次数，不等于裁判允许的总尝试规则。
   max_pick_retries: 1
+
+# NavigationConfig完整显式映射。数值均为团队早期官方仿真联调初值，尚需实测标定；
+# 当前控制器只做局部站位和比例控制，不包含障碍物检测或全局路径规划。
+navigation:
+  standoff_m: 0.60                         # m
+  position_tolerance_m: 0.05               # m
+  yaw_tolerance_rad: 0.10                  # rad
+  goal_timeout_ns: 30000000000             # ns
+  command_ttl_ns: 200000000                # ns
+  odom_max_age_ns: 150000000               # ns
+  target_max_age_ns: 150000000             # ns
+  max_abs_v_mps: 0.25                      # m/s
+  max_abs_w_radps: 0.50                    # rad/s
+  linear_kp: 0.8                           # (m/s)/m
+  angular_kp: 1.5                          # (rad/s)/rad
+  heading_stop_rad: 0.7853981633974483     # rad，pi/4
+  max_settled_linear_speed_mps: 0.01       # m/s
+  max_settled_angular_speed_radps: 0.02    # rad/s
+  settled_required_cycles: 3               # 不同Odom帧的连续停稳周期数
+  settled_max_odom_gap_ns: 200000000       # ns
 
 # 轴对齐区域顺序：[xmin,xmax,ymin,ymax,zmin,zmax]，单位米，必须和frames.planning一致。
 # 当前每组最小值大于最大值是故意的安全占位，使分类返回UNKNOWN而不是猜测桌面/货架。

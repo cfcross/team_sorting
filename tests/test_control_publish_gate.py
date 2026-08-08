@@ -25,6 +25,8 @@ from team_sorting.interfaces import (
     GlobalPhase,
     LocalPhase,
     ManipulationCommand,
+    NavGoal,
+    NavigationStatus,
     ObjectEstimate3D,
     RobotJointState,
     SensorSnapshot,
@@ -32,6 +34,7 @@ from team_sorting.interfaces import (
 )
 from team_sorting.ros_nodes import (
     _base_planar_transform_snapshot,
+    _create_perception_node,
     _create_team_client_node,
     _internal_fsm_publish_authorization,
     _select_target_estimate,
@@ -706,6 +709,9 @@ def test_complete_arm_execution_config_constructs_controller_only_once(
 
 def _dirty_runtime_wiring(node: Any) -> None:
     state = node._runtime_wiring
+    state.phase_entered_ns = 123
+    state.search_target = _estimate("search-old", 0.8)
+    state.refined_target = _estimate("refined-old", 0.8)
     state.active_target = _estimate("old", 0.8)
     state.preferred_object_id = "old"
     state.active_nav_goal = object()
@@ -719,13 +725,20 @@ def _dirty_runtime_wiring(node: Any) -> None:
     state.place_observation_before_release = _estimate("old", 0.8)
     state.latest_place_verification_observation = _estimate("old", 0.8)
     state.last_navigation_status = object()
+    state.navigation_success_submitted = True
+    state.navigation_failure_submitted = True
+    state.navigation_diagnostic = "old navigation"
     state.last_manipulation_status = object()
     state.phase_event_keys.add(("old",))
     state.phase_entry_failure_reason = "old failure"
+    node._latest_estimates = (_estimate("cached-old", 0.9),)
 
 
 def _assert_runtime_payload_cleared(node: Any) -> None:
     state = node._runtime_wiring
+    assert state.phase_entered_ns is None
+    assert state.search_target is None
+    assert state.refined_target is None
     assert state.active_target is None
     assert state.preferred_object_id == ""
     assert state.active_nav_goal is None
@@ -739,9 +752,73 @@ def _assert_runtime_payload_cleared(node: Any) -> None:
     assert state.place_observation_before_release is None
     assert state.latest_place_verification_observation is None
     assert state.last_navigation_status is None
+    assert not state.navigation_success_submitted
+    assert not state.navigation_failure_submitted
+    assert state.navigation_diagnostic == ""
     assert state.last_manipulation_status is None
     assert state.phase_event_keys == set()
     assert state.phase_entry_failure_reason == ""
+    assert node._latest_estimates == ()
+
+
+def test_perception_identity_resets_only_at_context_and_fsm_reset_boundaries() -> None:
+    perception_class = _create_perception_node(_ros())
+    node = perception_class.__new__(perception_class)
+    _Node.__init__(node, "perception_node_test")
+    calls = {"stabilizer": 0, "estimator": 0}
+    node._stabilizer = SimpleNamespace(
+        reset=lambda: calls.__setitem__("stabilizer", calls["stabilizer"] + 1)
+    )
+    node._estimator = SimpleNamespace(
+        reset_tracks=lambda: calls.__setitem__("estimator", calls["estimator"] + 1)
+    )
+    node._last_frame_issue = ""
+    node._identity_context_key = None
+    node._last_identity_fsm_phase = None
+    task = _task()
+
+    def context(*, attempt: int = 0, finished: bool = False) -> CompetitionContext:
+        return CompetitionContext(
+            schema_name="team_sorting.competition_context",
+            schema_version=1,
+            run_id="run-1",
+            task_set_fingerprint="fingerprint",
+            current_task_id=None if finished else 1,
+            current_attempt_count=attempt,
+            elapsed_sim_s=1.0,
+            score=0,
+            best_scores=(0, 0, 0),
+            current_step="-",
+            finished=finished,
+            active_task=None if finished else task,
+            instruction_timestamp_ns=NOW - 100,
+            referee_timestamp_ns=NOW - 50,
+            valid=True,
+            failure_reason="",
+        )
+
+    node._on_competition_context(_message(context().to_json()))
+    assert calls == {"stabilizer": 0, "estimator": 0}
+
+    # 同一任务的正常视觉/导航阶段变化不得破坏稳定身份。
+    for phase in (
+        GlobalPhase.SEARCH_TARGET,
+        GlobalPhase.NAV_TO_PICK,
+        GlobalPhase.REFINE_TARGET,
+    ):
+        status = FSMStatus(1, phase, LocalPhase.IDLE, 0, False, "", NOW)
+        node._on_fsm_status(_message(ros_nodes_module.fsm_status_to_json(status)))
+    assert calls == {"stabilizer": 0, "estimator": 0}
+
+    node._on_competition_context(_message(context(attempt=1).to_json()))
+    assert calls == {"stabilizer": 1, "estimator": 1}
+    reset_status = FSMStatus(
+        1, GlobalPhase.WAIT_READY, LocalPhase.IDLE, 0, False, "", NOW
+    )
+    node._on_fsm_status(_message(ros_nodes_module.fsm_status_to_json(reset_status)))
+    assert calls == {"stabilizer": 2, "estimator": 2}
+    node._on_competition_context(_message(context(attempt=1, finished=True).to_json()))
+    assert calls == {"stabilizer": 3, "estimator": 3}
 
 
 def test_task_and_attempt_transitions_clear_all_runtime_wiring() -> None:
@@ -817,6 +894,294 @@ def test_phase_entry_runs_once_per_phase_and_rearms_on_change() -> None:
     assert node._runtime_wiring.phase_generation == generation + 1
     assert node._runtime_wiring.preferred_object_id == "selected-after-entry"
     assert node._runtime_wiring.active_target is None
+
+
+def test_navigation_pick_goal_is_built_once_and_reused_for_every_update() -> None:
+    node = _node()
+    goal = NavGoal(
+        "pick-goal", "pick", (0.4, 0.0, 0.0), "odom", 0.05, 0.1, NOW + 1_000
+    )
+    calls: dict[str, list[object]] = {"build": [], "update": []}
+
+    class NavigationSpy:
+        def build_pick_goal(
+            self,
+            task: TaskSpec,
+            target: ObjectEstimate3D,
+            base: BaseState,
+            timestamp_ns: int,
+        ) -> NavGoal:
+            calls["build"].append((task, target, base, timestamp_ns))
+            return goal
+
+        def update(
+            self, base: BaseState, supplied_goal: NavGoal, timestamp_ns: int
+        ) -> tuple[BaseCommand, NavigationStatus]:
+            calls["update"].append((base, supplied_goal, timestamp_ns))
+            return (
+                BaseCommand(0.1, 0.0, timestamp_ns, timestamp_ns + 100),
+                NavigationStatus(
+                    supplied_goal.goal_id,
+                    "moving",
+                    0.4,
+                    0.0,
+                    False,
+                    "",
+                    timestamp_ns,
+                ),
+            )
+
+    node._navigation = NavigationSpy()
+    node._runtime_wiring.search_target = _estimate("stable-target", 0.9)
+    snapshot = SensorSnapshot(_task(), _base(), _joints(), (), NOW, True)
+    status = FSMStatus(1, GlobalPhase.NAV_TO_PICK, LocalPhase.IDLE, 0, False, "", NOW)
+
+    assert node._handle_phase_entry(snapshot, status, None, NOW)
+    assert not node._handle_phase_entry(snapshot, status, None, NOW + 1)
+    assert node._runtime_wiring.active_nav_goal is goal
+    node._compute_candidate_commands(snapshot, status, NOW)
+    node._compute_candidate_commands(snapshot, status, NOW + 1)
+
+    assert len(calls["build"]) == 1
+    assert [call[1] for call in calls["update"]] == [goal, goal]
+
+
+@pytest.mark.parametrize(
+    ("phase", "expected_event"),
+    (
+        (GlobalPhase.NAV_TO_PICK, FSMEvent.PICK_NAV_REACHED),
+        (GlobalPhase.NAV_TO_PLACE, FSMEvent.PLACE_NAV_REACHED),
+        (GlobalPhase.RETURN_END, FSMEvent.RETURN_REACHED),
+    ),
+)
+def test_navigation_arrival_emits_matching_real_feedback_once(
+    phase: GlobalPhase, expected_event: FSMEvent
+) -> None:
+    node = _node()
+    state = node._runtime_wiring
+    state.run_id = "run-1"
+    state.task_id = 1
+    state.attempt = 0
+    state.active_nav_goal = NavGoal(
+        "goal-a", "test", (0.0, 0.0, 0.0), "odom", 0.05, 0.1, NOW + 1_000
+    )
+
+    class ArrivedNavigation:
+        def update(
+            self, _base_state: BaseState, supplied_goal: NavGoal, timestamp_ns: int
+        ) -> tuple[BaseCommand, NavigationStatus]:
+            return (
+                BaseCommand(0.0, 0.0, timestamp_ns, timestamp_ns + 100),
+                NavigationStatus(
+                    supplied_goal.goal_id,
+                    "arrived",
+                    0.0,
+                    0.0,
+                    True,
+                    "",
+                    timestamp_ns,
+                ),
+            )
+
+    node._navigation = ArrivedNavigation()
+    snapshot = SensorSnapshot(_task(), _base(), _joints(), (), NOW, True)
+    status = FSMStatus(1, phase, LocalPhase.IDLE, 0, False, "", NOW)
+
+    first = node._run_current_phase(snapshot, status, None, NOW)
+    second = node._run_current_phase(snapshot, status, None, NOW)
+
+    assert first[0] is not None and first[0].valid
+    assert (first[0].v, first[0].w) == (0.0, 0.0)
+    assert first[2] is not None
+    assert first[2].event is expected_event
+    assert first[2].goal_id == "goal-a"
+    assert first[2].confirmed_by_real_feedback
+    assert second[2] is None
+
+
+def test_navigation_goal_identity_mismatch_fails_once_with_invalid_zero_base() -> None:
+    node = _node()
+    state = node._runtime_wiring
+    state.run_id = "run-1"
+    state.task_id = 1
+    state.attempt = 0
+    state.active_nav_goal = NavGoal(
+        "goal-a", "pick", (0.4, 0.0, 0.0), "odom", 0.05, 0.1, NOW + 1_000
+    )
+
+    class WrongGoalNavigation:
+        def update(
+            self, _base_state: BaseState, _goal: NavGoal, timestamp_ns: int
+        ) -> tuple[BaseCommand, NavigationStatus]:
+            return (
+                BaseCommand(0.2, 0.1, timestamp_ns, timestamp_ns + 100),
+                NavigationStatus(
+                    "other-goal", "moving", 1.0, 0.0, False, "", timestamp_ns
+                ),
+            )
+
+    node._navigation = WrongGoalNavigation()
+    snapshot = SensorSnapshot(_task(), _base(), _joints(), (), NOW, True)
+    status = FSMStatus(1, GlobalPhase.NAV_TO_PICK, LocalPhase.IDLE, 0, False, "", NOW)
+
+    first = node._run_current_phase(snapshot, status, None, NOW)
+    second = node._run_current_phase(snapshot, status, None, NOW)
+
+    assert first[0] is not None and not first[0].valid
+    assert (first[0].v, first[0].w) == (0.0, 0.0)
+    assert first[2] is not None and first[2].event is FSMEvent.FAILURE
+    assert "goal_id" in first[2].reason
+    assert second[2] is None
+
+
+def test_navigation_candidate_enters_action_mux_and_safe_hold_preserves_no_event() -> None:
+    node = _node()
+    state = node._runtime_wiring
+    goal = NavGoal(
+        "goal-a", "pick", (0.4, 0.0, 0.0), "odom", 0.05, 0.1, NOW + 1_000
+    )
+    state.active_nav_goal = goal
+    state.navigation_success_submitted = True
+    state.navigation_failure_submitted = True
+    state.navigation_diagnostic = "latched"
+
+    class MovingNavigation:
+        def update(
+            self, _base_state: BaseState, supplied_goal: NavGoal, timestamp_ns: int
+        ) -> tuple[BaseCommand, NavigationStatus]:
+            return (
+                BaseCommand(0.1, -0.2, timestamp_ns, timestamp_ns + 100),
+                NavigationStatus(
+                    supplied_goal.goal_id,
+                    "moving",
+                    0.4,
+                    -0.2,
+                    False,
+                    "",
+                    timestamp_ns,
+                ),
+            )
+
+    node._navigation = MovingNavigation()
+    snapshot = SensorSnapshot(_task(), _base(), _joints(), (), NOW, True)
+    nav_status = FSMStatus(
+        1, GlobalPhase.NAV_TO_PICK, LocalPhase.IDLE, 0, False, "", NOW
+    )
+    command, manipulation = node._compute_candidate_commands(snapshot, nav_status, NOW)
+    action, _ = node._mux.compose_with_decision(
+        command, manipulation, _joints(), nav_status, NOW
+    )
+
+    assert command is not None and command.valid
+    assert action.values[:2] == pytest.approx((0.1, -0.2))
+
+    state.navigation_diagnostic = "latched"
+    node._prepare_phase_transition(GlobalPhase.NAV_TO_PICK, GlobalPhase.SAFE_HOLD)
+    safe_status = replace(nav_status, global_phase=GlobalPhase.SAFE_HOLD)
+    assert node._run_current_phase(snapshot, safe_status, None, NOW) == (
+        None,
+        None,
+        None,
+    )
+    assert state.active_nav_goal is goal
+    assert state.navigation_success_submitted
+    assert state.navigation_failure_submitted
+    assert state.navigation_diagnostic == "latched"
+
+
+@pytest.mark.parametrize("bad_base", ("stale", "wrong_frame"))
+def test_navigation_bad_odom_fails_once_with_invalid_zero_base(
+    bad_base: str,
+) -> None:
+    node = _node()
+    state = node._runtime_wiring
+    state.run_id = "run-1"
+    state.task_id = 1
+    state.attempt = 0
+    state.active_nav_goal = NavGoal(
+        "goal-a", "pick", (0.4, 0.0, 0.0), "odom", 0.05, 0.1, NOW + 1_000
+    )
+    base = (
+        replace(_base(), timestamp_ns=NOW - 150_000_001)
+        if bad_base == "stale"
+        else replace(_base(), frame_id="world")
+    )
+    snapshot = SensorSnapshot(_task(), base, _joints(), (), NOW, True)
+    status = FSMStatus(1, GlobalPhase.NAV_TO_PICK, LocalPhase.IDLE, 0, False, "", NOW)
+
+    first = node._run_current_phase(snapshot, status, None, NOW)
+    second = node._run_current_phase(snapshot, status, None, NOW)
+
+    assert first[0] is not None and not first[0].valid
+    assert (first[0].v, first[0].w) == (0.0, 0.0)
+    assert first[2] is not None and first[2].event is FSMEvent.FAILURE
+    expected = "过期" if bad_base == "stale" else "frame"
+    assert expected in first[2].reason
+    assert second[2] is None
+
+
+def test_navigation_phase_transition_publishes_zero_not_old_nonzero_command() -> None:
+    node = _node(observe_only=False, enable_official_publish=True)
+    _prime_control_state(node)
+    task = _task()
+    context = CompetitionContext(
+        schema_name="team_sorting.competition_context",
+        schema_version=1,
+        run_id="run-1",
+        task_set_fingerprint="fingerprint",
+        current_task_id=1,
+        current_attempt_count=0,
+        elapsed_sim_s=1.0,
+        score=0,
+        best_scores=(0, 0, 0),
+        current_step="-",
+        finished=False,
+        active_task=task,
+        instruction_timestamp_ns=NOW - 100,
+        referee_timestamp_ns=NOW - 50,
+        valid=True,
+        failure_reason="",
+    )
+    before = FSMStatus(
+        1, GlobalPhase.NAV_TO_PICK, LocalPhase.IDLE, 0, False, "", NOW
+    )
+    after = replace(before, global_phase=GlobalPhase.REFINE_TARGET)
+    statuses = iter((before, after))
+    node._active_context = context
+    node._fsm = SimpleNamespace(
+        task=task,
+        phase_entered_ns=NOW - 10,
+        status=lambda _now: next(statuses),
+        check_timeout=lambda _now: False,
+    )
+    node._check_readiness = lambda *_args: None
+    node._synchronize_runtime_context = lambda _context: None
+    node._handle_phase_entry = lambda *_args: False
+    node._submit_fsm_event_once = lambda *_args, **_kwargs: True
+    node._run_current_phase = lambda *_args: (
+        BaseCommand(0.2, 0.1, NOW, NOW + 100),
+        None,
+        SimpleNamespace(
+            event=FSMEvent.PICK_NAV_REACHED,
+            source_timestamp_ns=NOW,
+            run_id="run-1",
+            task_id=1,
+            attempt=0,
+            reason="arrived",
+            object_id="",
+            goal_id="goal-a",
+            trajectory_id="",
+            confirmed_by_real_feedback=True,
+        ),
+    )
+
+    node._control_tick()
+
+    cmd_vel = node.publishers["/cmd_vel"].messages[-1]
+    assert cmd_vel.linear.x == 0.0
+    assert cmd_vel.angular.z == 0.0
+    action = json.loads(node.publishers["/team/final_action"].messages[-1].data)
+    assert action["action"][:2] == [0.0, 0.0]
 
 
 def test_phase_specific_cleanup_preserves_cross_phase_pick_context() -> None:
@@ -1669,6 +2034,20 @@ def test_internal_fsm_publish_authorization_is_pure_and_fail_closed() -> None:
         base_command=zero_base,
         manipulation_command=None,
         final_action=final_action,
+        now_ns=NOW,
+    )
+    zero_final_action, _ = ActionMux().compose_with_decision(
+        zero_base, None, _joints(), status, NOW
+    )
+    assert _internal_fsm_publish_authorization(
+        observe_only=False,
+        enable_official_publish=True,
+        context=context,
+        snapshot=snapshot,
+        fsm_status=status,
+        base_command=zero_base,
+        manipulation_command=None,
+        final_action=zero_final_action,
         now_ns=NOW,
     )
     assert not _internal_fsm_publish_authorization(
