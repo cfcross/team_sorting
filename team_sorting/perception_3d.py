@@ -10,15 +10,18 @@
 计算左右夹爪目标。Odom 只给出底盘位姿；slide 和 head 关节会改变头部相机相对底盘的
 位置与朝向，因此还必须使用实际 ``RobotJointState`` 和 ``MMK2FK`` 闭合坐标链。
 
-MMK2FK、MuJoCo、SciPy 和 NumPy 均按需延迟导入。物体尺寸由调用方注入；已知尺寸时
-沿相机射线把可见表面点补偿到近似几何中心，未知尺寸时明确返回无效估计，禁止把
-表面点冒充物体中心继续下传。
+MMK2FK、MuJoCo、SciPy 和 NumPy 均按需延迟导入。启发式中心补偿尺寸和物体局部
+XYZ 完整尺寸由调用方通过两个语义独立的映射注入：前者只用于沿相机射线把可见
+表面点补偿到近似几何中心，后者只在来源明确时写入 ``ObjectEstimate3D.size_xyz_m``。
+未知中心补偿尺寸时明确返回无效估计；未知局部尺寸时继续输出 ``None``，禁止把两类
+尺寸互相冒充。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 import importlib
+from itertools import permutations, product
 import math
 from numbers import Integral, Real
 import os
@@ -123,6 +126,151 @@ def project_pixel_to_camera(
     if not all(math.isfinite(value) for value in result):
         raise ValueError("反投影结果包含 NaN 或 Inf")
     return result
+
+
+def _rotation_matrix_to_xyzw(matrix: Any) -> tuple[float, float, float, float]:
+    """把右手正交旋转矩阵转换为归一化 ``xyzw`` 四元数。"""
+
+    m00, m01, m02 = (float(value) for value in matrix[0])
+    m10, m11, m12 = (float(value) for value in matrix[1])
+    m20, m21, m22 = (float(value) for value in matrix[2])
+    trace = m00 + m11 + m22
+    if trace > 0.0:
+        scale = math.sqrt(trace + 1.0) * 2.0
+        qw = 0.25 * scale
+        qx = (m21 - m12) / scale
+        qy = (m02 - m20) / scale
+        qz = (m10 - m01) / scale
+    elif m00 > m11 and m00 > m22:
+        scale = math.sqrt(max(0.0, 1.0 + m00 - m11 - m22)) * 2.0
+        qw = (m21 - m12) / scale
+        qx = 0.25 * scale
+        qy = (m01 + m10) / scale
+        qz = (m02 + m20) / scale
+    elif m11 > m22:
+        scale = math.sqrt(max(0.0, 1.0 + m11 - m00 - m22)) * 2.0
+        qw = (m02 - m20) / scale
+        qx = (m01 + m10) / scale
+        qy = 0.25 * scale
+        qz = (m12 + m21) / scale
+    else:
+        scale = math.sqrt(max(0.0, 1.0 + m22 - m00 - m11)) * 2.0
+        qw = (m10 - m01) / scale
+        qx = (m02 + m20) / scale
+        qy = (m12 + m21) / scale
+        qz = 0.25 * scale
+    norm = math.hypot(qx, qy, qz, qw)
+    if norm < 1e-12 or not math.isfinite(norm):
+        raise ValueError("点云旋转矩阵无法转换为非零有限四元数")
+    quaternion = (qx / norm, qy / norm, qz / norm, qw / norm)
+    # q 与 -q 表示同一旋转；固定符号可避免跨帧无意义跳变。
+    if quaternion[3] < 0.0:
+        quaternion = tuple(-value for value in quaternion)
+    return quaternion
+
+
+def _fit_cuboid_pose(
+    points_xyz: Any,
+    size_xyz_m: tuple[float, float, float],
+    max_extent_error_ratio: float,
+    np: Any,
+    camera_position_xyz: Any = None,
+) -> Optional[
+    tuple[tuple[float, float, float], tuple[float, float, float, float]]
+]:
+    """由可见点云拟合已知长方体的中心和对称等价局部轴姿态。
+
+    PCA 给出可见面的三条正交主轴，再枚举轴排列并以已知局部 XYZ 完整尺寸筛选。
+    长方体点云无法区分绕任意局部轴 180° 翻转，因此返回离输出 frame 单位姿态最近的
+    等价代表；它足以描述同一个有向包围盒，但不能声称恢复了 MJCF body 轴的符号。
+    """
+
+    points = np.asarray(points_xyz, dtype=float)
+    if points.ndim != 2 or points.shape[1] != 3 or points.shape[0] < 3:
+        return None
+    if not bool(np.all(np.isfinite(points))):
+        return None
+    centered = points - np.median(points, axis=0)
+    covariance = centered.T @ centered / float(points.shape[0])
+    eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+    order = np.argsort(eigenvalues)[::-1]
+    eigenvalues = eigenvalues[order]
+    axes = eigenvectors[:, order]
+    if float(eigenvalues[0]) <= 1e-12 or float(eigenvalues[1]) <= 1e-12:
+        return None
+    projections = centered @ axes
+    extents = np.percentile(projections, 97.5, axis=0) - np.percentile(
+        projections, 2.5, axis=0
+    )
+
+    best: Optional[tuple[float, tuple[int, int, int]]] = None
+    for axis_order in permutations((0, 1, 2)):
+        observed = tuple(float(extents[index]) for index in axis_order)
+        supported = [
+            index
+            for index, extent in enumerate(observed)
+            if extent >= 0.2 * size_xyz_m[index]
+        ]
+        if len(supported) < 2:
+            continue
+        errors = [
+            abs(observed[index] - size_xyz_m[index]) / size_xyz_m[index]
+            for index in supported
+        ]
+        if max(errors) > max_extent_error_ratio:
+            continue
+        score = sum(errors) / len(errors)
+        candidate = (score, axis_order)
+        if best is None or candidate < best:
+            best = candidate
+    if best is None:
+        return None
+
+    rotation = axes[:, best[1]]
+    candidates: list[tuple[tuple[float, float, float, float], Any]] = []
+    for signs in product((-1.0, 1.0), repeat=3):
+        signed = rotation * np.asarray(signs, dtype=float)
+        if float(np.linalg.det(signed)) <= 0.0:
+            continue
+        candidates.append((_rotation_matrix_to_xyzw(signed), signed))
+    if not candidates:
+        return None
+    # 箱体中心对称使四个右手符号组合几何等价；选最接近单位姿态的确定性代表。
+    quaternion, rotation = max(
+        candidates, key=lambda item: (abs(item[0][3]), item[0])
+    )
+    local_points = points @ rotation
+    lower = np.percentile(local_points, 2.5, axis=0)
+    upper = np.percentile(local_points, 97.5, axis=0)
+    observed = upper - lower
+    local_center = (lower + upper) / 2.0
+    for index in range(3):
+        if float(observed[index]) >= 0.2 * size_xyz_m[index]:
+            continue
+        if camera_position_xyz is None:
+            return None
+        camera_local = np.asarray(camera_position_xyz, dtype=float) @ rotation
+        surface = float(np.median(local_points[:, index]))
+        direction = 1.0 if float(camera_local[index]) >= surface else -1.0
+        local_center[index] = surface - direction * size_xyz_m[index] / 2.0
+    center = local_center @ rotation.T
+    if not bool(np.all(np.isfinite(center))):
+        return None
+    return tuple(float(value) for value in center), quaternion
+
+
+def _fit_cuboid_orientation_xyzw(
+    points_xyz: Any,
+    size_xyz_m: tuple[float, float, float],
+    max_extent_error_ratio: float,
+    np: Any,
+) -> Optional[tuple[float, float, float, float]]:
+    """兼容只需要完整长方体点云姿态的内部测试入口。"""
+
+    result = _fit_cuboid_pose(
+        points_xyz, size_xyz_m, max_extent_error_ratio, np
+    )
+    return None if result is None else result[1]
 
 
 @dataclass(frozen=True)
@@ -542,6 +690,9 @@ class _Track:
     last_detection_ts_ns: int
     bbox_center_xy: tuple[float, float]
     last_surface_xyz: tuple[float, float, float]
+    pose_quaternion_xyzw: Optional[list[float]] = None
+    pose_count: int = 0
+    last_pose_position_xyz: Optional[tuple[float, float, float]] = None
 
 
 @dataclass(frozen=True)
@@ -561,6 +712,7 @@ class _SurfaceProbe:
     depth_m: float
     valid_fraction: float
     camera_surface_xyz: tuple[float, float, float]
+    camera_points_xyz: Any = None
 
 
 class _SurfaceProbeError(ValueError):
@@ -590,20 +742,34 @@ class Perception3DEstimator:
         object_dimensions_m: Optional[
             dict[str, tuple[float, float, float]]
         ] = None,
+        object_local_size_xyz_m: Optional[
+            dict[str, tuple[float, float, float]]
+        ] = None,
         ambiguity_ratio: float = 2.0,
         center_compensation_mode: str = "degraded",
         heuristic_center_reliability: float = 0.5,
+        pose_refinement_enabled: bool = False,
+        pose_min_points: int = 64,
+        pose_required_frames: int = 3,
+        pose_depth_band_m: float = 0.08,
+        pose_max_position_delta_m: float = 0.03,
+        pose_max_angular_delta_rad: float = 0.20,
+        pose_max_extent_error_ratio: float = 0.45,
     ) -> None:
         """保存三维估计参数，构造阶段不加载任何官方依赖。
 
         ``object_dimensions_m`` 的值依次为宽、高、沿相机视线近似深度，单位米；它只
         服务当前启发式中心补偿，不是经过frame语义确认的物体局部XYZ尺寸生产源。
+        ``object_local_size_xyz_m`` 的值是物体局部坐标系下完整 XYZ 三轴尺寸，单位
+        米；只有该独立来源明确提供对应类别时，结果才填写 ``size_xyz_m``。随机 yaw
+        不会交换这三个局部轴，也不会从 ``object_dimensions_m`` 猜测缺失尺寸。
         ``max_track_age_s`` 为轨迹超时秒数，``max_input_skew_s`` 为
         Detection/Depth/CameraInfo 最大绝对时间差秒数，``max_position_jump_m``
         为相邻有效轨迹点允许的最大三维跳变。``ambiguity_ratio`` 控制稳定ID与其他
         同类历史轨迹的距离比判定。中心补偿默认是降级的启发式估计；``strict`` 模式
-        会拒绝未经真值验证的中心补偿。失败：参数类型、范围或物体尺寸不合法时抛出
-        ``ValueError``。
+        会拒绝未经真值验证的中心补偿。``pose_*`` 参数控制框内点云深度带、最少点数、
+        连续收敛帧数及位置/角度/尺寸门限；该能力默认关闭。失败：参数类型、范围或物体
+        尺寸不合法时抛出 ``ValueError``。
         """
 
         if isinstance(depth_radius_px, bool) or not isinstance(
@@ -618,6 +784,14 @@ class Perception3DEstimator:
             raise ValueError("converge_frames 必须是正整数")
         if int(converge_frames) <= 0:
             raise ValueError("converge_frames 必须是正整数")
+        if type(pose_refinement_enabled) is not bool:
+            raise ValueError("pose_refinement_enabled 必须是布尔值")
+        for value, name in (
+            (pose_min_points, "pose_min_points"),
+            (pose_required_frames, "pose_required_frames"),
+        ):
+            if isinstance(value, bool) or not isinstance(value, Integral) or int(value) <= 0:
+                raise ValueError(f"{name} 必须是正整数")
 
         alpha = _finite_number(ema_alpha, "ema_alpha")
         max_age_s = _finite_number(max_track_age_s, "max_track_age_s")
@@ -630,6 +804,16 @@ class Perception3DEstimator:
         )
         center_reliability = _finite_number(
             heuristic_center_reliability, "heuristic_center_reliability"
+        )
+        pose_depth_band = _finite_number(pose_depth_band_m, "pose_depth_band_m")
+        pose_position_delta = _finite_number(
+            pose_max_position_delta_m, "pose_max_position_delta_m"
+        )
+        pose_angular_delta = _finite_number(
+            pose_max_angular_delta_rad, "pose_max_angular_delta_rad"
+        )
+        pose_extent_error = _finite_number(
+            pose_max_extent_error_ratio, "pose_max_extent_error_ratio"
         )
         if not 0.0 < alpha <= 1.0:
             raise ValueError("ema_alpha 必须位于 (0, 1] 范围")
@@ -652,6 +836,12 @@ class Perception3DEstimator:
             raise ValueError(
                 "heuristic_center_reliability 必须位于 (0, 1] 范围"
             )
+        if pose_depth_band <= 0.0 or pose_position_delta <= 0.0:
+            raise ValueError("点云深度带和refine位置阈值必须是正的有限米数")
+        if not 0.0 < pose_angular_delta <= math.pi:
+            raise ValueError("pose_max_angular_delta_rad 必须位于 (0, pi] 范围")
+        if not 0.0 < pose_extent_error < 1.0:
+            raise ValueError("pose_max_extent_error_ratio 必须位于 (0, 1) 范围")
 
         dimensions = dict(object_dimensions_m) if object_dimensions_m else {}
         normalized_dimensions: dict[str, tuple[float, float, float]] = {}
@@ -667,6 +857,31 @@ class Perception3DEstimator:
                 )
             normalized_dimensions[class_id] = (width, height, depth_extent)
 
+        local_sizes = (
+            dict(object_local_size_xyz_m) if object_local_size_xyz_m else {}
+        )
+        normalized_local_sizes: dict[str, tuple[float, float, float]] = {}
+        for class_id, values in local_sizes.items():
+            if (
+                not isinstance(class_id, str)
+                or not class_id.strip()
+                or class_id != class_id.strip()
+            ):
+                raise ValueError(
+                    "object_local_size_xyz_m 的类别键必须是无首尾空白的非空字符串"
+                )
+            size_x, size_y, size_z = _finite_vector(
+                values,
+                3,
+                f"object_local_size_xyz_m[{class_id!r}]",
+            )
+            if size_x <= 0.0 or size_y <= 0.0 or size_z <= 0.0:
+                raise ValueError(
+                    f"object_local_size_xyz_m[{class_id!r}] 的局部XYZ完整尺寸"
+                    "必须均为正数"
+                )
+            normalized_local_sizes[class_id] = (size_x, size_y, size_z)
+
         self.transform_provider = transform_provider
         self.depth_radius_px = int(depth_radius_px)
         self.ema_alpha = alpha
@@ -677,7 +892,15 @@ class Perception3DEstimator:
         self.ambiguity_ratio = identity_ambiguity_ratio
         self.center_compensation_mode = center_compensation_mode
         self.heuristic_center_reliability = center_reliability
+        self.pose_refinement_enabled = pose_refinement_enabled
+        self.pose_min_points = int(pose_min_points)
+        self.pose_required_frames = int(pose_required_frames)
+        self.pose_depth_band_m = pose_depth_band
+        self.pose_max_position_delta_m = pose_position_delta
+        self.pose_max_angular_delta_rad = pose_angular_delta
+        self.pose_max_extent_error_ratio = pose_extent_error
         self._dims = normalized_dimensions
+        self._local_sizes = normalized_local_sizes
         self._tracks: dict[str, _Track] = {}
         self._last_frame_ts_ns: Optional[int] = None
         self._last_detection_frame_ts_ns: Optional[int] = None
@@ -1025,6 +1248,18 @@ class Perception3DEstimator:
                 timestamp_ns,
                 track_error,
             )
+        pose_candidate = self._point_cloud_pose_candidate(
+            detection.class_id,
+            probe,
+            head_pose,
+            base,
+            joints,
+            legacy_point_transform,
+        )
+        refined_position, orientation, pose_count = self._update_pose_refinement(
+            track_key,
+            pose_candidate,
+        )
         converge = min(1.0, count / self.converge_frames)
         confidence *= (
             probe.valid_fraction
@@ -1034,19 +1269,177 @@ class Perception3DEstimator:
         confidence = max(0.0, min(1.0, confidence))
         return ObjectEstimate3D(
             class_id=detection.class_id,
-            position_xyz=filtered_point,
+            position_xyz=(
+                refined_position if refined_position is not None else filtered_point
+            ),
             confidence=confidence,
             frame_id=output_frame,
             timestamp_ns=timestamp_ns,
             valid=True,
             failure_reason=(
-                "heuristic center approximation "
-                "(surface-to-center not validated)"
+                "point-cloud cuboid center/pose converged"
+                if orientation is not None
+                else (
+                    "heuristic center approximation "
+                    "(surface-to-center not validated)"
+                    + (
+                        f"; point-cloud pose pending ({pose_count}/"
+                        f"{self.pose_required_frames})"
+                        if self.pose_refinement_enabled
+                        else ""
+                    )
+                )
             ),
             object_id=track_key,
-            orientation_xyzw=None,
-            # _dims第三轴是相机视线近似深度；随机yaw下不能冒充物体局部XYZ尺寸。
-            size_xyz_m=None,
+            orientation_xyzw=orientation,
+            size_xyz_m=self._local_sizes.get(detection.class_id),
+        )
+
+    def _point_cloud_pose_candidate(
+        self,
+        class_id: str,
+        probe: _SurfaceProbe,
+        head_pose: Optional[_HeadCameraPose],
+        base: BaseState,
+        joints: RobotJointState,
+        legacy_point_transform: bool,
+    ) -> Optional[
+        tuple[tuple[float, float, float], tuple[float, float, float, float]]
+    ]:
+        """把当前框点云变到输出 frame，并生成单帧长方体中心/姿态候选。"""
+
+        size = self._local_sizes.get(class_id)
+        if not self.pose_refinement_enabled or size is None or probe.camera_points_xyz is None:
+            return None
+        try:
+            import numpy as np
+        except ImportError:
+            return None
+        try:
+            camera_points = np.asarray(probe.camera_points_xyz, dtype=float)
+            if legacy_point_transform:
+                output_points = np.asarray(
+                    [
+                        self.transform_provider.camera_to_output(
+                            tuple(float(value) for value in point), base, joints
+                        )
+                        for point in camera_points
+                    ],
+                    dtype=float,
+                )
+                camera_position = self.transform_provider.camera_to_output(
+                    (0.0, 0.0, 0.0), base, joints
+                )
+            else:
+                if head_pose is None:
+                    return None
+                qw, qx, qy, qz = _finite_vector(
+                    head_pose.quaternion_wxyz,
+                    4,
+                    "MMK2FK camera_quaternion_wxyz",
+                )
+                norm = math.hypot(qw, qx, qy, qz)
+                if norm < 1e-12:
+                    return None
+                qw, qx, qy, qz = (
+                    qw / norm,
+                    qx / norm,
+                    qy / norm,
+                    qz / norm,
+                )
+                rotation = np.asarray(
+                    (
+                        (1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qz * qw), 2 * (qx * qz + qy * qw)),
+                        (2 * (qx * qy + qz * qw), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qx * qw)),
+                        (2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx * qx + qy * qy)),
+                    ),
+                    dtype=float,
+                )
+                output_points = camera_points @ rotation.T + np.asarray(
+                    head_pose.position, dtype=float
+                )
+                camera_position = head_pose.position
+            return _fit_cuboid_pose(
+                output_points,
+                size,
+                self.pose_max_extent_error_ratio,
+                np,
+                camera_position,
+            )
+        except (TypeError, ValueError, RuntimeError, np.linalg.LinAlgError):
+            return None
+
+    def _update_pose_refinement(
+        self,
+        track_key: Optional[str],
+        candidate_pose: Optional[
+            tuple[tuple[float, float, float], tuple[float, float, float, float]]
+        ],
+    ) -> tuple[
+        Optional[tuple[float, float, float]],
+        Optional[tuple[float, float, float, float]],
+        int,
+    ]:
+        """同一稳定ID的点云中心和姿态连续收敛后才成对发布。"""
+
+        if not self.pose_refinement_enabled or track_key is None:
+            return None, None, 0
+        track = self._tracks.get(track_key)
+        if track is None:
+            return None, None, 0
+        if candidate_pose is None:
+            track.pose_quaternion_xyzw = None
+            track.pose_count = 0
+            track.last_pose_position_xyz = None
+            return None, None, 0
+        position_xyz, candidate_xyzw = candidate_pose
+        candidate = list(candidate_xyzw)
+        previous = track.pose_quaternion_xyzw
+        reset = previous is None or track.last_pose_position_xyz is None
+        if not reset:
+            dot = sum(previous[index] * candidate[index] for index in range(4))
+            if dot < 0.0:
+                candidate = [-value for value in candidate]
+                dot = -dot
+            angular_delta = 2.0 * math.acos(max(-1.0, min(1.0, dot)))
+            position_delta = math.dist(track.last_pose_position_xyz, position_xyz)
+            reset = (
+                angular_delta > self.pose_max_angular_delta_rad
+                or position_delta > self.pose_max_position_delta_m
+            )
+        if reset:
+            track.pose_quaternion_xyzw = candidate
+            track.last_pose_position_xyz = position_xyz
+            track.pose_count = 1
+        else:
+            assert previous is not None
+            blended = [
+                self.ema_alpha * candidate[index]
+                + (1.0 - self.ema_alpha) * previous[index]
+                for index in range(4)
+            ]
+            norm = math.sqrt(sum(value * value for value in blended))
+            if norm < 1e-12:
+                track.pose_quaternion_xyzw = candidate
+                track.last_pose_position_xyz = position_xyz
+                track.pose_count = 1
+            else:
+                track.pose_quaternion_xyzw = [value / norm for value in blended]
+                assert track.last_pose_position_xyz is not None
+                track.last_pose_position_xyz = tuple(
+                    self.ema_alpha * position_xyz[index]
+                    + (1.0 - self.ema_alpha) * track.last_pose_position_xyz[index]
+                    for index in range(3)
+                )
+                track.pose_count += 1
+        if track.pose_count < self.pose_required_frames:
+            return None, None, track.pose_count
+        assert track.pose_quaternion_xyzw is not None
+        assert track.last_pose_position_xyz is not None
+        return (
+            track.last_pose_position_xyz,
+            tuple(track.pose_quaternion_xyzw),
+            track.pose_count,
         )
 
     def _surface_probe(
@@ -1083,13 +1476,85 @@ class Perception3DEstimator:
             )
         except ValueError as exc:
             raise _SurfaceProbeError(f"反投影失败：{exc}") from exc
+        camera_points = None
+        if (
+            self.pose_refinement_enabled
+            and detection.class_id in self._local_sizes
+        ):
+            try:
+                camera_points = self._bbox_point_cloud_camera(
+                    detection,
+                    intrinsics,
+                    request,
+                    depth_array,
+                    statistics.depth_m,
+                    np,
+                )
+            except ValueError:
+                # 点云姿态是可选增强；失败不得让仍有依据的中心估计一起失效。
+                camera_points = None
         return _SurfaceProbe(
             u,
             v,
             statistics.depth_m,
             statistics.valid_fraction,
             camera_surface,
+            camera_points,
         )
+
+    def _bbox_point_cloud_camera(
+        self,
+        detection: Detection2D,
+        intrinsics: CameraIntrinsics,
+        request: _DepthWindowRequest,
+        depth_array: Any,
+        surface_depth_m: float,
+        np: Any,
+    ) -> Any:
+        """提取框内靠近可见表面的有限深度点并批量反投影。"""
+
+        if depth_array.ndim != 2:
+            raise ValueError("深度图必须是严格二维数组")
+        height, width = depth_array.shape
+        x0, y0, x1, y1 = _finite_vector(
+            detection.bbox_xyxy, 4, "Detection2D.bbox_xyxy"
+        )
+        xa, xb = max(0, math.ceil(x0)), min(width, math.ceil(x1))
+        ya, yb = max(0, math.ceil(y0)), min(height, math.ceil(y1))
+        if xa >= xb or ya >= yb:
+            raise ValueError("bbox 与深度图没有有效交集")
+        try:
+            raw = depth_array[ya:yb, xa:xb].astype(float)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("bbox 深度无法转换为数值") from exc
+        depth_m = raw * request.unit_scale_m
+        valid = (
+            np.isfinite(depth_m)
+            & (depth_m > 0.0)
+            & (np.abs(depth_m - surface_depth_m) <= self.pose_depth_band_m)
+        )
+        rows, columns = np.nonzero(valid)
+        if rows.size < self.pose_min_points:
+            raise ValueError(
+                f"点云有效点不足：{rows.size} < {self.pose_min_points}"
+            )
+        # 对大框做确定性均匀抽样，限制每目标每帧的 PCA 成本。
+        if rows.size > 2048:
+            selected = np.linspace(0, rows.size - 1, 2048, dtype=int)
+            rows, columns = rows[selected], columns[selected]
+        z = depth_m[rows, columns]
+        fx = _finite_number(intrinsics.k[0], "相机焦距 fx")
+        fy = _finite_number(intrinsics.k[4], "相机焦距 fy")
+        cx = _finite_number(intrinsics.k[2], "相机主点 cx")
+        cy = _finite_number(intrinsics.k[5], "相机主点 cy")
+        if fx <= 0.0 or fy <= 0.0:
+            raise ValueError("相机焦距必须为正")
+        u = columns.astype(float) + xa
+        v = rows.astype(float) + ya
+        points = np.column_stack(((u - cx) * z / fx, (v - cy) * z / fy, z))
+        if not bool(np.all(np.isfinite(points))):
+            raise ValueError("反投影点云包含NaN或Inf")
+        return points
 
     def _compensate_to_center(
         self,
