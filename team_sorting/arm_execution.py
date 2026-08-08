@@ -240,11 +240,15 @@ class ArmExecutionController:
             raise ValueError("verification.is_grasped必须是严格bool")
 
         confidence = verification.confidence
-        if type(confidence) is bool or not isinstance(confidence, (int, float)):
+        if type(confidence) is bool or not isinstance(confidence, Real):
             raise ValueError("verification.confidence必须是数值且不能是bool")
-        if not math.isfinite(confidence):
+        try:
+            confidence_value = float(confidence)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("verification.confidence必须能转换为有限浮点数") from exc
+        if not math.isfinite(confidence_value):
             raise ValueError("verification.confidence必须是有限数值")
-        if not (0.0 <= confidence <= 1.0):
+        if not (0.0 <= confidence_value <= 1.0):
             raise ValueError("verification.confidence必须位于[0.0, 1.0]")
 
         if not isinstance(verification.visual_evidence, str):
