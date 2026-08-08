@@ -33,7 +33,7 @@ def _ament_contract_candidate() -> Path | None:
         from ament_index_python.packages import get_package_share_directory
 
         return Path(get_package_share_directory("team_sorting")) / _RELATIVE_PATH
-    except (ImportError, LookupError):
+    except (ImportError, LookupError, OSError):
         return None
 
 
