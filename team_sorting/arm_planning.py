@@ -52,6 +52,7 @@ _KDL_TARGET_FRAME = "footprint"
 _WORLD_FRAME = "world"
 _GEOMETRY_TOLERANCE = 1e-9
 _VERTICAL_TOLERANCE = 1e-6
+_SLIDE_SEARCH_SUBDIVISIONS = 8
 
 
 def _vector_add(left: tuple[float, ...], right: tuple[float, ...]) -> tuple[float, ...]:
@@ -381,6 +382,13 @@ class OfficialKDLAdapter:
             raise RuntimeError(f"官方 MMK2Kdl FK 自检失败：{exc}") from exc
         self._solver = solver
 
+    def slide_limits(self) -> Optional[tuple[float, float]]:
+        """返回官方求解器公开的slide限位；未自检或未公开时不得猜测。"""
+
+        if self._solver is None:
+            raise RuntimeError("OfficialKDLAdapter 尚未通过 self_check")
+        return _solver_slide_limits(self._solver)
+
     def solve_ik(
         self,
         actual_joints: RobotJointState,
@@ -678,10 +686,12 @@ class ArmPlanner:
             ("LIFT", left_lift, right_lift),
             ("RETREAT", left_retreat, right_retreat),
         )
-        ik_results = tuple(
-            _solve_dual_ik(self._ik_adapter, actual_joints, left, right,
-                           actual_position[0], label)
-            for label, left, right in pose_pairs
+        ik_results = _solve_ik_sequence_with_slide_search(
+            self._ik_adapter,
+            actual_joints,
+            pose_pairs,
+            actual_position[0],
+            _config_float(self._config, "max_slide_waypoint_delta_m"),
         )
         pregrasp_time = _config_float(self._config, "pregrasp_duration_s")
         half_grasp_time = _config_float(self._config, "grasp_duration_s") / 2.0
@@ -850,10 +860,12 @@ class ArmPlanner:
             ("LOWER", left_release, right_release),
             ("POST_RELEASE_RETREAT", left_retreat, right_retreat),
         )
-        ik_results = tuple(
-            _solve_dual_ik(self._ik_adapter, actual_joints, left, right,
-                           actual_position[0], label)
-            for label, left, right in pose_pairs
+        ik_results = _solve_ik_sequence_with_slide_search(
+            self._ik_adapter,
+            actual_joints,
+            pose_pairs,
+            actual_position[0],
+            _config_float(self._config, "max_slide_waypoint_delta_m"),
         )
         preplace_time = _config_float(self._config, "preplace_duration_s")
         lower_time = preplace_time + _config_float(self._config, "lower_duration_s")
@@ -1100,6 +1112,88 @@ def _solve_dual_ik(
     _finite_vector(result.left_joint_target, 6, f"{phase_name} IK左臂解")
     _finite_vector(result.right_joint_target, 6, f"{phase_name} IK右臂解")
     return result
+
+
+def _slide_search_candidates(
+    adapter: object,
+    actual_slide: float,
+    max_waypoint_delta_m: float,
+) -> tuple[float, ...]:
+    """按离当前高度由近到远生成有限slide候选，范围只来自官方限位。"""
+
+    current = _finite_scalar(actual_slide, "actual slide")
+    maximum_delta = _finite_scalar(
+        max_waypoint_delta_m, "max_slide_waypoint_delta_m"
+    )
+    if maximum_delta <= 0.0:
+        raise ValueError("max_slide_waypoint_delta_m必须为有限正数")
+    limit_reader = getattr(adapter, "slide_limits", None)
+    if not callable(limit_reader):
+        # 兼容只实现solve_ik的旧fake/第三方薄适配器；没有官方限位就只能尝试当前高度。
+        return (current,)
+    try:
+        limits = limit_reader()
+    except Exception as exc:  # noqa: BLE001 - 适配器边界统一转为规划失败
+        raise ValueError(f"读取官方slide限位失败：{exc}") from exc
+    if limits is None:
+        return (current,)
+    lower, upper = _finite_vector(limits, 2, "官方slide限位")
+    if lower > upper:
+        raise ValueError("官方slide限位下界大于上界")
+    if current < lower - _GEOMETRY_TOLERANCE or current > upper + _GEOMETRY_TOLERANCE:
+        raise ValueError(
+            f"实际slide={current}超出官方限位[{lower}, {upper}]，拒绝搜索"
+        )
+
+    feasible_lower = max(lower, current - maximum_delta)
+    feasible_upper = min(upper, current + maximum_delta)
+    candidates = [current]
+    if feasible_upper - feasible_lower > _GEOMETRY_TOLERANCE:
+        span = feasible_upper - feasible_lower
+        for index in range(_SLIDE_SEARCH_SUBDIVISIONS + 1):
+            candidate = feasible_lower + span * index / _SLIDE_SEARCH_SUBDIVISIONS
+            if not any(
+                math.isclose(candidate, existing, rel_tol=0.0, abs_tol=_GEOMETRY_TOLERANCE)
+                for existing in candidates
+            ):
+                candidates.append(candidate)
+    candidates.sort(key=lambda value: (abs(value - current), value))
+    return tuple(candidates)
+
+
+def _solve_ik_sequence_with_slide_search(
+    adapter: OfficialKDLAdapter,
+    actual_joints: RobotJointState,
+    pose_pairs: tuple[tuple[str, Pose3D, Pose3D], ...],
+    actual_slide: float,
+    max_waypoint_delta_m: float,
+) -> tuple[IKResult, ...]:
+    """为整段轨迹选择同一合法slide；任一阶段失败就尝试下一个候选。"""
+
+    candidates = _slide_search_candidates(
+        adapter, actual_slide, max_waypoint_delta_m
+    )
+    failures: list[str] = []
+    for candidate in candidates:
+        results: list[IKResult] = []
+        try:
+            for label, left_target, right_target in pose_pairs:
+                results.append(
+                    _solve_dual_ik(
+                        adapter,
+                        actual_joints,
+                        left_target,
+                        right_target,
+                        candidate,
+                        label,
+                    )
+                )
+        except ValueError as exc:
+            failures.append(f"slide={candidate:.9g}: {exc}")
+            continue
+        return tuple(results)
+    detail = "; ".join(failures)
+    raise ValueError(f"所有官方slide候选均无完整双臂IK解：{detail}")
 
 
 def _joint_waypoint(
