@@ -337,12 +337,16 @@ yaw、根据颜色产生姿态，或把确认后的规划关系描述为真实�
 有效路点至少控制一个关节；全False mask不能表示等待、停止或阶段标签。等待由带实际
 目标的路点时间表达，停止仍由正常安全控制链处理。
 
-ArmExecution已实现轨迹运动学执行，但真实抓取验证和confirmed GraspContext仍未实现，
-等待提交3B/集成阶段的真实证据来源。抓取执行到LIFT稳定到位后停在 `VERIFY`，只报告
-`VERIFICATION_PENDING`并输出短TTL保持候选；没有验证入口就不能进入RETREAT，也不能
-提升为抓取成功。放置轨迹结束只报告
-`MOTION_COMPLETED_PLACE_VERIFICATION_PENDING`且 `success=False`，不能表示物体已经
-稳定、脱夹、位于目标范围或获得 `PLACE_VERIFIED`。执行配置无隐藏默认值，当前
+ArmExecution已把真实抓取验证接入纯Python执行闭环：抓取执行到LIFT稳定到位后进入
+`VERIFY`，只有属于当前 `EXECUTE_PICK`、最后一个LIFT路点且位于显式等待窗口内的
+`GraspVerification` 才能被接收。`success=False` 只表示证据不足并继续等待更新证据；
+`success=True` 时无论明确抓住还是明确未抓住，都保存原始结论并继续安全RETREAT，
+不得伪造业务成功。RETREAT仍需后续不同时间戳的真实JointState满足连续停稳要求，才返回
+`MOTION_COMPLETED_PICK`；同一验证可通过只读 `latest_grasp_verification` 供
+`VERIFY_PICK` 使用。放置撤离到位返回
+`MOTION_COMPLETED_PLACE_VERIFICATION_PENDING`。两个运动完成态的 `success=True` 只表示
+JointTrajectory已由真实关节反馈完整确认，不表示物体抓住、脱夹、位于目标范围或获得
+`PICK_VERIFIED` / `PLACE_VERIFIED`。执行配置无隐藏默认值，当前
 `config.arm_execution` 全部为 `null`，且ROS/FSM尚未接线。
 
 `VisualObservationVerifier` 当前是纯算法组件：它仅接受达到最低置信度且 frame 严格为
