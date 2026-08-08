@@ -205,6 +205,14 @@ class ArmExecutionController:
         本入口只负责接收，不确认 ``GraspContext``，也不会改变局部阶段或让
         ``step`` 自动越过 ``VERIFY``。所有检查在写入前完成，避免非法输入
         覆盖此前已经接收的有效验证。
+
+        校验规则：
+        - ``is_grasped`` / ``success``：严格 ``bool``；
+        - ``confidence``：有限实数，范围 ``[0.0, 1.0]``，禁止 ``bool``；
+        - ``visual_evidence`` / ``effort_evidence`` / ``failure_reason``：``str``；
+        - ``timestamp_ns``：非负 ``int``，禁止 ``bool``；
+        - 时间单调性：旧 timestamp 拒绝；相同 timestamp 且内容相同可幂等；
+          相同 timestamp 但内容不同则 fail closed。
         """
 
         if not isinstance(verification, GraspVerification):
@@ -227,14 +235,47 @@ class ArmExecutionController:
                 f"verification字段不完整，缺少：{', '.join(missing_fields)}"
             )
 
-        timestamp_ns = verification.timestamp_ns
-        if type(timestamp_ns) is not int or timestamp_ns < 0:
-            raise ValueError("verification.timestamp_ns必须是非负整数且不能是bool")
+        # 1. 严格字段类型/范围校验（任何失败都不应覆盖缓存）
+        if type(verification.is_grasped) is not bool:
+            raise ValueError("verification.is_grasped必须是严格bool")
+
+        confidence = verification.confidence
+        if type(confidence) is bool or not isinstance(confidence, (int, float)):
+            raise ValueError("verification.confidence必须是数值且不能是bool")
+        if not math.isfinite(confidence):
+            raise ValueError("verification.confidence必须是有限数值")
+        if not (0.0 <= confidence <= 1.0):
+            raise ValueError("verification.confidence必须位于[0.0, 1.0]")
+
+        if not isinstance(verification.visual_evidence, str):
+            raise ValueError("verification.visual_evidence必须是字符串")
+        if not isinstance(verification.effort_evidence, str):
+            raise ValueError("verification.effort_evidence必须是字符串")
+
         if type(verification.success) is not bool:
             raise ValueError("verification.success必须是严格bool")
         if not isinstance(verification.failure_reason, str):
             raise ValueError("verification.failure_reason必须是字符串")
 
+        timestamp_ns = verification.timestamp_ns
+        if type(timestamp_ns) is not int or timestamp_ns < 0:
+            raise ValueError("verification.timestamp_ns必须是非负整数且不能是bool")
+
+        # 2. 时间单调性校验（事务式：失败不覆盖缓存）
+        cached = self._cached_verification
+        if cached is not None:
+            if timestamp_ns < cached.timestamp_ns:
+                raise ValueError(
+                    "verification.timestamp_ns不能早于已缓存的timestamp_ns"
+                )
+            if timestamp_ns == cached.timestamp_ns:
+                if verification == cached:
+                    return
+                raise ValueError(
+                    "同一timestamp_ns下收到内容不同的verification，拒绝冲突重复"
+                )
+
+        # 3. 全部校验通过，才覆盖缓存
         self._cached_verification = verification
         self._verification_received_ns = timestamp_ns
 

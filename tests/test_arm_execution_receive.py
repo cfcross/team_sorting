@@ -212,3 +212,114 @@ def test_accept_grasp_verification_rejects_incomplete_instance(
 
     assert controller._cached_verification is None
     assert controller._verification_received_ns is None
+
+
+@pytest.mark.parametrize(
+    "is_grasped",
+    ["yes", 1, 0, None],
+)
+def test_accept_grasp_verification_rejects_invalid_is_grasped(
+    is_grasped: object,
+) -> None:
+    controller = ArmExecutionController()
+    accepted = _verification(timestamp_ns=99)
+    controller.accept_grasp_verification(accepted)
+
+    with pytest.raises(ValueError, match="is_grasped"):
+        controller.accept_grasp_verification(
+            _damaged_verification(is_grasped=is_grasped, timestamp_ns=100)
+        )
+
+    assert controller._cached_verification is accepted
+
+
+@pytest.mark.parametrize(
+    "confidence",
+    [
+        True,
+        False,
+        "0.9",
+        None,
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        -0.01,
+        1.01,
+    ],
+)
+def test_accept_grasp_verification_rejects_invalid_confidence(
+    confidence: object,
+) -> None:
+    controller = ArmExecutionController()
+    accepted = _verification(timestamp_ns=99)
+    controller.accept_grasp_verification(accepted)
+
+    with pytest.raises(ValueError, match="confidence"):
+        controller.accept_grasp_verification(
+            _damaged_verification(confidence=confidence, timestamp_ns=100)
+        )
+
+    assert controller._cached_verification is accepted
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("visual_evidence", 123),
+        ("visual_evidence", None),
+        ("effort_evidence", 123),
+        ("effort_evidence", None),
+    ],
+)
+def test_accept_grasp_verification_rejects_non_str_evidence(
+    field: str,
+    value: object,
+) -> None:
+    controller = ArmExecutionController()
+    accepted = _verification(timestamp_ns=99)
+    controller.accept_grasp_verification(accepted)
+
+    with pytest.raises(ValueError, match=field):
+        controller.accept_grasp_verification(
+            _damaged_verification(**{field: value}, timestamp_ns=100)
+        )
+
+    assert controller._cached_verification is accepted
+
+
+def test_accept_grasp_verification_rejects_stale_timestamp() -> None:
+    controller = ArmExecutionController()
+    accepted = _verification(timestamp_ns=200)
+    controller.accept_grasp_verification(accepted)
+
+    stale = _verification(timestamp_ns=100)
+    with pytest.raises(ValueError, match="timestamp_ns"):
+        controller.accept_grasp_verification(stale)
+
+    assert controller._cached_verification is accepted
+    assert controller._verification_received_ns == 200
+
+
+def test_accept_grasp_verification_idempotent_duplicate() -> None:
+    controller = ArmExecutionController()
+    accepted = _verification(timestamp_ns=200)
+    controller.accept_grasp_verification(accepted)
+
+    duplicate = _verification(timestamp_ns=200)
+    controller.accept_grasp_verification(duplicate)
+
+    assert controller._cached_verification is accepted
+    assert controller._verification_received_ns == 200
+
+
+def test_accept_grasp_verification_rejects_conflicting_duplicate() -> None:
+    controller = ArmExecutionController()
+    accepted = _verification(timestamp_ns=200, success=True)
+    controller.accept_grasp_verification(accepted)
+
+    conflicting = _verification(timestamp_ns=200, success=False)
+    with pytest.raises(ValueError, match="同一timestamp_ns"):
+        controller.accept_grasp_verification(conflicting)
+
+    assert controller._cached_verification is accepted
+    assert controller._cached_verification.success is True
