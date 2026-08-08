@@ -434,13 +434,15 @@ def _nav_base(
     frame: str = "odom",
     stamp: int = 1_000_000_000,
     valid: bool = True,
+    linear_velocity: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    angular_velocity: tuple[float, float, float] = (0.0, 0.0, 0.0),
 ) -> BaseState:
     return BaseState(
         (x, y, 0.0),
         (0.0, 0.0, math.sin(yaw / 2.0), math.cos(yaw / 2.0)),
         yaw,
-        (0.0, 0.0, 0.0),
-        (0.0, 0.0, 0.0),
+        linear_velocity,
+        angular_velocity,
         frame,
         stamp,
         valid,
@@ -543,6 +545,7 @@ def test_navigation_place_goal_uses_f1_alignment_and_stands_off() -> None:
     task = _nav_task()
     goal = controller.build_place_goal(task, _nav_base(frame="odom"), 1_000_000_000)
     assert goal.goal_type == "place"
+    assert "early_simulation_standoff_strategy" in goal.goal_id
     assert goal.frame_id == "odom"
     assert goal.pose_xyyaw[:2] != pytest.approx(task.place_world_xyz[:2])
     assert distance_xy(goal.pose_xyyaw, task.place_world_xyz) == pytest.approx(0.6)
@@ -698,11 +701,135 @@ def test_navigation_update_slows_near_goal_and_requires_final_yaw() -> None:
     )
     assert align.v == 0.0 and align.w > 0.0
     assert not align_status.success
+    arrival_goal = _nav_goal(0.01, 0.0, 0.05)
+    for offset_ns in (0, 50_000_000):
+        pending, pending_status = controller.update(
+            _nav_base(stamp=1_000_000_000 + offset_ns),
+            arrival_goal,
+            1_000_000_000 + offset_ns,
+        )
+        assert (pending.v, pending.w) == (0.0, 0.0)
+        assert not pending_status.success
     arrived, arrived_status = controller.update(
-        _nav_base(), _nav_goal(0.01, 0.0, 0.05), 1_000_000_000
+        _nav_base(stamp=1_100_000_000), arrival_goal, 1_100_000_000
     )
     assert (arrived.v, arrived.w) == (0.0, 0.0)
     assert arrived_status.success
+
+
+def test_navigation_requires_low_actual_speed_and_distinct_consecutive_odom() -> None:
+    controller = NavigationController(
+        NavigationConfig(
+            max_settled_linear_speed_mps=0.02,
+            max_settled_angular_speed_radps=0.03,
+            settled_required_cycles=2,
+        )
+    )
+    goal = _nav_goal(0.01, 0.0, 0.05)
+    for fast_base in (
+        _nav_base(linear_velocity=(0.021, 0.0, 0.0)),
+        _nav_base(angular_velocity=(0.0, 0.0, 0.031)),
+    ):
+        fast, fast_status = controller.update(fast_base, goal, 1_000_000_000)
+        assert (fast.v, fast.w) == (0.0, 0.0)
+        assert fast.valid and not fast_status.success
+
+    first, first_status = controller.update(_nav_base(), goal, 1_000_000_000)
+    repeated, repeated_status = controller.update(_nav_base(), goal, 1_000_000_000)
+    assert (first.v, first.w) == (0.0, 0.0)
+    assert not first_status.success and not repeated_status.success
+    arrived, arrived_status = controller.update(
+        _nav_base(stamp=1_050_000_000), goal, 1_050_000_000
+    )
+    assert (arrived.v, arrived.w) == (0.0, 0.0)
+    assert arrived_status.success
+
+
+def test_navigation_resets_settled_confirmation_after_leaving_tolerance() -> None:
+    controller = NavigationController(NavigationConfig(settled_required_cycles=2))
+    goal = _nav_goal(0.01, 0.0, 0.0)
+    _, first = controller.update(_nav_base(), goal, 1_000_000_000)
+    assert not first.success
+    moving, outside = controller.update(
+        _nav_base(x=-0.2, stamp=1_050_000_000), goal, 1_050_000_000
+    )
+    assert moving.v > 0.0 and not outside.success
+    _, restarted = controller.update(
+        _nav_base(stamp=1_100_000_000), goal, 1_100_000_000
+    )
+    assert not restarted.success
+    _, arrived = controller.update(
+        _nav_base(stamp=1_150_000_000), goal, 1_150_000_000
+    )
+    assert arrived.success
+
+
+def test_navigation_goal_lifecycles_do_not_share_settled_samples() -> None:
+    controller = NavigationController(NavigationConfig(settled_required_cycles=2))
+    first_goal = _nav_goal(0.01, 0.0, 0.0)
+    second_goal = NavGoal(
+        "goal-2", "place", (0.01, 0.0, 0.0), "odom", 0.05, 0.1, 2_000_000_000
+    )
+    controller.update(_nav_base(), first_goal, 1_000_000_000)
+    _, first_second_goal_status = controller.update(
+        _nav_base(stamp=1_050_000_000), second_goal, 1_050_000_000
+    )
+    assert not first_second_goal_status.success
+    _, arrived = controller.update(
+        _nav_base(stamp=1_100_000_000), second_goal, 1_100_000_000
+    )
+    assert arrived.success
+
+
+def test_navigation_arrival_latch_holds_zero_until_goal_changes() -> None:
+    controller = NavigationController(NavigationConfig(settled_required_cycles=1))
+    goal = _nav_goal(0.01, 0.0, 0.0)
+    command, arrived = controller.update(_nav_base(), goal, 1_000_000_000)
+    assert arrived.success and (command.v, command.w) == (0.0, 0.0)
+
+    held, displaced = controller.update(
+        _nav_base(x=-0.2, stamp=1_050_000_000), goal, 1_050_000_000
+    )
+    assert (held.v, held.w) == (0.0, 0.0)
+    assert held.valid and not displaced.success
+    assert "等待 FSM 阶段切换" in displaced.failure_reason
+
+    replacement = NavGoal(
+        "replacement", "return", (1.0, 0.0, 0.0), "odom", 0.05, 0.1, 2_000_000_000
+    )
+    moving, replacement_status = controller.update(
+        _nav_base(x=-0.2, stamp=1_100_000_000), replacement, 1_100_000_000
+    )
+    assert moving.v > 0.0 and not replacement_status.success
+
+
+def test_navigation_abnormal_settled_odom_interval_fails_closed() -> None:
+    controller = NavigationController(
+        NavigationConfig(settled_required_cycles=2, settled_max_odom_gap_ns=10)
+    )
+    goal = _nav_goal(0.01, 0.0, 0.0)
+    controller.update(_nav_base(stamp=1_000), goal, 1_000)
+    command, status = controller.update(_nav_base(stamp=1_011), goal, 1_011)
+    assert (command.v, command.w) == (0.0, 0.0)
+    assert not command.valid
+    assert status.state == "failed" and "时间间隔异常" in status.failure_reason
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"max_settled_linear_speed_mps": -0.01},
+        {"max_settled_angular_speed_radps": math.nan},
+        {"settled_required_cycles": 0},
+        {"settled_required_cycles": True},
+        {"settled_max_odom_gap_ns": 0},
+    ],
+)
+def test_navigation_rejects_invalid_settling_configuration(
+    kwargs: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError):
+        NavigationConfig(**kwargs)  # type: ignore[arg-type]
 
 
 def test_navigation_update_safely_stops_on_timeout_invalid_and_stale_odom() -> None:
