@@ -563,7 +563,7 @@ orphan 规则见
 | `perception.estimator_3d.max_position_jump_m` | `1.0` | 单轨迹相邻三维中心最大允许跳变 |
 | `perception.estimator_3d.object_dimensions_m.*` | `[0.24, 0.16, 0.19]` | 启发式中心补偿使用的宽、高、沿相机视线近似深度；不是物体局部XYZ尺寸 |
 | `perception.estimator_3d.object_local_size_xyz_m.*` | `[0.24, 0.16, 0.19]` | 官方模型确认的物体局部坐标系完整XYZ尺寸；只用于`size_xyz_m`，不推断姿态 |
-| `perception.estimator_3d.pose_refinement.*` | 见默认配置 | 框内点云深度带、最少点数、连续帧数及位置/角度/尺寸误差门限；均为待真实相机标定的团队初值 |
+| `perception.estimator_3d.pose_refinement.*` | `enabled: false`，其余见默认配置 | 框内点云深度带、最少点数、连续帧数及位置/角度/尺寸误差门限；均为待真实相机标定的团队初值，正式联调前默认关闭 |
 | `recorder.enabled` | `false` | 默认不启动记录 |
 | `recorder.record_rosbag` | `true` | 启动 Recorder 时同时管理 rosbag |
 | `recorder.root_dir` | `./team_sorting_dataset` | Recorder schema v1 dataset root；旧扁平目录不自动迁移 |
@@ -590,9 +590,11 @@ orphan 规则见
 π/2；这不会交换物体局部轴。箱体使用自由关节，运行中不能据此假设 roll/pitch 永远为
 零；该静态模型事实本身不能产生实时姿态。启用 `pose_refinement` 后，估计器只取二维框
 内靠近可见表面深度的点，反投影到相机点云并变换到输出 frame；随后以 PCA 主轴和已知
-局部尺寸筛选长方体 OBB，得到局部轴到输出 frame 的 `xyzw` 四元数候选。同一稳定
-`track_id` 必须连续满足位置、角度和尺寸误差门限达到 `required_frames`，才输出姿态；
-否则仍为 `None`。中心对称长方体无法仅凭点云区分局部轴的 180° 符号翻转，代码固定选择
+局部尺寸筛选长方体 OBB，得到点云拟合中心和局部轴到输出 frame 的 `xyzw` 四元数候选；
+只观测到单个表面时，结合相机位置与已知半尺寸从可见面恢复中心。同一稳定 `track_id`
+必须连续满足中心位置、角度和尺寸误差门限达到 `required_frames`，才原子输出 refined
+中心与姿态；否则继续输出原快速启发式中心且姿态为 `None`。中心对称长方体无法仅凭点云
+区分局部轴的 180° 符号翻转，代码固定选择
 同一有向包围盒中最接近单位姿态的等价代表，不能把它描述为恢复了 MJCF body 轴符号。
 不得用单位四元数或 MJCF 初始姿态补造观测。该算法已有合成点云回归，但正式相机噪声、
 遮挡和动态翻滚仍待在线验证。
@@ -732,7 +734,7 @@ Run/Task/Attempt 层级；Segment 边界不被描述为正式训练 Episode 边�
 - 三个 ROS 2 节点入口、消息转换、时间缓存和官方发布出口骨架；
 - YOLO、MMK2FK、KDL 薄适配器及缺失依赖的清晰报错；
 - YOLO 检测的 RGB frame 传递、二维稳定轨迹 ID 与 PerceptionNode 接线；
-- 三维深度中位数、反投影、配置尺寸中心补偿、独立局部尺寸输出、点云长方体姿态拟合、稳定 ID 多帧 refine、跳变拒绝与三方时帧校验；
+- 三维深度中位数、反投影、配置尺寸中心补偿、独立局部尺寸输出、点云长方体中心/姿态拟合、稳定 ID 多帧 refine、跳变拒绝与三方时帧校验；
 - Recorder schema v1 bootstrap/run-bound 生命周期、manifest/segment/event、只读恢复报告，
   以及兼容 metadata、FSM/动作 JSONL 和分段外部 rosbag 管理链；
 - 几何、任务解析、FSM、19 维动作、安全覆盖与 Recorder 的测试骨架。
@@ -740,7 +742,7 @@ Run/Task/Attempt 层级；Segment 边界不被描述为正式训练 Episode 边�
 ### 尚未完成
 
 - 正式 YOLO/相机环境中的检测与二维稳定器参数联调；
-- 点云姿态/refine 在正式相机噪声与遮挡下的参数标定，以及正式 ROS/MMK2FK 环境中的三维坐标、时间同步和 planning frame 端到端验证；
+- 点云中心/姿态 refine 在正式相机噪声与遮挡下的参数标定，以及正式 ROS/MMK2FK 环境中的三维坐标、时间同步和 planning frame 端到端验证（通过前默认关闭）；
 - 抓取/放置站位生成、航点导航、精对准和底盘控制；
 - 由物体中心生成抓取/放置末端位姿，以及完整 IK/轨迹规划；
 - ArmExecution与ROS/FSM的运行时接线及官方环境参数标定；

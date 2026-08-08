@@ -169,13 +169,16 @@ def _rotation_matrix_to_xyzw(matrix: Any) -> tuple[float, float, float, float]:
     return quaternion
 
 
-def _fit_cuboid_orientation_xyzw(
+def _fit_cuboid_pose(
     points_xyz: Any,
     size_xyz_m: tuple[float, float, float],
     max_extent_error_ratio: float,
     np: Any,
-) -> Optional[tuple[float, float, float, float]]:
-    """由可见点云拟合已知长方体的对称等价局部轴姿态。
+    camera_position_xyz: Any = None,
+) -> Optional[
+    tuple[tuple[float, float, float], tuple[float, float, float, float]]
+]:
+    """由可见点云拟合已知长方体的中心和对称等价局部轴姿态。
 
     PCA 给出可见面的三条正交主轴，再枚举轴排列并以已知局部 XYZ 完整尺寸筛选。
     长方体点云无法区分绕任意局部轴 180° 翻转，因此返回离输出 frame 单位姿态最近的
@@ -224,16 +227,50 @@ def _fit_cuboid_orientation_xyzw(
         return None
 
     rotation = axes[:, best[1]]
-    candidates: list[tuple[float, float, float, float]] = []
+    candidates: list[tuple[tuple[float, float, float, float], Any]] = []
     for signs in product((-1.0, 1.0), repeat=3):
         signed = rotation * np.asarray(signs, dtype=float)
         if float(np.linalg.det(signed)) <= 0.0:
             continue
-        candidates.append(_rotation_matrix_to_xyzw(signed))
+        candidates.append((_rotation_matrix_to_xyzw(signed), signed))
     if not candidates:
         return None
     # 箱体中心对称使四个右手符号组合几何等价；选最接近单位姿态的确定性代表。
-    return max(candidates, key=lambda item: (abs(item[3]), item))
+    quaternion, rotation = max(
+        candidates, key=lambda item: (abs(item[0][3]), item[0])
+    )
+    local_points = points @ rotation
+    lower = np.percentile(local_points, 2.5, axis=0)
+    upper = np.percentile(local_points, 97.5, axis=0)
+    observed = upper - lower
+    local_center = (lower + upper) / 2.0
+    for index in range(3):
+        if float(observed[index]) >= 0.2 * size_xyz_m[index]:
+            continue
+        if camera_position_xyz is None:
+            return None
+        camera_local = np.asarray(camera_position_xyz, dtype=float) @ rotation
+        surface = float(np.median(local_points[:, index]))
+        direction = 1.0 if float(camera_local[index]) >= surface else -1.0
+        local_center[index] = surface - direction * size_xyz_m[index] / 2.0
+    center = local_center @ rotation.T
+    if not bool(np.all(np.isfinite(center))):
+        return None
+    return tuple(float(value) for value in center), quaternion
+
+
+def _fit_cuboid_orientation_xyzw(
+    points_xyz: Any,
+    size_xyz_m: tuple[float, float, float],
+    max_extent_error_ratio: float,
+    np: Any,
+) -> Optional[tuple[float, float, float, float]]:
+    """兼容只需要完整长方体点云姿态的内部测试入口。"""
+
+    result = _fit_cuboid_pose(
+        points_xyz, size_xyz_m, max_extent_error_ratio, np
+    )
+    return None if result is None else result[1]
 
 
 @dataclass(frozen=True)
@@ -1219,10 +1256,9 @@ class Perception3DEstimator:
             joints,
             legacy_point_transform,
         )
-        orientation, pose_count = self._update_pose_refinement(
+        refined_position, orientation, pose_count = self._update_pose_refinement(
             track_key,
             pose_candidate,
-            world_point,
         )
         converge = min(1.0, count / self.converge_frames)
         confidence *= (
@@ -1233,18 +1269,20 @@ class Perception3DEstimator:
         confidence = max(0.0, min(1.0, confidence))
         return ObjectEstimate3D(
             class_id=detection.class_id,
-            position_xyz=filtered_point,
+            position_xyz=(
+                refined_position if refined_position is not None else filtered_point
+            ),
             confidence=confidence,
             frame_id=output_frame,
             timestamp_ns=timestamp_ns,
             valid=True,
             failure_reason=(
-                "heuristic center approximation "
-                "(surface-to-center not validated)"
-                + (
-                    "; point-cloud cuboid pose converged"
-                    if orientation is not None
-                    else (
+                "point-cloud cuboid center/pose converged"
+                if orientation is not None
+                else (
+                    "heuristic center approximation "
+                    "(surface-to-center not validated)"
+                    + (
                         f"; point-cloud pose pending ({pose_count}/"
                         f"{self.pose_required_frames})"
                         if self.pose_refinement_enabled
@@ -1265,8 +1303,10 @@ class Perception3DEstimator:
         base: BaseState,
         joints: RobotJointState,
         legacy_point_transform: bool,
-    ) -> Optional[tuple[float, float, float, float]]:
-        """把当前框点云变到输出 frame，并生成单帧长方体姿态候选。"""
+    ) -> Optional[
+        tuple[tuple[float, float, float], tuple[float, float, float, float]]
+    ]:
+        """把当前框点云变到输出 frame，并生成单帧长方体中心/姿态候选。"""
 
         size = self._local_sizes.get(class_id)
         if not self.pose_refinement_enabled or size is None or probe.camera_points_xyz is None:
@@ -1286,6 +1326,9 @@ class Perception3DEstimator:
                         for point in camera_points
                     ],
                     dtype=float,
+                )
+                camera_position = self.transform_provider.camera_to_output(
+                    (0.0, 0.0, 0.0), base, joints
                 )
             else:
                 if head_pose is None:
@@ -1315,11 +1358,13 @@ class Perception3DEstimator:
                 output_points = camera_points @ rotation.T + np.asarray(
                     head_pose.position, dtype=float
                 )
-            return _fit_cuboid_orientation_xyzw(
+                camera_position = head_pose.position
+            return _fit_cuboid_pose(
                 output_points,
                 size,
                 self.pose_max_extent_error_ratio,
                 np,
+                camera_position,
             )
         except (TypeError, ValueError, RuntimeError, np.linalg.LinAlgError):
             return None
@@ -1327,21 +1372,27 @@ class Perception3DEstimator:
     def _update_pose_refinement(
         self,
         track_key: Optional[str],
-        candidate_xyzw: Optional[tuple[float, float, float, float]],
-        position_xyz: tuple[float, float, float],
-    ) -> tuple[Optional[tuple[float, float, float, float]], int]:
-        """同一稳定ID连续收敛后才发布姿态；断证据或跳变立即重新累计。"""
+        candidate_pose: Optional[
+            tuple[tuple[float, float, float], tuple[float, float, float, float]]
+        ],
+    ) -> tuple[
+        Optional[tuple[float, float, float]],
+        Optional[tuple[float, float, float, float]],
+        int,
+    ]:
+        """同一稳定ID的点云中心和姿态连续收敛后才成对发布。"""
 
         if not self.pose_refinement_enabled or track_key is None:
-            return None, 0
+            return None, None, 0
         track = self._tracks.get(track_key)
         if track is None:
-            return None, 0
-        if candidate_xyzw is None:
+            return None, None, 0
+        if candidate_pose is None:
             track.pose_quaternion_xyzw = None
             track.pose_count = 0
             track.last_pose_position_xyz = None
-            return None, 0
+            return None, None, 0
+        position_xyz, candidate_xyzw = candidate_pose
         candidate = list(candidate_xyzw)
         previous = track.pose_quaternion_xyzw
         reset = previous is None or track.last_pose_position_xyz is None
@@ -1358,6 +1409,7 @@ class Perception3DEstimator:
             )
         if reset:
             track.pose_quaternion_xyzw = candidate
+            track.last_pose_position_xyz = position_xyz
             track.pose_count = 1
         else:
             assert previous is not None
@@ -1369,15 +1421,26 @@ class Perception3DEstimator:
             norm = math.sqrt(sum(value * value for value in blended))
             if norm < 1e-12:
                 track.pose_quaternion_xyzw = candidate
+                track.last_pose_position_xyz = position_xyz
                 track.pose_count = 1
             else:
                 track.pose_quaternion_xyzw = [value / norm for value in blended]
+                assert track.last_pose_position_xyz is not None
+                track.last_pose_position_xyz = tuple(
+                    self.ema_alpha * position_xyz[index]
+                    + (1.0 - self.ema_alpha) * track.last_pose_position_xyz[index]
+                    for index in range(3)
+                )
                 track.pose_count += 1
-        track.last_pose_position_xyz = position_xyz
         if track.pose_count < self.pose_required_frames:
-            return None, track.pose_count
+            return None, None, track.pose_count
         assert track.pose_quaternion_xyzw is not None
-        return tuple(track.pose_quaternion_xyzw), track.pose_count
+        assert track.last_pose_position_xyz is not None
+        return (
+            track.last_pose_position_xyz,
+            tuple(track.pose_quaternion_xyzw),
+            track.pose_count,
+        )
 
     def _surface_probe(
         self,

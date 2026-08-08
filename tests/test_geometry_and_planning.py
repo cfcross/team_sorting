@@ -842,7 +842,7 @@ def test_config_numeric_types_finiteness_and_ranges() -> None:
         "max_angular_delta_rad",
         "max_extent_error_ratio",
     }
-    assert pose["enabled"] is True
+    assert pose["enabled"] is False
     assert isinstance(pose["min_points"], int) and pose["min_points"] > 0
     assert isinstance(pose["required_frames"], int) and pose["required_frames"] > 0
     for name in (
@@ -1408,7 +1408,8 @@ def test_perception_point_cloud_pose_requires_stable_multiframe_refine() -> None
     estimator = Perception3DEstimator(
         _OffsetTransformProvider(),
         converge_frames=1,
-        object_dimensions_m={"pink": (0.24, 0.16, 0.19)},
+        # SEARCH 的旧视线启发式深度故意与已确认局部尺寸不同，证明成功后中心换源。
+        object_dimensions_m={"pink": (0.24, 0.16, 0.33)},
         object_local_size_xyz_m={"pink": (0.24, 0.16, 0.19)},
         pose_refinement_enabled=True,
         pose_min_points=64,
@@ -1439,8 +1440,88 @@ def test_perception_point_cloud_pose_requires_stable_multiframe_refine() -> None
     assert results[0].orientation_xyzw is None
     assert results[1].orientation_xyzw is None
     assert results[2].orientation_xyzw is not None
+    # 点云平面位于相机 z=1.0；SEARCH 用旧启发式深度0.33得到1.165，
+    # REFINE 则用局部深度0.19拟合出中心1.095，明确证明 position 已换源。
+    assert results[0].position_xyz[2] == pytest.approx(1.165)
+    assert results[1].position_xyz[2] == pytest.approx(1.165)
+    assert results[2].position_xyz[2] == pytest.approx(1.095, abs=1e-6)
     assert 2.0 * math.acos(abs(results[2].orientation_xyzw[3])) < 0.01
     assert "pose converged" in results[2].failure_reason
+
+
+@pytest.mark.parametrize("failure", ("insufficient", "bad_depth", "size_mismatch"))
+def test_perception_point_cloud_refine_failures_keep_orientation_unknown(
+    failure: str,
+) -> None:
+    local_size = (
+        (0.60, 0.50, 0.40)
+        if failure == "size_mismatch"
+        else (0.24, 0.16, 0.19)
+    )
+    estimator = Perception3DEstimator(
+        _OffsetTransformProvider(),
+        converge_frames=1,
+        object_dimensions_m={"pink": (0.24, 0.16, 0.33)},
+        object_local_size_xyz_m={"pink": local_size},
+        pose_refinement_enabled=True,
+        pose_min_points=100_000 if failure == "insufficient" else 64,
+        pose_required_frames=1,
+        pose_max_extent_error_ratio=0.1,
+    )
+    image = np.full((480, 640), 1000.0)
+    if failure == "bad_depth":
+        image[:] = np.nan
+    result = estimator.estimate(
+        (_estimator_detection(track_id=10),),
+        _estimator_depth(1000.0, 100, image=image),
+        _intrinsics(timestamp_ns=100),
+        _base(),
+        _actual_joints(),
+    )[0]
+
+    assert result.orientation_xyzw is None
+    if failure != "bad_depth":
+        assert result.valid
+        assert result.position_xyz[2] == pytest.approx(1.165)
+
+
+@pytest.mark.parametrize("unstable_component", ("center", "orientation"))
+def test_perception_point_cloud_unstable_pose_resets_multiframe_refine(
+    unstable_component: str,
+) -> None:
+    estimator = Perception3DEstimator(
+        _OffsetTransformProvider(),
+        converge_frames=1,
+        object_dimensions_m={"pink": (0.24, 0.16, 0.33)},
+        object_local_size_xyz_m={"pink": (0.24, 0.16, 0.19)},
+        pose_refinement_enabled=True,
+        pose_required_frames=2,
+        pose_max_position_delta_m=0.01,
+    )
+    stable = ((0.0, 0.0, 1.095), (0.0, 0.0, 0.0, 1.0))
+    unstable = (
+        ((0.0, 0.0, 1.195), stable[1])
+        if unstable_component == "center"
+        else (stable[0], (0.0, 0.0, math.sqrt(0.5), math.sqrt(0.5)))
+    )
+    candidates = iter((stable, unstable, stable))
+    estimator._point_cloud_pose_candidate = (  # type: ignore[method-assign]
+        lambda *args: next(candidates)
+    )
+
+    results = [
+        estimator.estimate(
+            (_estimator_detection(timestamp_ns=timestamp_ns, track_id=10),),
+            _estimator_depth(1000.0, timestamp_ns),
+            _intrinsics(timestamp_ns=timestamp_ns),
+            _base(),
+            _actual_joints(),
+        )[0]
+        for timestamp_ns in (100, 101, 102)
+    ]
+
+    assert all(result.orientation_xyzw is None for result in results)
+    assert all(result.position_xyz[2] == pytest.approx(1.165) for result in results)
 
 
 def test_cuboid_point_cloud_fit_recovers_rotated_axes_up_to_box_symmetry() -> None:

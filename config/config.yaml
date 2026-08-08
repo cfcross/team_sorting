@@ -126,7 +126,7 @@ perception:
     # 框内深度点云的PCA/已知长方体尺寸拟合；只有同一稳定track连续多帧的位置和
     # 姿态都收敛才发布四元数。阈值是团队仿真初值，真实相机仍需标定。
     pose_refinement:
-      enabled: true
+      enabled: false
       min_points: 64
       required_frames: 3
       depth_band_m: 0.08
