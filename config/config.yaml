@@ -123,6 +123,16 @@ perception:
       pink: [0.24, 0.16, 0.19]
       yellow: [0.24, 0.16, 0.19]
       brown: [0.24, 0.16, 0.19]
+    # 框内深度点云的PCA/已知长方体尺寸拟合；只有同一稳定track连续多帧的位置和
+    # 姿态都收敛才发布四元数。阈值是团队仿真初值，真实相机仍需标定。
+    pose_refinement:
+      enabled: false
+      min_points: 64
+      required_frames: 3
+      depth_band_m: 0.08
+      max_position_delta_m: 0.03
+      max_angular_delta_rad: 0.20
+      max_extent_error_ratio: 0.45
 
 # 提交1只冻结配置契约，不构造ArmPlanner。enabled默认关闭；null表示尚未标定，不能由
 # 代码补隐藏默认值。抓取与放置启用前分别调用ArmPlanningConfig的操作级验证。

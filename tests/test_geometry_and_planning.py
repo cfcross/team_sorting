@@ -912,6 +912,7 @@ def test_config_numeric_types_finiteness_and_ranges() -> None:
         "max_position_jump_m",
         "object_dimensions_m",
         "object_local_size_xyz_m",
+        "pose_refinement",
     }
     assert isinstance(estimator["depth_radius_px"], int)
     assert isinstance(estimator["converge_frames"], int)
@@ -934,6 +935,27 @@ def test_config_numeric_types_finiteness_and_ranges() -> None:
         assert tuple(_strict_finite_number(value) for value in values) == pytest.approx(
             (0.24, 0.16, 0.19)
         )
+    pose = estimator["pose_refinement"]
+    assert isinstance(pose, dict)
+    assert set(pose) == {
+        "enabled",
+        "min_points",
+        "required_frames",
+        "depth_band_m",
+        "max_position_delta_m",
+        "max_angular_delta_rad",
+        "max_extent_error_ratio",
+    }
+    assert pose["enabled"] is False
+    assert isinstance(pose["min_points"], int) and pose["min_points"] > 0
+    assert isinstance(pose["required_frames"], int) and pose["required_frames"] > 0
+    for name in (
+        "depth_band_m",
+        "max_position_delta_m",
+        "max_angular_delta_rad",
+        "max_extent_error_ratio",
+    ):
+        assert _strict_finite_number(pose[name]) > 0.0
 
     retry_count = fsm["max_pick_retries"]
     assert isinstance(retry_count, int) and not isinstance(retry_count, bool) and retry_count >= 0
@@ -943,7 +965,7 @@ def test_config_numeric_types_finiteness_and_ranges() -> None:
 
 @pytest.mark.parametrize(
     "invalid_case",
-    ("missing_field", "wrong_classes", "bool_value"),
+    ("missing_field", "missing_pose", "wrong_classes", "bool_value"),
 )
 def test_perception_config_reader_rejects_invalid_local_size_schema(
     invalid_case: str,
@@ -956,6 +978,8 @@ def test_perception_config_reader_rejects_invalid_local_size_schema(
 
     if invalid_case == "missing_field":
         del estimator["object_local_size_xyz_m"]
+    elif invalid_case == "missing_pose":
+        del estimator["pose_refinement"]
     else:
         local_sizes = estimator["object_local_size_xyz_m"]
         assert isinstance(local_sizes, dict)
@@ -972,7 +996,10 @@ def test_perception_config_reader_rejects_invalid_local_size_schema(
         )
 
     message = str(exc_info.value)
-    assert "object_local_size_xyz_m" in message
+    assert (
+        "pose_refinement" if invalid_case == "missing_pose"
+        else "object_local_size_xyz_m"
+    ) in message
     if invalid_case == "wrong_classes":
         assert "brown" in message and "red" in message
     if invalid_case == "bool_value":
@@ -1479,6 +1506,172 @@ def test_perception_independent_local_size_is_published_without_axis_swapping() 
     assert result.orientation_xyzw is None
     assert estimator._dims["pink"] == (0.11, 0.22, 0.33)
     assert estimator._local_sizes["pink"] == (0.24, 0.16, 0.19)
+
+
+def test_perception_point_cloud_pose_requires_stable_multiframe_refine() -> None:
+    estimator = Perception3DEstimator(
+        _OffsetTransformProvider(),
+        converge_frames=1,
+        # SEARCH 的旧视线启发式深度故意与已确认局部尺寸不同，证明成功后中心换源。
+        object_dimensions_m={"pink": (0.24, 0.16, 0.33)},
+        object_local_size_xyz_m={"pink": (0.24, 0.16, 0.19)},
+        pose_refinement_enabled=True,
+        pose_min_points=64,
+        pose_required_frames=3,
+        pose_depth_band_m=0.05,
+        pose_max_position_delta_m=0.01,
+        pose_max_angular_delta_rad=0.1,
+        pose_max_extent_error_ratio=0.1,
+    )
+    results = []
+    for timestamp_ns in (100, 101, 102):
+        results.append(
+            estimator.estimate(
+                (
+                    _estimator_detection(
+                        bbox_xyxy=(260.0, 200.0, 380.0, 280.0),
+                        timestamp_ns=timestamp_ns,
+                        track_id=10,
+                    ),
+                ),
+                _estimator_depth(1000.0, timestamp_ns),
+                _intrinsics(timestamp_ns=timestamp_ns),
+                _base(),
+                _actual_joints(),
+            )[0]
+        )
+
+    assert results[0].orientation_xyzw is None
+    assert results[1].orientation_xyzw is None
+    assert results[2].orientation_xyzw is not None
+    # 点云平面位于相机 z=1.0；SEARCH 用旧启发式深度0.33得到1.165，
+    # REFINE 则用局部深度0.19拟合出中心1.095，明确证明 position 已换源。
+    assert results[0].position_xyz[2] == pytest.approx(1.165)
+    assert results[1].position_xyz[2] == pytest.approx(1.165)
+    assert results[2].position_xyz[2] == pytest.approx(1.095, abs=1e-6)
+    assert 2.0 * math.acos(abs(results[2].orientation_xyzw[3])) < 0.01
+    assert "pose converged" in results[2].failure_reason
+
+
+@pytest.mark.parametrize("failure", ("insufficient", "bad_depth", "size_mismatch"))
+def test_perception_point_cloud_refine_failures_keep_orientation_unknown(
+    failure: str,
+) -> None:
+    local_size = (
+        (0.60, 0.50, 0.40)
+        if failure == "size_mismatch"
+        else (0.24, 0.16, 0.19)
+    )
+    estimator = Perception3DEstimator(
+        _OffsetTransformProvider(),
+        converge_frames=1,
+        object_dimensions_m={"pink": (0.24, 0.16, 0.33)},
+        object_local_size_xyz_m={"pink": local_size},
+        pose_refinement_enabled=True,
+        pose_min_points=100_000 if failure == "insufficient" else 64,
+        pose_required_frames=1,
+        pose_max_extent_error_ratio=0.1,
+    )
+    image = np.full((480, 640), 1000.0)
+    if failure == "bad_depth":
+        image[:] = np.nan
+    result = estimator.estimate(
+        (_estimator_detection(track_id=10),),
+        _estimator_depth(1000.0, 100, image=image),
+        _intrinsics(timestamp_ns=100),
+        _base(),
+        _actual_joints(),
+    )[0]
+
+    assert result.orientation_xyzw is None
+    if failure != "bad_depth":
+        assert result.valid
+        assert result.position_xyz[2] == pytest.approx(1.165)
+
+
+@pytest.mark.parametrize("unstable_component", ("center", "orientation"))
+def test_perception_point_cloud_unstable_pose_resets_multiframe_refine(
+    unstable_component: str,
+) -> None:
+    estimator = Perception3DEstimator(
+        _OffsetTransformProvider(),
+        converge_frames=1,
+        object_dimensions_m={"pink": (0.24, 0.16, 0.33)},
+        object_local_size_xyz_m={"pink": (0.24, 0.16, 0.19)},
+        pose_refinement_enabled=True,
+        pose_required_frames=2,
+        pose_max_position_delta_m=0.01,
+    )
+    stable = ((0.0, 0.0, 1.095), (0.0, 0.0, 0.0, 1.0))
+    unstable = (
+        ((0.0, 0.0, 1.195), stable[1])
+        if unstable_component == "center"
+        else (stable[0], (0.0, 0.0, math.sqrt(0.5), math.sqrt(0.5)))
+    )
+    candidates = iter((stable, unstable, stable))
+    estimator._point_cloud_pose_candidate = (  # type: ignore[method-assign]
+        lambda *args: next(candidates)
+    )
+
+    results = [
+        estimator.estimate(
+            (_estimator_detection(timestamp_ns=timestamp_ns, track_id=10),),
+            _estimator_depth(1000.0, timestamp_ns),
+            _intrinsics(timestamp_ns=timestamp_ns),
+            _base(),
+            _actual_joints(),
+        )[0]
+        for timestamp_ns in (100, 101, 102)
+    ]
+
+    assert all(result.orientation_xyzw is None for result in results)
+    assert all(result.position_xyz[2] == pytest.approx(1.165) for result in results)
+
+
+def test_cuboid_point_cloud_fit_recovers_rotated_axes_up_to_box_symmetry() -> None:
+    size = np.asarray((0.24, 0.16, 0.19))
+    coordinates = [
+        np.linspace(-extent / 2.0, extent / 2.0, 9) for extent in size
+    ]
+    points = []
+    for axis in range(3):
+        others = [index for index in range(3) if index != axis]
+        for sign in (-1.0, 1.0):
+            for first in coordinates[others[0]]:
+                for second in coordinates[others[1]]:
+                    point = np.zeros(3)
+                    point[axis] = sign * size[axis] / 2.0
+                    point[others[0]] = first
+                    point[others[1]] = second
+                    points.append(point)
+    yaw, pitch, roll = 0.55, -0.30, 0.20
+    cz, sz = math.cos(yaw), math.sin(yaw)
+    cy, sy = math.cos(pitch), math.sin(pitch)
+    cx, sx = math.cos(roll), math.sin(roll)
+    expected_rotation = np.asarray(
+        (
+            (cz * cy, cz * sy * sx - sz * cx, cz * sy * cx + sz * sx),
+            (sz * cy, sz * sy * sx + cz * cx, sz * sy * cx - cz * sx),
+            (-sy, cy * sx, cy * cx),
+        )
+    )
+    rotated = np.asarray(points) @ expected_rotation.T + np.asarray((1.0, 2.0, 3.0))
+    quaternion = perception_3d_module._fit_cuboid_orientation_xyzw(
+        rotated, tuple(size), 0.1, np
+    )
+
+    assert quaternion is not None
+    x, y, z, w = quaternion
+    actual_rotation = np.asarray(
+        (
+            (1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)),
+            (2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)),
+            (2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)),
+        )
+    )
+    assert np.abs(actual_rotation.T @ expected_rotation) == pytest.approx(
+        np.eye(3), abs=1e-6
+    )
 
 
 @pytest.mark.parametrize(
