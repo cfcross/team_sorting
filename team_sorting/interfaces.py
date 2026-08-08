@@ -1817,6 +1817,25 @@ class GraspVerification:
     failure_reason: str
     timestamp_ns: int
 
+    def __post_init__(self) -> None:
+        """在公共接口构造边界拒绝类型或范围无效的抓取验证结果。"""
+
+        _strict_bool(self.is_grasped, "GraspVerification.is_grasped")
+        _strict_bool(self.success, "GraspVerification.success")
+        _require_finite_real(self.confidence, "GraspVerification.confidence")
+        if not 0.0 <= float(self.confidence) <= 1.0:
+            raise ValueError("GraspVerification.confidence 必须位于 [0,1]")
+        _require_string(
+            self.visual_evidence, "GraspVerification.visual_evidence"
+        )
+        _require_string(
+            self.effort_evidence, "GraspVerification.effort_evidence"
+        )
+        _require_string(self.failure_reason, "GraspVerification.failure_reason")
+        _strict_nonnegative_ns(
+            self.timestamp_ns, "GraspVerification.timestamp_ns"
+        )
+
 
 # FSM与最终动作
 
