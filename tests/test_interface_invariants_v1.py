@@ -15,6 +15,7 @@ from team_sorting.interfaces import (
     FSMStatus,
     FinalAction,
     GlobalPhase,
+    GraspVerification,
     IKResult,
     LocalPhase,
     ManipulationCommand,
@@ -82,6 +83,100 @@ def _final_action() -> FinalAction:
         (0.0,) * 19, 0, NOW, GlobalPhase.SEARCH_TARGET, LocalPhase.IDLE,
         True, False, "",
     )
+
+
+def _grasp_verification(**overrides: object) -> GraspVerification:
+    values: dict[str, object] = {
+        "is_grasped": True,
+        "confidence": 0.9,
+        "visual_evidence": "v",
+        "effort_evidence": "e",
+        "success": True,
+        "failure_reason": "",
+        "timestamp_ns": 100,
+    }
+    values.update(overrides)
+    return GraspVerification(**values)  # type: ignore[arg-type]
+
+
+def test_grasp_verification_valid_construct() -> None:
+    verification = _grasp_verification()
+    assert verification.timestamp_ns == 100
+
+
+@pytest.mark.parametrize("value", (1, "yes", 0))
+def test_grasp_verification_is_grasped_rejects_non_strict_bool(
+    value: object,
+) -> None:
+    with pytest.raises(ValueError, match="is_grasped"):
+        _grasp_verification(is_grasped=value)
+
+
+@pytest.mark.parametrize("value", (1, "true"))
+def test_grasp_verification_success_rejects_non_strict_bool(
+    value: object,
+) -> None:
+    with pytest.raises(ValueError, match="success"):
+        _grasp_verification(success=value)
+
+
+def test_grasp_verification_confidence_rejects_bool() -> None:
+    with pytest.raises(ValueError, match="confidence"):
+        _grasp_verification(confidence=True)
+
+
+@pytest.mark.parametrize("value", ("0.9", None))
+def test_grasp_verification_confidence_rejects_non_real(value: object) -> None:
+    with pytest.raises(ValueError, match="confidence"):
+        _grasp_verification(confidence=value)
+
+
+@pytest.mark.parametrize("value", (float("nan"), float("inf")))
+def test_grasp_verification_confidence_rejects_nonfinite(value: float) -> None:
+    with pytest.raises(ValueError, match="confidence"):
+        _grasp_verification(confidence=value)
+
+
+@pytest.mark.parametrize("value", (1.5, -0.1))
+def test_grasp_verification_confidence_rejects_out_of_range(value: float) -> None:
+    with pytest.raises(ValueError, match="confidence"):
+        _grasp_verification(confidence=value)
+
+
+@pytest.mark.parametrize("value", (123, None))
+def test_grasp_verification_visual_evidence_rejects_non_string(
+    value: object,
+) -> None:
+    with pytest.raises(ValueError, match="visual_evidence"):
+        _grasp_verification(visual_evidence=value)
+
+
+def test_grasp_verification_effort_evidence_rejects_non_string() -> None:
+    with pytest.raises(ValueError, match="effort_evidence"):
+        _grasp_verification(effort_evidence=None)
+
+
+@pytest.mark.parametrize("value", (None, 123))
+def test_grasp_verification_failure_reason_rejects_non_string(
+    value: object,
+) -> None:
+    with pytest.raises(ValueError, match="failure_reason"):
+        _grasp_verification(failure_reason=value)
+
+
+def test_grasp_verification_timestamp_rejects_bool() -> None:
+    with pytest.raises(ValueError, match="timestamp_ns"):
+        _grasp_verification(timestamp_ns=True)
+
+
+def test_grasp_verification_timestamp_rejects_float() -> None:
+    with pytest.raises(ValueError, match="timestamp_ns"):
+        _grasp_verification(timestamp_ns=1.0)
+
+
+def test_grasp_verification_timestamp_rejects_negative() -> None:
+    with pytest.raises(ValueError, match="timestamp_ns"):
+        _grasp_verification(timestamp_ns=-1)
 
 
 def test_all_target_types_accept_existing_production_shapes() -> None:
