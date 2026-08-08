@@ -36,6 +36,7 @@ from .interfaces import (
 _ODOM_FRAME_ID = "odom"
 _WORLD_FRAME_ID = "world"
 _RETURN_END_POSE_XYYAW = (-0.70, 0.55, math.pi / 2.0)
+_EARLY_SIMULATION_PLACE_STRATEGY = "early_simulation_standoff_strategy"
 
 
 def _finite_real(value: object, field_name: str) -> float:
@@ -77,6 +78,12 @@ class NavigationConfig:
     linear_kp: float = 0.8
     angular_kp: float = 1.5
     heading_stop_rad: float = math.pi / 4.0
+    # 以下停稳值是模块内保守提案，不是官方仿真标定结果；共享配置获批前不得据此
+    # 宣称导航已可正式接线。连续确认按不同 Odom 时间戳计数，不能重复消费同一帧。
+    max_settled_linear_speed_mps: float = 0.01
+    max_settled_angular_speed_radps: float = 0.02
+    settled_required_cycles: int = 3
+    settled_max_odom_gap_ns: int = 200_000_000
 
     def __post_init__(self) -> None:
         positive_fields = (
@@ -100,6 +107,22 @@ class NavigationConfig:
         ):
             if _nonnegative_int(value, f"NavigationConfig.{name}") == 0:
                 raise ValueError(f"NavigationConfig.{name}必须大于零")
+        for name, value in (
+            ("max_settled_linear_speed_mps", self.max_settled_linear_speed_mps),
+            ("max_settled_angular_speed_radps", self.max_settled_angular_speed_radps),
+        ):
+            if _finite_real(value, f"NavigationConfig.{name}") < 0.0:
+                raise ValueError(f"NavigationConfig.{name}必须大于等于零")
+        if _nonnegative_int(
+            self.settled_required_cycles,
+            "NavigationConfig.settled_required_cycles",
+        ) == 0:
+            raise ValueError("NavigationConfig.settled_required_cycles必须大于零")
+        if _nonnegative_int(
+            self.settled_max_odom_gap_ns,
+            "NavigationConfig.settled_max_odom_gap_ns",
+        ) == 0:
+            raise ValueError("NavigationConfig.settled_max_odom_gap_ns必须大于零")
 
 
 def _read_xy(point: object, field_name: str) -> tuple[float, float]:
@@ -230,6 +253,10 @@ class NavigationController:
 
     def __init__(self, config: NavigationConfig | None = None) -> None:
         self._config = config if config is not None else NavigationConfig()
+        self._active_goal_key: tuple[object, ...] | None = None
+        self._settled_samples = 0
+        self._last_settled_odom_timestamp_ns: int | None = None
+        self._arrival_latched = False
 
     def build_pick_goal(
         self, task: TaskSpec, target: ObjectEstimate3D, base: BaseState, timestamp_ns: int
@@ -282,7 +309,9 @@ class NavigationController:
     def build_place_goal(self, task: TaskSpec, base: BaseState, timestamp_ns: int) -> NavGoal:
         """根据 ``TaskSpec.place_world_xyz`` 反算放置时的底盘站位。
 
-        ``place_world_xyz`` 是物体最终中心，单位米，不是底盘停车点。当前按冻结的 F1
+        ``place_world_xyz`` 是物体最终中心，单位米，不是底盘停车点。当前使用标识为
+        ``early_simulation_standoff_strategy`` 的固定退让策略，仅获准用于早期官方仿真
+        联调，不代表已处理 place_type/direction、禁入区或机械臂可达性。当前按冻结的 F1
         约定把 world 数值坐标显式复制为 odom 数值坐标；这是绑定当前官方镜像的
         world/odom 对齐策略，不是通用 frame 转换，也不会创建或查询 ROS TF。
         """
@@ -306,7 +335,7 @@ class NavigationController:
         )
         self._finite_vector((goal_x, goal_y, goal_yaw), "放置 NavGoal.pose_xyyaw")
         return NavGoal(
-            f"place-{task.task_id}-{now}",
+            f"place-{_EARLY_SIMULATION_PLACE_STRATEGY}-{task.task_id}-{now}",
             "place",
             (goal_x, goal_y, goal_yaw),
             _ODOM_FRAME_ID,
@@ -346,8 +375,9 @@ class NavigationController:
         输出是带短 TTL 的 ``BaseCommand(v,w)`` 和基于同一份 Odom 的
         ``NavigationStatus``；每次调用只生成一个周期的建议。
 
-        只有实际 Odom 同时满足位置与角度容差时才能 ``success=True``；deadline 过期、
-        frame 不一致或目标无效时必须失败。生成 ``NavGoal`` 或速度命令都不代表已经到达。
+        只有实际 Odom 同时满足位置、角度和停稳速度阈值，并由不同 Odom 帧连续确认后，
+        才能 ``success=True``；deadline 过期、frame 不一致或目标无效时必须失败。生成
+        ``NavGoal`` 或速度命令都不代表已经到达。
         """
 
         try:
@@ -362,6 +392,7 @@ class NavigationController:
                 raise ValueError("NavGoal 与 BaseState frame 不一致")
             deadline = self._timestamp(goal.deadline_ns, "goal.deadline_ns")
             if now >= deadline:
+                self._reset_settled_confirmation()
                 return self._stopped(
                     goal.goal_id,
                     now,
@@ -380,13 +411,84 @@ class NavigationController:
             if position_tolerance < 0.0 or yaw_tolerance < 0.0:
                 raise ValueError("NavGoal 容差不能为负数")
 
+            goal_key = (
+                goal.goal_id,
+                goal.goal_type,
+                goal.pose_xyyaw,
+                goal.frame_id,
+                goal.position_tolerance,
+                goal.yaw_tolerance,
+                goal.deadline_ns,
+            )
+            if goal_key != self._active_goal_key:
+                self._active_goal_key = goal_key
+                self._reset_settled_confirmation()
+                self._arrival_latched = False
+
             # 第二阶段：所有输入确认可靠后，再计算位置误差和最终姿态误差。
             base_x, base_y = _read_xy(base.position_xyz, "base.position_xyz")
             distance_error = distance_xy((base_x, base_y), (goal_x, goal_y))
             final_yaw_error = wrap_to_pi(goal_yaw - base.yaw)
+            linear_speed, angular_speed = self._base_speed_norms(base)
+            if self._arrival_latched:
+                still_settled = (
+                    distance_error <= position_tolerance
+                    and abs(final_yaw_error) <= yaw_tolerance
+                    and linear_speed <= self._config.max_settled_linear_speed_mps
+                    and angular_speed <= self._config.max_settled_angular_speed_radps
+                )
+                return (
+                    BaseCommand(0.0, 0.0, now, now + self._config.command_ttl_ns),
+                    NavigationStatus(
+                        goal.goal_id,
+                        "arrived" if still_settled else "moving",
+                        distance_error,
+                        final_yaw_error,
+                        still_settled,
+                        "" if still_settled else "目标已确认到达，等待 FSM 阶段切换并保持零速",
+                        now,
+                    ),
+                )
             if distance_error <= position_tolerance:
                 # 已进入位置容差：停止平移，只调整目标要求的最终 yaw。
                 if abs(final_yaw_error) <= yaw_tolerance:
+                    if (
+                        linear_speed > self._config.max_settled_linear_speed_mps
+                        or angular_speed
+                        > self._config.max_settled_angular_speed_radps
+                    ):
+                        self._reset_settled_confirmation()
+                        return (
+                            BaseCommand(
+                                0.0, 0.0, now, now + self._config.command_ttl_ns
+                            ),
+                            NavigationStatus(
+                                goal.goal_id,
+                                "moving",
+                                distance_error,
+                                final_yaw_error,
+                                False,
+                                "位置与朝向已满足，等待实际 Odom 速度停稳",
+                                now,
+                            ),
+                        )
+                    self._record_settled_sample(base.timestamp_ns)
+                    if self._settled_samples < self._config.settled_required_cycles:
+                        return (
+                            BaseCommand(
+                                0.0, 0.0, now, now + self._config.command_ttl_ns
+                            ),
+                            NavigationStatus(
+                                goal.goal_id,
+                                "moving",
+                                distance_error,
+                                final_yaw_error,
+                                False,
+                                "位置、朝向和速度已满足，等待连续 Odom 帧确认",
+                                now,
+                            ),
+                        )
+                    self._arrival_latched = True
                     return (
                         BaseCommand(
                             0.0, 0.0, now, now + self._config.command_ttl_ns
@@ -401,6 +503,7 @@ class NavigationController:
                             now,
                         ),
                     )
+                self._reset_settled_confirmation()
                 v = 0.0
                 raw_w = _finite_real(
                     self._config.angular_kp * final_yaw_error, "最终对准角速度"
@@ -409,6 +512,7 @@ class NavigationController:
                 state = "aligning_final_yaw"
                 control_yaw_error = final_yaw_error
             else:
+                self._reset_settled_confirmation()
                 # 尚未到达停车点：先朝向停车点，再按距离比例向前推进。
                 bearing = math.atan2(goal_y - base_y, goal_x - base_x)
                 heading_error = wrap_to_pi(bearing - base.yaw)
@@ -447,6 +551,7 @@ class NavigationController:
             )
         except (TypeError, ValueError, OverflowError) as exc:
             # 非法输入或非有限计算结果统一转成无效零速候选，交给 ActionMux 安全仲裁。
+            self._reset_settled_confirmation()
             goal_id = goal.goal_id if isinstance(goal, NavGoal) else ""
             safe_now = (
                 timestamp_ns
@@ -490,6 +595,59 @@ class NavigationController:
         for index, value in enumerate(base.position_xyz):
             _finite_real(value, f"base.position_xyz[{index}]")
         _finite_real(base.yaw, "base.yaw")
+        self._base_speed_norms(base)
+
+    @staticmethod
+    def _base_speed_norms(base: BaseState) -> tuple[float, float]:
+        """读取 Odom 的三轴实际速度范数，拒绝损坏或非有限反馈。"""
+
+        linear = NavigationController._validated_velocity_vector(
+            base.linear_velocity_xyz, "base.linear_velocity_xyz"
+        )
+        angular = NavigationController._validated_velocity_vector(
+            base.angular_velocity_xyz, "base.angular_velocity_xyz"
+        )
+        return (
+            _finite_real(math.hypot(*linear), "BaseState线速度范数"),
+            _finite_real(math.hypot(*angular), "BaseState角速度范数"),
+        )
+
+    @staticmethod
+    def _validated_velocity_vector(
+        values: object, field_name: str
+    ) -> tuple[float, float, float]:
+        if isinstance(values, (str, bytes)):
+            raise ValueError(f"{field_name}必须包含三项")
+        try:
+            if len(values) != 3:  # type: ignore[arg-type]
+                raise ValueError(f"{field_name}必须包含三项")
+            return tuple(
+                _finite_real(values[index], f"{field_name}[{index}]")  # type: ignore[index]
+                for index in range(3)
+            )  # type: ignore[return-value]
+        except (TypeError, KeyError, IndexError, OverflowError) as exc:
+            raise ValueError(f"{field_name}必须包含三项") from exc
+
+    def _record_settled_sample(self, odom_timestamp_ns: int) -> None:
+        """只用新的、间隔正常的 Odom 帧累计连续停稳确认。"""
+
+        previous = self._last_settled_odom_timestamp_ns
+        if previous is None:
+            self._settled_samples = 1
+            self._last_settled_odom_timestamp_ns = odom_timestamp_ns
+            return
+        if odom_timestamp_ns < previous:
+            raise ValueError("BaseState/Odom 时间戳相对上一停稳样本倒退")
+        if odom_timestamp_ns == previous:
+            return
+        if odom_timestamp_ns - previous > self._config.settled_max_odom_gap_ns:
+            raise ValueError("连续停稳确认的 Odom 时间间隔异常")
+        self._settled_samples += 1
+        self._last_settled_odom_timestamp_ns = odom_timestamp_ns
+
+    def _reset_settled_confirmation(self) -> None:
+        self._settled_samples = 0
+        self._last_settled_odom_timestamp_ns = None
 
     def _stand_off_pose(
         self,
