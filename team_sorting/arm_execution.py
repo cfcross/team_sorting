@@ -14,6 +14,7 @@ from .interfaces import (
     ArmExecutionConfig,
     ArmMotionPhase,
     GlobalPhase,
+    GraspVerification,
     JOINT_NAMES,
     JointTrajectory,
     JointWaypoint,
@@ -175,6 +176,8 @@ class ArmExecutionController:
 
     正式执行必须显式注入 ``ArmExecutionConfig``。暂时允许无参构造，仅用于尚未获准修改
     的 ROS 骨架兼容；该实例不能装载或执行轨迹，并始终失败关闭，不含任何默认参数。
+    当前只提供 ``accept_grasp_verification`` 接收并缓存验证结果；是否据此解除
+    ``VERIFY`` 锁定，仍由后续 ROS/FSM 接线评审决定，本执行器默认保持关闭。
     """
 
     def __init__(self, config: ArmExecutionConfig | None = None) -> None:
@@ -191,7 +194,94 @@ class ArmExecutionController:
         self._last_command: tuple[float, ...] | None = None
         self._initial_position: tuple[float, ...] | None = None
         self._terminal_status: ManipulationStatus | None = None
-        self._cached_verification = None
+        self._cached_verification: GraspVerification | None = None
+        self._verification_received_ns: int | None = None
+
+    def accept_grasp_verification(
+        self, verification: "GraspVerification"
+    ) -> None:
+        """校验并缓存外部抓取验证，留待后续获批的 ROS/FSM 组装层消费。
+
+        本入口只负责接收，不确认 ``GraspContext``，也不会改变局部阶段或让
+        ``step`` 自动越过 ``VERIFY``。所有检查在写入前完成，避免非法输入
+        覆盖此前已经接收的有效验证。
+
+        校验规则：
+        - ``is_grasped`` / ``success``：严格 ``bool``；
+        - ``confidence``：有限实数，范围 ``[0.0, 1.0]``，禁止 ``bool``；
+        - ``visual_evidence`` / ``effort_evidence`` / ``failure_reason``：``str``；
+        - ``timestamp_ns``：非负 ``int``，禁止 ``bool``；
+        - 时间单调性：旧 timestamp 拒绝；相同 timestamp 且内容相同可幂等；
+          相同 timestamp 但内容不同则 fail closed。
+        """
+
+        if not isinstance(verification, GraspVerification):
+            raise ValueError("verification必须是GraspVerification实例")
+
+        required_fields = (
+            "is_grasped",
+            "confidence",
+            "visual_evidence",
+            "effort_evidence",
+            "success",
+            "failure_reason",
+            "timestamp_ns",
+        )
+        missing_fields = tuple(
+            name for name in required_fields if not hasattr(verification, name)
+        )
+        if missing_fields:
+            raise ValueError(
+                f"verification字段不完整，缺少：{', '.join(missing_fields)}"
+            )
+
+        # 1. 严格字段类型/范围校验（任何失败都不应覆盖缓存）
+        if type(verification.is_grasped) is not bool:
+            raise ValueError("verification.is_grasped必须是严格bool")
+
+        confidence = verification.confidence
+        if type(confidence) is bool or not isinstance(confidence, Real):
+            raise ValueError("verification.confidence必须是数值且不能是bool")
+        try:
+            confidence_value = float(confidence)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("verification.confidence必须能转换为有限浮点数") from exc
+        if not math.isfinite(confidence_value):
+            raise ValueError("verification.confidence必须是有限数值")
+        if not (0.0 <= confidence_value <= 1.0):
+            raise ValueError("verification.confidence必须位于[0.0, 1.0]")
+
+        if not isinstance(verification.visual_evidence, str):
+            raise ValueError("verification.visual_evidence必须是字符串")
+        if not isinstance(verification.effort_evidence, str):
+            raise ValueError("verification.effort_evidence必须是字符串")
+
+        if type(verification.success) is not bool:
+            raise ValueError("verification.success必须是严格bool")
+        if not isinstance(verification.failure_reason, str):
+            raise ValueError("verification.failure_reason必须是字符串")
+
+        timestamp_ns = verification.timestamp_ns
+        if type(timestamp_ns) is not int or timestamp_ns < 0:
+            raise ValueError("verification.timestamp_ns必须是非负整数且不能是bool")
+
+        # 2. 时间单调性校验（事务式：失败不覆盖缓存）
+        cached = self._cached_verification
+        if cached is not None:
+            if timestamp_ns < cached.timestamp_ns:
+                raise ValueError(
+                    "verification.timestamp_ns不能早于已缓存的timestamp_ns"
+                )
+            if timestamp_ns == cached.timestamp_ns:
+                if verification == cached:
+                    return
+                raise ValueError(
+                    "同一timestamp_ns下收到内容不同的verification，拒绝冲突重复"
+                )
+
+        # 3. 全部校验通过，才覆盖缓存
+        self._cached_verification = verification
+        self._verification_received_ns = timestamp_ns
 
     def create_hold_command(
         self, actual_joints: RobotJointState, timestamp_ns: int, valid_for_ns: int
@@ -246,6 +336,7 @@ class ArmExecutionController:
         self._initial_position = None
         self._terminal_status = None
         self._cached_verification = None
+        self._verification_received_ns = None
         self.local_phase = LocalPhase.IDLE
 
     @staticmethod
