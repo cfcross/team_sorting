@@ -19,15 +19,25 @@ from team_sorting.external_candidate import ExternalCandidateDecision
 from team_sorting.fsm import FSMEvent
 from team_sorting.interfaces import (
     ArmExecutionConfig,
+    ArmMotionPhase,
     BaseCommand,
     BaseState,
     FSMStatus,
     GlobalPhase,
+    GraspContext,
+    GraspTarget,
+    GraspVerification,
+    JointTrajectory,
+    JointWaypoint,
     LocalPhase,
     ManipulationCommand,
+    ManipulationStatus,
     NavGoal,
     NavigationStatus,
     ObjectEstimate3D,
+    PlaceTarget,
+    Pose3D,
+    RigidTransform3D,
     RobotJointState,
     SensorSnapshot,
     TaskSpec,
@@ -286,6 +296,79 @@ def _estimate(
         orientation_xyzw=(0.0, 0.0, 0.0, 1.0) if orientation else None,
         size_xyz_m=(0.2, 0.1, 0.1) if size else None,
     )
+
+
+def _pose() -> Pose3D:
+    return Pose3D((1.0, 0.0, 0.5), (0.0, 0.0, 0.0, 1.0), "footprint")
+
+
+def _grasp_context(*, confirmed: bool = False) -> GraspContext:
+    object_frame = "object/target-a"
+    transform_left = RigidTransform3D(
+        "left_gripper", object_frame, (0.0, 0.05, 0.0),
+        (0.0, 0.0, 0.0, 1.0), NOW - 20, True,
+    )
+    transform_right = RigidTransform3D(
+        "right_gripper", object_frame, (0.0, -0.05, 0.0),
+        (0.0, 0.0, 0.0, 1.0), NOW - 20, True,
+    )
+    return GraspContext(
+        task_id=1,
+        target_body="box_1",
+        target_class_id="pink",
+        object_id="target-a",
+        object_frame=object_frame,
+        object_size_xyz_m=(0.2, 0.1, 0.1),
+        object_from_left_gripper=transform_left,
+        object_from_right_gripper=transform_right,
+        object_orientation_world_xyzw_at_grasp=(0.0, 0.0, 0.0, 1.0),
+        orientation_observed_at_ns=NOW - 30,
+        planned_at_ns=NOW - 20,
+        confirmed_at_ns=NOW - 5 if confirmed else None,
+        confirmed=confirmed,
+        valid=True,
+    )
+
+
+def _trajectory(phase: GlobalPhase) -> JointTrajectory:
+    phases = (
+        (
+            ArmMotionPhase.PREGRASP,
+            ArmMotionPhase.GRASP,
+            ArmMotionPhase.LIFT,
+            ArmMotionPhase.RETREAT,
+        )
+        if phase is GlobalPhase.EXECUTE_PICK
+        else (
+            ArmMotionPhase.PREPLACE,
+            ArmMotionPhase.LOWER,
+            ArmMotionPhase.RELEASE,
+            ArmMotionPhase.POST_RELEASE_RETREAT,
+        )
+    )
+    return JointTrajectory(
+        trajectory_id=("pick-test" if phase is GlobalPhase.EXECUTE_PICK else "place-test"),
+        task_id=1,
+        target_body="box_1",
+        execution_phase=phase,
+        waypoints=tuple(
+            JointWaypoint(item, float(index), (0.0,) * 17, (True, *([False] * 16)))
+            for index, item in enumerate(phases, start=1)
+        ),
+        timestamp_ns=NOW - 5,
+    )
+
+
+def _grasp_target(context: GraspContext) -> GraspTarget:
+    pose = _pose()
+    return GraspTarget(
+        pose, pose, pose, pose, pose, pose, pose, pose, context, 0.9, True
+    )
+
+
+def _place_target() -> PlaceTarget:
+    pose = _pose()
+    return PlaceTarget(pose, pose, pose, pose, pose, pose, pose, 0.1, True)
 
 
 def _execution_config_values() -> dict[str, object]:
@@ -721,15 +804,26 @@ def _dirty_runtime_wiring(node: Any) -> None:
     state.active_pick_trajectory = object()
     state.active_place_trajectory = object()
     state.active_trajectory_id = "trajectory-old"
+    state.active_trajectory_phase_generation = 99
     state.pick_observation_before_lift = _estimate("old", 0.8)
+    state.pick_lift_started_ns = 123
+    state.grasp_verification_after_observation_timestamp = 124
     state.latest_grasp_verification = object()
+    state.latest_grasp_verification_trajectory_id = "trajectory-old"
     state.place_observation_before_release = _estimate("old", 0.8)
+    state.place_release_or_completion_ns = 125
+    state.place_post_release_observations.append(_estimate("old", 0.8))
     state.latest_place_verification_observation = _estimate("old", 0.8)
     state.last_navigation_status = object()
     state.navigation_success_submitted = True
     state.navigation_failure_submitted = True
     state.navigation_diagnostic = "old navigation"
     state.last_manipulation_status = object()
+    state.planning_attempted = True
+    state.trajectory_started = True
+    state.phase_success_feedback_emitted = True
+    state.phase_failure_feedback_emitted = True
+    state.manipulation_diagnostic = "old manipulation"
     state.phase_event_keys.add(("old",))
     state.phase_entry_failure_reason = "old failure"
     node._latest_estimates = (_estimate("cached-old", 0.9),)
@@ -748,15 +842,26 @@ def _assert_runtime_payload_cleared(node: Any) -> None:
     assert state.active_pick_trajectory is None
     assert state.active_place_trajectory is None
     assert state.active_trajectory_id == ""
+    assert state.active_trajectory_phase_generation is None
     assert state.pick_observation_before_lift is None
+    assert state.pick_lift_started_ns is None
+    assert state.grasp_verification_after_observation_timestamp is None
     assert state.latest_grasp_verification is None
+    assert state.latest_grasp_verification_trajectory_id == ""
     assert state.place_observation_before_release is None
+    assert state.place_release_or_completion_ns is None
+    assert not state.place_post_release_observations
     assert state.latest_place_verification_observation is None
     assert state.last_navigation_status is None
     assert not state.navigation_success_submitted
     assert not state.navigation_failure_submitted
     assert state.navigation_diagnostic == ""
     assert state.last_manipulation_status is None
+    assert not state.planning_attempted
+    assert not state.trajectory_started
+    assert not state.phase_success_feedback_emitted
+    assert not state.phase_failure_feedback_emitted
+    assert state.manipulation_diagnostic == ""
     assert state.phase_event_keys == set()
     assert state.phase_entry_failure_reason == ""
     assert node._latest_estimates == ()
@@ -1223,7 +1328,7 @@ def test_phase_specific_cleanup_preserves_cross_phase_pick_context() -> None:
     node._prepare_phase_transition(GlobalPhase.EXECUTE_PICK, GlobalPhase.VERIFY_PICK)
     assert state.active_pick_trajectory is pick_trajectory
     assert state.planned_grasp_context is planned_context
-    assert state.latest_grasp_verification is None
+    assert state.latest_grasp_verification is not None
     assert reset_calls["count"] == 0
 
 
@@ -1918,7 +2023,12 @@ def test_visual_verification_phases_never_emit_business_success_alone(
     )
     status = FSMStatus(1, phase, LocalPhase.IDLE, 0, False, "", NOW)
 
-    assert node._run_current_phase(snapshot, status, None, NOW)[2] is None
+    feedback = node._run_current_phase(snapshot, status, None, NOW)[2]
+    assert feedback is None or feedback.event is not (
+        FSMEvent.PICK_VERIFIED
+        if phase is GlobalPhase.VERIFY_PICK
+        else FSMEvent.PLACE_VERIFIED
+    )
 
 
 def test_planar_transform_snapshot_has_explicit_inverse_direction_and_time() -> None:
@@ -2554,6 +2664,323 @@ def test_destroy_node_with_fresh_joints_clears_pending_without_any_control_publi
     assert node.events.index("timer_cancel") < node.events.index("candidate_shutdown")
     assert node.events.index("candidate_shutdown") < node.events.index("super_destroy")
     assert node.destroy_count == 1
+
+
+def test_plan_pick_entry_plans_once_with_locked_target_and_explicit_transforms() -> None:
+    node = _node()
+    state = node._runtime_wiring
+    state.run_id, state.task_id, state.attempt = "run-1", 1, 0
+    target = _estimate("target-a", 0.9, timestamp_ns=NOW - 10)
+    state.active_target = target
+    state.refined_target = target
+    state.preferred_object_id = "target-a"
+    context = _grasp_context()
+    trajectory = _trajectory(GlobalPhase.EXECUTE_PICK)
+    calls: list[tuple[object, ...]] = []
+
+    def plan_grasp(*args: object) -> tuple[GraspTarget, JointTrajectory]:
+        calls.append(args)
+        return _grasp_target(context), trajectory
+
+    node._arm_planner = SimpleNamespace(plan_grasp=plan_grasp)
+    node._fsm.phase_entered_ns = NOW
+    status = FSMStatus(1, GlobalPhase.PLAN_PICK, LocalPhase.IDLE, 0, False, "", NOW)
+    snapshot = SensorSnapshot(_task(), _base(), _joints(), (target,), NOW, True)
+
+    assert node._handle_phase_entry(snapshot, status, None, NOW)
+    assert not node._handle_phase_entry(snapshot, status, None, NOW)
+    assert len(calls) == 1
+    assert calls[0][1] is target
+    target_to_footprint = calls[0][2]
+    target_to_world = calls[0][3]
+    assert (target_to_footprint.source_frame, target_to_footprint.target_frame) == (
+        "odom", "footprint"
+    )
+    assert target_to_world == RigidTransform3D(
+        "odom", "world", (0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0),
+        target.timestamp_ns, True,
+    )
+    assert state.planned_grasp_context is context
+    assert state.active_pick_trajectory is trajectory
+    _, _, feedback = node._run_current_phase(snapshot, status, None, NOW)
+    assert feedback.event is FSMEvent.PICK_PLAN_READY
+    assert (feedback.object_id, feedback.trajectory_id) == (
+        "target-a", trajectory.trajectory_id
+    )
+
+
+def test_plan_pick_missing_geometry_fails_once_without_calling_planner() -> None:
+    node = _node()
+    state = node._runtime_wiring
+    state.run_id, state.task_id, state.attempt = "run-1", 1, 0
+    target = _estimate("target-a", 0.9, orientation=False)
+    state.active_target = target
+    state.refined_target = target
+    state.preferred_object_id = "target-a"
+    node._arm_planner = SimpleNamespace(
+        plan_grasp=lambda *_args: pytest.fail("缺姿态时不得调用plan_grasp")
+    )
+    node._fsm.phase_entered_ns = NOW
+    status = FSMStatus(1, GlobalPhase.PLAN_PICK, LocalPhase.IDLE, 0, False, "", NOW)
+    snapshot = SensorSnapshot(_task(), _base(), _joints(), (target,), NOW, True)
+
+    node._handle_phase_entry(snapshot, status, None, NOW)
+    first = node._run_current_phase(snapshot, status, None, NOW)[2]
+    second = node._run_current_phase(snapshot, status, None, NOW + 1)[2]
+    assert first.event is FSMEvent.FAILURE
+    assert second is None
+    assert state.active_pick_trajectory is None
+
+
+def test_plan_place_requires_confirmed_context_and_plans_once() -> None:
+    node = _node()
+    state = node._runtime_wiring
+    state.run_id, state.task_id, state.attempt = "run-1", 1, 0
+    state.confirmed_grasp_context = _grasp_context(confirmed=True)
+    trajectory = _trajectory(GlobalPhase.EXECUTE_PLACE)
+    calls: list[tuple[object, ...]] = []
+
+    def plan_place(*args: object) -> tuple[PlaceTarget, JointTrajectory]:
+        calls.append(args)
+        return _place_target(), trajectory
+
+    node._arm_planner = SimpleNamespace(plan_place=plan_place)
+    node._fsm.phase_entered_ns = NOW
+    status = FSMStatus(1, GlobalPhase.PLAN_PLACE, LocalPhase.IDLE, 0, False, "", NOW)
+    snapshot = SensorSnapshot(_task(), _base(), _joints(), (), NOW, True)
+
+    assert node._handle_phase_entry(snapshot, status, None, NOW)
+    assert not node._handle_phase_entry(snapshot, status, None, NOW)
+    assert len(calls) == 1
+    world_to_footprint = calls[0][1]
+    assert (world_to_footprint.source_frame, world_to_footprint.target_frame) == (
+        "world", "footprint"
+    )
+    assert calls[0][2] is state.confirmed_grasp_context
+    assert state.active_place_trajectory is trajectory
+    _, _, feedback = node._run_current_phase(snapshot, status, None, NOW)
+    assert feedback.event is FSMEvent.PLACE_PLAN_READY
+    assert feedback.trajectory_id == trajectory.trajectory_id
+
+
+def test_execute_pick_starts_once_and_steps_latest_joint_feedback() -> None:
+    node = _node()
+    state = node._runtime_wiring
+    state.run_id, state.task_id, state.attempt = "run-1", 1, 0
+    trajectory = _trajectory(GlobalPhase.EXECUTE_PICK)
+    state.active_pick_trajectory = trajectory
+    state.active_trajectory_id = trajectory.trajectory_id
+    state.planned_grasp_context = _grasp_context()
+    calls: dict[str, list[object]] = {"start": [], "step": []}
+    command = ManipulationCommand(
+        (0.0,) * 17, (True, *([False] * 16)), LocalPhase.MOVE_PREGRASP,
+        NOW, NOW + 100,
+    )
+
+    class Execution:
+        latest_grasp_verification = None
+
+        def start_trajectory(self, value: object) -> ManipulationStatus:
+            calls["start"].append(value)
+            return ManipulationStatus(
+                LocalPhase.IDLE, "LOADED", 0.0, float("inf"), False,
+                "loaded", NOW - 5,
+            )
+
+        def step(self, joints: object, timestamp_ns: int) -> tuple[ManipulationCommand, ManipulationStatus]:
+            calls["step"].append(joints)
+            return replace(command, timestamp_ns=timestamp_ns, valid_until_ns=timestamp_ns + 100), ManipulationStatus(
+                LocalPhase.MOVE_PREGRASP, "RUNNING", 0.1, 0.0, False,
+                "running", timestamp_ns,
+            )
+
+    node._arm_execution = Execution()
+    node._fsm.phase_entered_ns = NOW
+    status = FSMStatus(1, GlobalPhase.EXECUTE_PICK, LocalPhase.IDLE, 0, False, "", NOW)
+    first_joints = _joints()
+    second_joints = replace(_joints(), timestamp_ns=NOW + 1)
+    first_snapshot = SensorSnapshot(_task(), _base(), first_joints, (), NOW, True)
+    second_snapshot = SensorSnapshot(_task(), _base(), second_joints, (), NOW + 1, True)
+
+    node._handle_phase_entry(first_snapshot, status, None, NOW)
+    first_base, first_command = node._compute_candidate_commands(first_snapshot, status, NOW)
+    second_base, second_command = node._compute_candidate_commands(second_snapshot, status, NOW + 1)
+    assert calls["start"] == [trajectory]
+    assert calls["step"] == [first_joints, second_joints]
+    assert first_command is not None and second_command is not None
+    assert (first_base.v, first_base.w) == (0.0, 0.0)
+    assert (second_base.v, second_base.w) == (0.0, 0.0)
+
+
+def test_execute_place_emits_motion_complete_once_without_place_verified() -> None:
+    node = _node()
+    state = node._runtime_wiring
+    state.run_id, state.task_id, state.attempt = "run-1", 1, 0
+    state.confirmed_grasp_context = _grasp_context(confirmed=True)
+    trajectory = _trajectory(GlobalPhase.EXECUTE_PLACE)
+    state.active_place_trajectory = trajectory
+    state.active_trajectory_id = trajectory.trajectory_id
+    calls: list[object] = []
+    command = ManipulationCommand(
+        (0.0,) * 17, (True, *([False] * 16)), LocalPhase.STOW,
+        NOW, NOW + 100,
+    )
+
+    class Execution:
+        def start_trajectory(self, value: object) -> ManipulationStatus:
+            calls.append(value)
+            return ManipulationStatus(
+                LocalPhase.IDLE, "LOADED", 0.0, float("inf"), False,
+                "loaded", NOW - 5,
+            )
+
+        def step(self, _joints: object, timestamp_ns: int) -> tuple[ManipulationCommand, ManipulationStatus]:
+            return replace(
+                command, timestamp_ns=timestamp_ns,
+                valid_until_ns=timestamp_ns + 100,
+            ), ManipulationStatus(
+                LocalPhase.STOW,
+                "MOTION_COMPLETED_PLACE_VERIFICATION_PENDING",
+                1.0,
+                0.0,
+                True,
+                "motion complete only",
+                timestamp_ns,
+            )
+
+    node._arm_execution = Execution()
+    node._fsm.phase_entered_ns = NOW
+    status = FSMStatus(1, GlobalPhase.EXECUTE_PLACE, LocalPhase.IDLE, 0, False, "", NOW)
+    snapshot = SensorSnapshot(_task(), _base(), _joints(), (), NOW, True)
+
+    node._handle_phase_entry(snapshot, status, None, NOW)
+    first = node._run_current_phase(snapshot, status, None, NOW)[2]
+    second = node._run_current_phase(snapshot, status, None, NOW + 1)[2]
+    assert calls == [trajectory]
+    assert first.event is FSMEvent.PLACE_EXECUTED
+    assert first.event is not FSMEvent.PLACE_VERIFIED
+    assert second is None
+
+
+@pytest.mark.parametrize(
+    ("is_grasped", "expected_event"),
+    [(True, FSMEvent.PICK_VERIFIED), (False, FSMEvent.PICK_FAILED)],
+)
+def test_verify_pick_maps_public_result_and_preserves_sensor_time(
+    is_grasped: bool, expected_event: FSMEvent
+) -> None:
+    node = _node()
+    state = node._runtime_wiring
+    state.run_id, state.task_id, state.attempt = "run-1", 1, 0
+    state.active_target = _estimate("target-a", 0.9)
+    state.planned_grasp_context = _grasp_context()
+    state.active_pick_trajectory = _trajectory(GlobalPhase.EXECUTE_PICK)
+    state.active_trajectory_id = state.active_pick_trajectory.trajectory_id
+    state.latest_grasp_verification_trajectory_id = state.active_trajectory_id
+    state.pick_lift_started_ns = NOW - 10
+    state.phase_entered_ns = NOW
+    verification = GraspVerification(
+        is_grasped, 0.9, "visual", "none", True, "", NOW - 5
+    )
+    node._arm_execution = SimpleNamespace(latest_grasp_verification=verification)
+    status = FSMStatus(1, GlobalPhase.VERIFY_PICK, LocalPhase.IDLE, 0, False, "", NOW)
+    snapshot = SensorSnapshot(_task(), _base(), _joints(), (), NOW, True)
+
+    feedback = node._run_current_phase(snapshot, status, None, NOW)[2]
+    assert feedback.event is expected_event
+    assert feedback.source_timestamp_ns == NOW
+    assert state.latest_grasp_verification.timestamp_ns == NOW - 5
+    if is_grasped:
+        assert state.confirmed_grasp_context.confirmed
+        assert state.confirmed_grasp_context.confirmed_at_ns == NOW - 5
+    else:
+        assert state.confirmed_grasp_context is None
+
+
+def test_verify_place_requires_bounded_stable_same_object_inside_radius() -> None:
+    node = _node()
+    state = node._runtime_wiring
+    state.run_id, state.task_id, state.attempt = "run-1", 1, 0
+    state.confirmed_grasp_context = _grasp_context(confirmed=True)
+    state.active_trajectory_id = "place-test"
+    state.place_release_or_completion_ns = NOW - 90
+    state.phase_entered_ns = NOW - 85
+    status = FSMStatus(1, GlobalPhase.VERIFY_PLACE, LocalPhase.IDLE, 0, False, "", NOW)
+    timestamps = (NOW - 80, NOW - 60, NOW - 40)
+    feedback = None
+    for index, timestamp_ns in enumerate(timestamps):
+        observation = replace(
+            _estimate("target-a", 0.9, timestamp_ns=timestamp_ns),
+            position_xyz=(1.0 + index * 0.001, 2.0, 3.0),
+        )
+        snapshot = SensorSnapshot(_task(), _base(), _joints(), (observation,), NOW, True)
+        feedback = node._run_current_phase(snapshot, status, None, NOW)[2]
+        if index < 2:
+            assert feedback is None
+    assert feedback.event is FSMEvent.PLACE_VERIFIED
+    assert feedback.object_id == "target-a"
+    assert len(state.place_post_release_observations) == 3
+    assert state.place_post_release_observations.maxlen == 12
+
+
+def test_internal_publish_authorization_accepts_only_bound_arm_execution() -> None:
+    task = _task()
+    context = CompetitionContext(
+        "team_sorting.competition_context", 1, "run-1", "fingerprint", 1, 0,
+        1.0, 0, (0, 0, 0), "-", False, task, NOW - 100, NOW - 50, True, "",
+    )
+    snapshot = SensorSnapshot(task, _base(), _joints(), (), NOW, True)
+    status = FSMStatus(
+        1, GlobalPhase.EXECUTE_PICK, LocalPhase.MOVE_PREGRASP, 0, False, "", NOW
+    )
+    base_command = BaseCommand(0.0, 0.0, NOW, NOW + 100)
+    manipulation = ManipulationCommand(
+        (0.0,) * 17, (True, *([False] * 16)), LocalPhase.MOVE_PREGRASP,
+        NOW, NOW + 100,
+    )
+    final_action, _ = ActionMux().compose_with_decision(
+        base_command, manipulation, _joints(), status, NOW
+    )
+    runtime = ros_nodes_module._RuntimeWiringState(
+        run_id="run-1",
+        task_id=1,
+        attempt=0,
+        last_handled_phase=GlobalPhase.EXECUTE_PICK,
+        phase_generation=4,
+        active_pick_trajectory=_trajectory(GlobalPhase.EXECUTE_PICK),
+        active_trajectory_id="pick-test",
+        active_trajectory_phase_generation=4,
+        last_manipulation_status=ManipulationStatus(
+            LocalPhase.MOVE_PREGRASP, "RUNNING", 0.1, 0.0, False, "running", NOW
+        ),
+        trajectory_started=True,
+    )
+
+    assert _internal_fsm_publish_authorization(
+        observe_only=False,
+        enable_official_publish=True,
+        context=context,
+        snapshot=snapshot,
+        fsm_status=status,
+        base_command=base_command,
+        manipulation_command=manipulation,
+        final_action=final_action,
+        now_ns=NOW,
+        runtime_wiring=runtime,
+    )
+    runtime.active_trajectory_id = "old"
+    assert not _internal_fsm_publish_authorization(
+        observe_only=False,
+        enable_official_publish=True,
+        context=context,
+        snapshot=snapshot,
+        fsm_status=status,
+        base_command=base_command,
+        manipulation_command=manipulation,
+        final_action=final_action,
+        now_ns=NOW,
+        runtime_wiring=runtime,
+    )
 
 
 def test_destroy_node_never_publishes_after_context_is_invalid() -> None:

@@ -108,6 +108,7 @@ from .interfaces import (
     ActionDispatchRecord,
     ActionMuxDecision,
     ArmExecutionConfig,
+    ArmMotionPhase,
     ArmPlanningConfig,
     BaseCommand,
     BaseState,
@@ -120,13 +121,16 @@ from .interfaces import (
     FinalAction,
     GlobalPhase,
     GraspContext,
+    GraspTarget,
     GraspVerification,
     JointTrajectory,
+    LocalPhase,
     ManipulationCommand,
     ManipulationStatus,
     NavGoal,
     NavigationStatus,
     ObjectEstimate3D,
+    PlaceTarget,
     RGBFrame,
     RigidTransform3D,
     RobotJointState,
@@ -181,15 +185,28 @@ class _RuntimeWiringState:
     active_pick_trajectory: Optional[JointTrajectory] = None
     active_place_trajectory: Optional[JointTrajectory] = None
     active_trajectory_id: str = ""
+    active_trajectory_phase_generation: Optional[int] = None
     pick_observation_before_lift: Optional[ObjectEstimate3D] = None
+    pick_lift_started_ns: Optional[int] = None
+    grasp_verification_after_observation_timestamp: Optional[int] = None
     latest_grasp_verification: Optional[GraspVerification] = None
+    latest_grasp_verification_trajectory_id: str = ""
     place_observation_before_release: Optional[ObjectEstimate3D] = None
+    place_release_or_completion_ns: Optional[int] = None
+    place_post_release_observations: deque[ObjectEstimate3D] = field(
+        default_factory=lambda: deque(maxlen=12)
+    )
     latest_place_verification_observation: Optional[ObjectEstimate3D] = None
     last_navigation_status: Optional[NavigationStatus] = None
     navigation_success_submitted: bool = False
     navigation_failure_submitted: bool = False
     navigation_diagnostic: str = ""
     last_manipulation_status: Optional[ManipulationStatus] = None
+    planning_attempted: bool = False
+    trajectory_started: bool = False
+    phase_success_feedback_emitted: bool = False
+    phase_failure_feedback_emitted: bool = False
+    manipulation_diagnostic: str = ""
     phase_event_keys: set[tuple[object, ...]] = field(default_factory=set)
     phase_entry_failure_reason: str = ""
     last_event_tick_ns: Optional[int] = None
@@ -378,6 +395,7 @@ def _internal_fsm_publish_authorization(
     final_action: FinalAction,
     now_ns: int,
     manipulation_source: str = "manipulation_command",
+    runtime_wiring: Optional[_RuntimeWiringState] = None,
 ) -> bool:
     """纯判断内部FSM候选是否可取得本控制周期FULL发布资格。"""
 
@@ -438,9 +456,48 @@ def _internal_fsm_publish_authorization(
         # 到达/失败切换周期允许发布显式零速，但不能拿零速候选给另一份非零
         # FinalAction授权。非零候选可能由ActionMux按配置限幅，因此不做反向等值要求。
         base_active = False
-    # 本轮只授权已接线的导航闭环；机械臂规划/执行尚未取得运行时发布授权，不能因
-    # 这个导航变更顺带打开其FULL出口。
-    return base_active
+    arm_active = (
+        fsm_status.global_phase
+        in {GlobalPhase.EXECUTE_PICK, GlobalPhase.EXECUTE_PLACE}
+        and isinstance(base_command, BaseCommand)
+        and base_command.valid
+        and base_command.v == 0.0
+        and base_command.w == 0.0
+        and now_ns < base_command.valid_until_ns
+        and isinstance(manipulation_command, ManipulationCommand)
+        and manipulation_command.valid
+        and manipulation_command.timestamp_ns == now_ns
+        and now_ns < manipulation_command.valid_until_ns
+        and isinstance(runtime_wiring, _RuntimeWiringState)
+        and runtime_wiring.run_id == context.run_id
+        and runtime_wiring.task_id == context.current_task_id
+        and runtime_wiring.attempt == context.current_attempt_count
+        and runtime_wiring.last_handled_phase is fsm_status.global_phase
+        and runtime_wiring.trajectory_started
+        and runtime_wiring.active_trajectory_phase_generation
+        == runtime_wiring.phase_generation
+        and isinstance(runtime_wiring.last_manipulation_status, ManipulationStatus)
+        and runtime_wiring.last_manipulation_status.timestamp_ns == now_ns
+        and runtime_wiring.last_manipulation_status.local_phase
+        is manipulation_command.local_phase
+        and runtime_wiring.last_manipulation_status.state
+        in {"RUNNING", "VERIFICATION_PENDING"}
+    )
+    if arm_active:
+        trajectory = (
+            runtime_wiring.active_pick_trajectory
+            if fsm_status.global_phase is GlobalPhase.EXECUTE_PICK
+            else runtime_wiring.active_place_trajectory
+        )
+        arm_active = (
+            isinstance(trajectory, JointTrajectory)
+            and trajectory.valid
+            and trajectory.execution_phase is fsm_status.global_phase
+            and trajectory.task_id == context.current_task_id
+            and trajectory.target_body == context.active_task.target_body
+            and trajectory.trajectory_id == runtime_wiring.active_trajectory_id
+        )
+    return base_active or arm_active
 
 
 class TimestampedCache:
@@ -1514,15 +1571,26 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             state.active_pick_trajectory = None
             state.active_place_trajectory = None
             state.active_trajectory_id = ""
+            state.active_trajectory_phase_generation = None
             state.pick_observation_before_lift = None
+            state.pick_lift_started_ns = None
+            state.grasp_verification_after_observation_timestamp = None
             state.latest_grasp_verification = None
+            state.latest_grasp_verification_trajectory_id = ""
             state.place_observation_before_release = None
+            state.place_release_or_completion_ns = None
+            state.place_post_release_observations.clear()
             state.latest_place_verification_observation = None
             state.last_navigation_status = None
             state.navigation_success_submitted = False
             state.navigation_failure_submitted = False
             state.navigation_diagnostic = ""
             state.last_manipulation_status = None
+            state.planning_attempted = False
+            state.trajectory_started = False
+            state.phase_success_feedback_emitted = False
+            state.phase_failure_feedback_emitted = False
+            state.manipulation_diagnostic = ""
             state.phase_event_keys.clear()
             state.phase_entry_failure_reason = reset_failure
             state.last_event_tick_ns = None
@@ -1541,7 +1609,6 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             """只清理新阶段已明确失效的业务缓存。"""
 
             state = self._runtime_wiring
-            state.phase_generation += 1
             state.phase_entry_failure_reason = ""
             # 去重键只在产生它的阶段内有效；新阶段必须重新武装，但SAFE_HOLD仍保留
             # 业务载荷以便恢复被暂停阶段。
@@ -1552,9 +1619,15 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             ):
                 # 安全暂停及恢复不能破坏被暂停阶段的业务生命周期。
                 return
+            state.phase_generation += 1
             state.navigation_success_submitted = False
             state.navigation_failure_submitted = False
             state.navigation_diagnostic = ""
+            state.planning_attempted = False
+            state.trajectory_started = False
+            state.phase_success_feedback_emitted = False
+            state.phase_failure_feedback_emitted = False
+            state.manipulation_diagnostic = ""
             if current_phase is GlobalPhase.SEARCH_TARGET:
                 state.active_target = None
                 state.search_target = None
@@ -1566,9 +1639,15 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 state.active_pick_trajectory = None
                 state.active_place_trajectory = None
                 state.active_trajectory_id = ""
+                state.active_trajectory_phase_generation = None
                 state.pick_observation_before_lift = None
+                state.pick_lift_started_ns = None
+                state.grasp_verification_after_observation_timestamp = None
                 state.latest_grasp_verification = None
+                state.latest_grasp_verification_trajectory_id = ""
                 state.place_observation_before_release = None
+                state.place_release_or_completion_ns = None
+                state.place_post_release_observations.clear()
                 state.latest_place_verification_observation = None
                 state.last_navigation_status = None
                 state.last_manipulation_status = None
@@ -1587,20 +1666,30 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 state.active_nav_goal = None
                 state.active_pick_trajectory = None
                 state.active_trajectory_id = ""
+                state.active_trajectory_phase_generation = None
                 state.planned_grasp_context = None
                 state.pick_observation_before_lift = None
+                state.pick_lift_started_ns = None
+                state.grasp_verification_after_observation_timestamp = None
                 state.latest_grasp_verification = None
+                state.latest_grasp_verification_trajectory_id = ""
                 state.last_navigation_status = None
             elif current_phase is GlobalPhase.PLAN_PICK:
                 state.active_pick_trajectory = None
                 state.active_trajectory_id = ""
+                state.active_trajectory_phase_generation = None
                 state.planned_grasp_context = None
                 state.pick_observation_before_lift = None
+                state.pick_lift_started_ns = None
+                state.grasp_verification_after_observation_timestamp = None
                 state.latest_grasp_verification = None
+                state.latest_grasp_verification_trajectory_id = ""
             elif current_phase is GlobalPhase.EXECUTE_PICK:
                 state.last_manipulation_status = None
             elif current_phase is GlobalPhase.VERIFY_PICK:
-                state.latest_grasp_verification = None
+                # EXECUTE_PICK产生的验证结论必须跨阶段保留，VERIFY_PICK只通过公开
+                # latest_grasp_verification重新核对当前轨迹绑定。
+                pass
             elif current_phase is GlobalPhase.NAV_TO_PLACE:
                 state.active_target = None
                 state.search_target = None
@@ -1611,9 +1700,15 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 state.active_pick_trajectory = None
                 state.active_place_trajectory = None
                 state.active_trajectory_id = ""
+                state.active_trajectory_phase_generation = None
                 state.pick_observation_before_lift = None
+                state.pick_lift_started_ns = None
+                state.grasp_verification_after_observation_timestamp = None
                 state.latest_grasp_verification = None
+                state.latest_grasp_verification_trajectory_id = ""
                 state.place_observation_before_release = None
+                state.place_release_or_completion_ns = None
+                state.place_post_release_observations.clear()
                 state.latest_place_verification_observation = None
                 state.last_navigation_status = None
                 state.last_manipulation_status = None
@@ -1622,12 +1717,16 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 state.last_navigation_status = None
                 state.active_place_trajectory = None
                 state.active_trajectory_id = ""
+                state.active_trajectory_phase_generation = None
                 state.place_observation_before_release = None
+                state.place_release_or_completion_ns = None
+                state.place_post_release_observations.clear()
                 state.latest_place_verification_observation = None
             elif current_phase is GlobalPhase.EXECUTE_PLACE:
                 state.last_manipulation_status = None
             elif current_phase is GlobalPhase.VERIFY_PLACE:
                 state.latest_place_verification_observation = None
+                state.place_post_release_observations.clear()
             elif current_phase is GlobalPhase.RETURN_END:
                 state.active_target = None
                 state.search_target = None
@@ -1639,9 +1738,15 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 state.active_pick_trajectory = None
                 state.active_place_trajectory = None
                 state.active_trajectory_id = ""
+                state.active_trajectory_phase_generation = None
                 state.pick_observation_before_lift = None
+                state.pick_lift_started_ns = None
+                state.grasp_verification_after_observation_timestamp = None
                 state.latest_grasp_verification = None
+                state.latest_grasp_verification_trajectory_id = ""
                 state.place_observation_before_release = None
+                state.place_release_or_completion_ns = None
+                state.place_post_release_observations.clear()
                 state.latest_place_verification_observation = None
                 state.last_navigation_status = None
                 state.last_manipulation_status = None
@@ -1654,9 +1759,15 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 state.active_pick_trajectory = None
                 state.active_place_trajectory = None
                 state.active_trajectory_id = ""
+                state.active_trajectory_phase_generation = None
                 state.pick_observation_before_lift = None
+                state.pick_lift_started_ns = None
+                state.grasp_verification_after_observation_timestamp = None
                 state.latest_grasp_verification = None
+                state.latest_grasp_verification_trajectory_id = ""
                 state.place_observation_before_release = None
+                state.place_release_or_completion_ns = None
+                state.place_post_release_observations.clear()
                 state.latest_place_verification_observation = None
                 state.last_navigation_status = None
                 state.last_manipulation_status = None
@@ -1737,6 +1848,13 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 and self._fsm.phase_entered_ns >= 0
                 else now_ns
             )
+            if previous_phase is GlobalPhase.SAFE_HOLD and phase not in {
+                GlobalPhase.DONE,
+                GlobalPhase.FAILED,
+            }:
+                # SAFETY_RECOVERED恢复的是同一业务阶段和同一执行器生命周期；
+                # 不得重新规划或第二次start_trajectory。
+                return True
             if type(now_ns) is not int or now_ns < 0:
                 state.phase_entry_failure_reason = "阶段入口时间无效"
                 return True
@@ -1802,13 +1920,176 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                             f"{phase.value}导航目标构建失败：{exc}"
                         )
                         state.navigation_diagnostic = state.phase_entry_failure_reason
-            elif phase in {GlobalPhase.PLAN_PICK, GlobalPhase.PLAN_PLACE}:
+            elif phase is GlobalPhase.PLAN_PICK:
+                state.planning_attempted = True
                 if self._arm_planner is None:
                     state.phase_entry_failure_reason = (
                         self._arm_planning_unavailable_reason or "ArmPlanner不可用"
                     )
                 else:
-                    state.phase_entry_failure_reason = "规划真实结果接口尚未接线"
+                    try:
+                        task = snapshot.task
+                        target = state.refined_target
+                        base = snapshot.base
+                        joints = snapshot.joints
+                        if not isinstance(task, TaskSpec) or not task.valid:
+                            raise ValueError("PLAN_PICK缺少当前有效TaskSpec")
+                        if task.task_id != state.task_id:
+                            raise ValueError("PLAN_PICK TaskSpec与运行时任务身份不一致")
+                        if not isinstance(target, ObjectEstimate3D) or not target.valid:
+                            raise ValueError("PLAN_PICK缺少REFINE_TARGET锁定的有效目标")
+                        if target is not state.active_target:
+                            raise ValueError("PLAN_PICK目标不是REFINE_TARGET保存的同一观测")
+                        object_id = (
+                            target.object_id.strip()
+                            if isinstance(target.object_id, str)
+                            else ""
+                        )
+                        if not object_id or object_id != state.preferred_object_id:
+                            raise ValueError("PLAN_PICK目标稳定身份与REFINE_TARGET不一致")
+                        if (
+                            target.frame_id != "odom"
+                            or target.class_id != task.target_color
+                            or target.orientation_xyzw is None
+                            or target.size_xyz_m is None
+                        ):
+                            raise ValueError(
+                                "PLAN_PICK目标必须是匹配任务且具有真实姿态/尺寸的odom观测"
+                            )
+                        if not isinstance(base, BaseState) or not base.valid:
+                            raise ValueError("PLAN_PICK缺少新鲜有效Odom")
+                        if not isinstance(joints, RobotJointState) or not joints.valid:
+                            raise ValueError("PLAN_PICK缺少新鲜有效JointState")
+                        for label, timestamp_ns in (
+                            ("target", target.timestamp_ns),
+                            ("base", base.timestamp_ns),
+                            ("joints", joints.timestamp_ns),
+                        ):
+                            if (
+                                type(timestamp_ns) is not int
+                                or timestamp_ns > now_ns
+                                or now_ns - timestamp_ns > self._state_max_delta_ns
+                            ):
+                                raise ValueError(f"PLAN_PICK {label}输入过期或来自未来")
+                        target_to_footprint = _base_planar_transform_snapshot(
+                            base,
+                            source_frame=target.frame_id,
+                            target_frame="footprint",
+                        )
+                        # F1官方镜像中world与odom数值轴对齐；这是显式镜像约定，
+                        # 不是通用TF，也不会创建或发布任何虚假TF。
+                        target_to_world = RigidTransform3D(
+                            source_frame="odom",
+                            target_frame="world",
+                            translation_xyz=(0.0, 0.0, 0.0),
+                            rotation_xyzw=(0.0, 0.0, 0.0, 1.0),
+                            timestamp_ns=target.timestamp_ns,
+                            valid=True,
+                        )
+                        grasp_target, trajectory = self._arm_planner.plan_grasp(
+                            task,
+                            target,
+                            target_to_footprint,
+                            target_to_world,
+                            joints,
+                            now_ns,
+                        )
+                        if not isinstance(grasp_target, GraspTarget) or not grasp_target.valid:
+                            raise ValueError(
+                                getattr(grasp_target, "failure_reason", "")
+                                or "ArmPlanner返回无效GraspTarget"
+                            )
+                        grasp_context = grasp_target.grasp_context
+                        if (
+                            not isinstance(grasp_context, GraspContext)
+                            or not grasp_context.valid
+                            or grasp_context.confirmed
+                            or grasp_context.object_id != object_id
+                            or grasp_context.task_id != task.task_id
+                            or grasp_context.target_body != task.target_body
+                        ):
+                            raise ValueError("GraspTarget.grasp_context身份或确认状态无效")
+                        self._validate_planned_trajectory(
+                            trajectory, task, GlobalPhase.EXECUTE_PICK
+                        )
+                        state.planned_grasp_context = grasp_context
+                        state.active_pick_trajectory = trajectory
+                        state.active_trajectory_id = trajectory.trajectory_id
+                        state.active_trajectory_phase_generation = state.phase_generation
+                        state.phase_entry_failure_reason = ""
+                    except (TypeError, ValueError, RuntimeError) as exc:
+                        state.planned_grasp_context = None
+                        state.active_pick_trajectory = None
+                        state.active_trajectory_id = ""
+                        state.active_trajectory_phase_generation = None
+                        state.phase_entry_failure_reason = f"PLAN_PICK规划失败：{exc}"
+            elif phase is GlobalPhase.PLAN_PLACE:
+                state.planning_attempted = True
+                if self._arm_planner is None:
+                    state.phase_entry_failure_reason = (
+                        self._arm_planning_unavailable_reason or "ArmPlanner不可用"
+                    )
+                else:
+                    try:
+                        task = snapshot.task
+                        base = snapshot.base
+                        joints = snapshot.joints
+                        grasp_context = state.confirmed_grasp_context
+                        if not isinstance(task, TaskSpec) or not task.valid:
+                            raise ValueError("PLAN_PLACE缺少当前有效TaskSpec")
+                        if task.task_id != state.task_id:
+                            raise ValueError("PLAN_PLACE TaskSpec与运行时任务身份不一致")
+                        if (
+                            not isinstance(grasp_context, GraspContext)
+                            or not grasp_context.valid
+                            or not grasp_context.confirmed
+                            or grasp_context.task_id != task.task_id
+                            or grasp_context.target_body != task.target_body
+                        ):
+                            raise ValueError("PLAN_PLACE要求当前任务的confirmed GraspContext")
+                        if not isinstance(base, BaseState) or not base.valid:
+                            raise ValueError("PLAN_PLACE缺少新鲜有效Odom")
+                        if not isinstance(joints, RobotJointState) or not joints.valid:
+                            raise ValueError("PLAN_PLACE缺少新鲜有效JointState")
+                        for label, timestamp_ns in (
+                            ("base", base.timestamp_ns),
+                            ("joints", joints.timestamp_ns),
+                        ):
+                            if (
+                                type(timestamp_ns) is not int
+                                or timestamp_ns > now_ns
+                                or now_ns - timestamp_ns > self._state_max_delta_ns
+                            ):
+                                raise ValueError(f"PLAN_PLACE {label}输入过期或来自未来")
+                        world_to_footprint = _base_planar_transform_snapshot(
+                            base,
+                            source_frame="world",
+                            target_frame="footprint",
+                        )
+                        place_target, trajectory = self._arm_planner.plan_place(
+                            task,
+                            world_to_footprint,
+                            grasp_context,
+                            joints,
+                            now_ns,
+                        )
+                        if not isinstance(place_target, PlaceTarget) or not place_target.valid:
+                            raise ValueError(
+                                getattr(place_target, "failure_reason", "")
+                                or "ArmPlanner返回无效PlaceTarget"
+                            )
+                        self._validate_planned_trajectory(
+                            trajectory, task, GlobalPhase.EXECUTE_PLACE
+                        )
+                        state.active_place_trajectory = trajectory
+                        state.active_trajectory_id = trajectory.trajectory_id
+                        state.active_trajectory_phase_generation = state.phase_generation
+                        state.phase_entry_failure_reason = ""
+                    except (TypeError, ValueError, RuntimeError) as exc:
+                        state.active_place_trajectory = None
+                        state.active_trajectory_id = ""
+                        state.active_trajectory_phase_generation = None
+                        state.phase_entry_failure_reason = f"PLAN_PLACE规划失败：{exc}"
             elif phase in {GlobalPhase.EXECUTE_PICK, GlobalPhase.EXECUTE_PLACE}:
                 if self._arm_execution is None:
                     state.phase_entry_failure_reason = (
@@ -1824,7 +2105,34 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 ):
                     state.phase_entry_failure_reason = "缺少当前阶段的有效轨迹，执行失败关闭"
                 else:
-                    state.phase_entry_failure_reason = "执行真实结果接口尚未接线"
+                    trajectory = (
+                        state.active_pick_trajectory
+                        if phase is GlobalPhase.EXECUTE_PICK
+                        else state.active_place_trajectory
+                    )
+                    try:
+                        if snapshot.task is None:
+                            raise ValueError("执行阶段缺少当前TaskSpec")
+                        self._validate_planned_trajectory(
+                            trajectory, snapshot.task, phase
+                        )
+                        if trajectory.trajectory_id != state.active_trajectory_id:
+                            raise ValueError("执行轨迹ID与活动轨迹ID不一致")
+                        start_status = self._arm_execution.start_trajectory(trajectory)
+                        state.trajectory_started = True
+                        state.last_manipulation_status = start_status
+                        if (
+                            not isinstance(start_status, ManipulationStatus)
+                            or start_status.state in {"REJECTED", "FAILED"}
+                        ):
+                            raise ValueError(
+                                getattr(start_status, "failure_reason", "")
+                                or "ArmExecutionController拒绝轨迹"
+                            )
+                        state.active_trajectory_phase_generation = state.phase_generation
+                        state.phase_entry_failure_reason = ""
+                    except (TypeError, ValueError, RuntimeError) as exc:
+                        state.phase_entry_failure_reason = f"{phase.value}启动失败：{exc}"
             elif phase is GlobalPhase.SEARCH_TARGET:
                 state.phase_entry_failure_reason = "等待真实、新鲜且具有稳定身份的odom目标"
             elif phase is GlobalPhase.REFINE_TARGET:
@@ -1832,8 +2140,87 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                     "等待阶段入口后的同任务odom观测及真实orientation_xyzw/size_xyz_m"
                 )
             elif phase in {GlobalPhase.VERIFY_PICK, GlobalPhase.VERIFY_PLACE}:
-                state.phase_entry_failure_reason = "抓放验证真实反馈接口尚未接线"
+                state.phase_entry_failure_reason = ""
             return True
+
+        @staticmethod
+        def _validate_planned_trajectory(
+            trajectory: object,
+            task: TaskSpec,
+            execution_phase: GlobalPhase,
+        ) -> None:
+            if not isinstance(trajectory, JointTrajectory) or not trajectory.valid:
+                raise ValueError(
+                    getattr(trajectory, "failure_reason", "")
+                    or "缺少有效JointTrajectory"
+                )
+            if (
+                trajectory.execution_phase is not execution_phase
+                or trajectory.task_id != task.task_id
+                or trajectory.target_body != task.target_body
+                or not trajectory.trajectory_id.strip()
+                or not trajectory.waypoints
+            ):
+                raise ValueError("JointTrajectory阶段、任务或身份不匹配")
+            required = (
+                {
+                    ArmMotionPhase.PREGRASP,
+                    ArmMotionPhase.GRASP,
+                    ArmMotionPhase.LIFT,
+                    ArmMotionPhase.RETREAT,
+                }
+                if execution_phase is GlobalPhase.EXECUTE_PICK
+                else {
+                    ArmMotionPhase.PREPLACE,
+                    ArmMotionPhase.LOWER,
+                    ArmMotionPhase.RELEASE,
+                    ArmMotionPhase.POST_RELEASE_RETREAT,
+                }
+            )
+            if {waypoint.phase for waypoint in trajectory.waypoints} != required:
+                raise ValueError("JointTrajectory缺少当前操作的完整四阶段")
+
+        def _runtime_object_id(self) -> str:
+            state = self._runtime_wiring
+            if isinstance(state.confirmed_grasp_context, GraspContext):
+                return state.confirmed_grasp_context.object_id.strip()
+            if isinstance(state.planned_grasp_context, GraspContext):
+                return state.planned_grasp_context.object_id.strip()
+            if isinstance(state.active_target, ObjectEstimate3D) and isinstance(
+                state.active_target.object_id, str
+            ):
+                return state.active_target.object_id.strip()
+            return ""
+
+        def _latest_matching_observation(
+            self,
+            snapshot: SensorSnapshot,
+            *,
+            object_id: str,
+            class_id: str,
+            now_ns: int,
+            after_ns: Optional[int] = None,
+            at_or_before_ns: Optional[int] = None,
+        ) -> Optional[ObjectEstimate3D]:
+            """选择同一稳定身份的新鲜odom事实，不按同色目标重新绑定。"""
+
+            candidates = tuple(
+                item
+                for item in snapshot.object_estimates
+                if isinstance(item, ObjectEstimate3D)
+                and item.valid
+                and item.frame_id == "odom"
+                and item.object_id == object_id
+                and item.class_id == class_id
+                and type(item.timestamp_ns) is int
+                and 0 <= now_ns - item.timestamp_ns <= self._state_max_delta_ns
+                and (after_ns is None or item.timestamp_ns > after_ns)
+                and (
+                    at_or_before_ns is None
+                    or item.timestamp_ns <= at_or_before_ns
+                )
+            )
+            return max(candidates, key=lambda item: item.timestamp_ns, default=None)
 
         def _run_current_phase(
             self,
@@ -1961,6 +2348,284 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                     reason=f"真实Odom确认{phase.value}目标到达",
                     confirmed_by_real_feedback=True,
                 )
+            if phase in {GlobalPhase.PLAN_PICK, GlobalPhase.PLAN_PLACE}:
+                if state.phase_entry_failure_reason:
+                    if state.phase_failure_feedback_emitted:
+                        return base_command, manipulation_command, None
+                    state.phase_failure_feedback_emitted = True
+                    return base_command, manipulation_command, _RuntimeFSMFeedback(
+                        event=FSMEvent.FAILURE,
+                        source_timestamp_ns=now_ns,
+                        run_id=state.run_id,
+                        task_id=state.task_id,
+                        attempt=state.attempt,
+                        object_id=self._runtime_object_id(),
+                        trajectory_id=state.active_trajectory_id,
+                        reason=state.phase_entry_failure_reason,
+                        confirmed_by_real_feedback=True,
+                    )
+                trajectory = (
+                    state.active_pick_trajectory
+                    if phase is GlobalPhase.PLAN_PICK
+                    else state.active_place_trajectory
+                )
+                if not state.planning_attempted or not isinstance(
+                    trajectory, JointTrajectory
+                ):
+                    return base_command, manipulation_command, None
+                if state.phase_success_feedback_emitted:
+                    return base_command, manipulation_command, None
+                state.phase_success_feedback_emitted = True
+                return base_command, manipulation_command, _RuntimeFSMFeedback(
+                    event=(
+                        FSMEvent.PICK_PLAN_READY
+                        if phase is GlobalPhase.PLAN_PICK
+                        else FSMEvent.PLACE_PLAN_READY
+                    ),
+                    source_timestamp_ns=now_ns,
+                    run_id=state.run_id,
+                    task_id=state.task_id,
+                    attempt=state.attempt,
+                    object_id=self._runtime_object_id(),
+                    trajectory_id=trajectory.trajectory_id,
+                    reason=f"{phase.value}获得有效目标、IK和完整JointTrajectory",
+                    confirmed_by_real_feedback=True,
+                )
+            if phase in {GlobalPhase.EXECUTE_PICK, GlobalPhase.EXECUTE_PLACE}:
+                status = state.last_manipulation_status
+                failure = state.phase_entry_failure_reason
+                if not failure and not isinstance(status, ManipulationStatus):
+                    failure = "执行阶段尚未获得ManipulationStatus"
+                if not failure and isinstance(status, ManipulationStatus) and (
+                    status.state in {"FAILED", "REJECTED"}
+                ):
+                    failure = status.failure_reason or f"执行器状态为{status.state}"
+                if not failure and manipulation_command is not None and (
+                    not isinstance(manipulation_command, ManipulationCommand)
+                    or not manipulation_command.valid
+                    or now_ns >= manipulation_command.valid_until_ns
+                ):
+                    failure = (
+                        getattr(manipulation_command, "failure_reason", "")
+                        or "执行器ManipulationCommand无效或已过期"
+                    )
+                if failure:
+                    state.manipulation_diagnostic = failure
+                    if state.phase_failure_feedback_emitted:
+                        return base_command, None, None
+                    state.phase_failure_feedback_emitted = True
+                    return base_command, None, _RuntimeFSMFeedback(
+                        event=FSMEvent.FAILURE,
+                        source_timestamp_ns=(
+                            status.timestamp_ns
+                            if isinstance(status, ManipulationStatus)
+                            and status.timestamp_ns >= (state.phase_entered_ns or 0)
+                            else now_ns
+                        ),
+                        run_id=state.run_id,
+                        task_id=state.task_id,
+                        attempt=state.attempt,
+                        object_id=self._runtime_object_id(),
+                        trajectory_id=state.active_trajectory_id,
+                        reason=f"{phase.value}失败：{failure}",
+                        confirmed_by_real_feedback=True,
+                    )
+                if not isinstance(status, ManipulationStatus):
+                    return base_command, manipulation_command, None
+                if phase is GlobalPhase.EXECUTE_PICK:
+                    completed = (
+                        status.state == "MOTION_COMPLETED_PICK"
+                        and status.success
+                        and status.progress == 1.0
+                        and isinstance(state.active_pick_trajectory, JointTrajectory)
+                        and state.active_pick_trajectory.trajectory_id
+                        == state.active_trajectory_id
+                        and isinstance(state.latest_grasp_verification, GraspVerification)
+                        and state.latest_grasp_verification_trajectory_id
+                        == state.active_trajectory_id
+                    )
+                    event = FSMEvent.PICK_EXECUTED
+                else:
+                    completed = (
+                        status.state
+                        == "MOTION_COMPLETED_PLACE_VERIFICATION_PENDING"
+                        and status.success
+                        and status.progress == 1.0
+                        and isinstance(state.active_place_trajectory, JointTrajectory)
+                        and state.active_place_trajectory.trajectory_id
+                        == state.active_trajectory_id
+                    )
+                    event = FSMEvent.PLACE_EXECUTED
+                    if completed and state.place_release_or_completion_ns is None:
+                        state.place_release_or_completion_ns = status.timestamp_ns
+                if not completed or state.phase_success_feedback_emitted:
+                    return base_command, manipulation_command, None
+                state.phase_success_feedback_emitted = True
+                return base_command, manipulation_command, _RuntimeFSMFeedback(
+                    event=event,
+                    source_timestamp_ns=status.timestamp_ns,
+                    run_id=state.run_id,
+                    task_id=state.task_id,
+                    attempt=state.attempt,
+                    object_id=self._runtime_object_id(),
+                    trajectory_id=state.active_trajectory_id,
+                    reason=(
+                        "完整轨迹已由不同时间戳的真实JointState连续确认完成"
+                    ),
+                    confirmed_by_real_feedback=True,
+                )
+            if phase is GlobalPhase.VERIFY_PICK:
+                verification = (
+                    self._arm_execution.latest_grasp_verification
+                    if self._arm_execution is not None
+                    else None
+                )
+                if verification is None:
+                    return base_command, manipulation_command, None
+                state.latest_grasp_verification = verification
+                if (
+                    not isinstance(verification, GraspVerification)
+                    or not verification.success
+                    or type(verification.timestamp_ns) is not int
+                    or verification.timestamp_ns > now_ns
+                    or state.latest_grasp_verification_trajectory_id
+                    != state.active_trajectory_id
+                    or state.pick_lift_started_ns is None
+                    or verification.timestamp_ns < state.pick_lift_started_ns
+                ):
+                    # success=False只代表证据不足；它不能被解释为明确未抓住。
+                    return base_command, manipulation_command, None
+                if state.phase_success_feedback_emitted:
+                    return base_command, manipulation_command, None
+                planned = state.planned_grasp_context
+                if not isinstance(planned, GraspContext) or not planned.valid:
+                    state.phase_entry_failure_reason = "VERIFY_PICK缺少有效planned GraspContext"
+                    if state.phase_failure_feedback_emitted:
+                        return base_command, manipulation_command, None
+                    state.phase_failure_feedback_emitted = True
+                    return base_command, manipulation_command, _RuntimeFSMFeedback(
+                        FSMEvent.FAILURE, now_ns, state.run_id, state.task_id,
+                        state.attempt, state.phase_entry_failure_reason,
+                        object_id=self._runtime_object_id(),
+                        trajectory_id=state.active_trajectory_id,
+                        confirmed_by_real_feedback=True,
+                    )
+                state.phase_success_feedback_emitted = True
+                if verification.is_grasped:
+                    state.confirmed_grasp_context = replace(
+                        planned,
+                        confirmed_at_ns=verification.timestamp_ns,
+                        confirmed=True,
+                    )
+                    event = FSMEvent.PICK_VERIFIED
+                    reason = (
+                        "试抬视觉验证明确抓住；保留原始验证时间"
+                        f"{verification.timestamp_ns}ns"
+                    )
+                else:
+                    state.confirmed_grasp_context = None
+                    event = FSMEvent.PICK_FAILED
+                    reason = "试抬视觉验证已完成并明确未抓住"
+                return base_command, manipulation_command, _RuntimeFSMFeedback(
+                    event=event,
+                    # 业务判定在当前VERIFY_PICK产生；原始传感器时间保留在state中。
+                    source_timestamp_ns=now_ns,
+                    run_id=state.run_id,
+                    task_id=state.task_id,
+                    attempt=state.attempt,
+                    object_id=planned.object_id,
+                    trajectory_id=state.active_trajectory_id,
+                    reason=reason,
+                    confirmed_by_real_feedback=True,
+                )
+            if phase is GlobalPhase.VERIFY_PLACE:
+                context_for_place = state.confirmed_grasp_context
+                if not isinstance(context_for_place, GraspContext):
+                    state.phase_entry_failure_reason = "VERIFY_PLACE缺少confirmed GraspContext"
+                elif snapshot.task is None or snapshot.task.task_id != context_for_place.task_id:
+                    state.phase_entry_failure_reason = "VERIFY_PLACE任务身份不一致"
+                elif (
+                    state.place_release_or_completion_ns is None
+                    or state.phase_entered_ns is None
+                ):
+                    state.phase_entry_failure_reason = "VERIFY_PLACE缺少释放/后撤时间边界"
+                elif self._visual_observation_verifier is None:
+                    state.phase_entry_failure_reason = (
+                        self._visual_observation_verifier_unavailable_reason
+                        or "VisualObservationVerifier不可用"
+                    )
+                else:
+                    newest = self._latest_matching_observation(
+                        snapshot,
+                        object_id=context_for_place.object_id,
+                        class_id=context_for_place.target_class_id,
+                        now_ns=now_ns,
+                        after_ns=max(
+                            state.place_release_or_completion_ns,
+                            state.phase_entered_ns,
+                        ),
+                    )
+                    if newest is not None and (
+                        not state.place_post_release_observations
+                        or newest.timestamp_ns
+                        > state.place_post_release_observations[-1].timestamp_ns
+                    ):
+                        state.place_post_release_observations.append(newest)
+                    stable = self._visual_observation_verifier.stable_post_motion_observation(
+                        tuple(state.place_post_release_observations),
+                        timestamp_ns=now_ns,
+                    )
+                    if stable.valid:
+                        state.latest_place_verification_observation = stable
+                        task = snapshot.task
+                        assert task is not None
+                        if task.place_world_xyz is None or task.place_radius is None:
+                            state.phase_entry_failure_reason = (
+                                "VERIFY_PLACE缺少world目标中心或place_radius"
+                            )
+                        elif math.dist(
+                            stable.position_xyz,
+                            # F1镜像中world/odom数值轴对齐；此处只做数值复制，不造TF。
+                            task.place_world_xyz,
+                        ) <= task.place_radius:
+                            if not state.phase_success_feedback_emitted:
+                                state.phase_success_feedback_emitted = True
+                                return base_command, manipulation_command, _RuntimeFSMFeedback(
+                                    FSMEvent.PLACE_VERIFIED,
+                                    now_ns,
+                                    state.run_id,
+                                    state.task_id,
+                                    state.attempt,
+                                    "释放和POST_RELEASE_RETREAT完成后，同一物体稳定观测位于任务半径内",
+                                    object_id=context_for_place.object_id,
+                                    trajectory_id=state.active_trajectory_id,
+                                    confirmed_by_real_feedback=True,
+                                )
+                            return base_command, manipulation_command, None
+                        else:
+                            # 位置尚未满足不等于不可恢复错误；继续等待阶段内新观测。
+                            state.manipulation_diagnostic = (
+                                "放置后稳定观测尚未进入TaskSpec.place_radius"
+                            )
+                    else:
+                        state.manipulation_diagnostic = stable.failure_reason
+                    state.phase_entry_failure_reason = ""
+                if state.phase_entry_failure_reason:
+                    if state.phase_failure_feedback_emitted:
+                        return base_command, manipulation_command, None
+                    state.phase_failure_feedback_emitted = True
+                    return base_command, manipulation_command, _RuntimeFSMFeedback(
+                        FSMEvent.FAILURE,
+                        now_ns,
+                        state.run_id,
+                        state.task_id,
+                        state.attempt,
+                        state.phase_entry_failure_reason,
+                        object_id=self._runtime_object_id(),
+                        trajectory_id=state.active_trajectory_id,
+                        confirmed_by_real_feedback=True,
+                    )
+                return base_command, manipulation_command, None
             if phase not in {GlobalPhase.SEARCH_TARGET, GlobalPhase.REFINE_TARGET}:
                 return base_command, manipulation_command, None
             if snapshot.task is None or snapshot.task.task_id != fsm_status.task_id:
@@ -2135,8 +2800,11 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             trajectory_events = {
                 FSMEvent.PICK_PLAN_READY,
                 FSMEvent.PICK_EXECUTED,
+                FSMEvent.PICK_VERIFIED,
+                FSMEvent.PICK_FAILED,
                 FSMEvent.PLACE_PLAN_READY,
                 FSMEvent.PLACE_EXECUTED,
+                FSMEvent.PLACE_VERIFIED,
             }
             if event in object_events and (
                 not expected_object_id or supplied_object_id != expected_object_id
@@ -2363,6 +3031,175 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 state.last_navigation_status = navigation_status
                 state.navigation_diagnostic = navigation_status.failure_reason
                 return command, None
+            if fsm_status.global_phase in {
+                GlobalPhase.EXECUTE_PICK,
+                GlobalPhase.EXECUTE_PLACE,
+            }:
+                state = self._runtime_wiring
+                if self._arm_execution is None or not state.trajectory_started:
+                    reason = (
+                        state.phase_entry_failure_reason
+                        or self._arm_execution_unavailable_reason
+                        or "机械臂执行器尚未启动当前轨迹"
+                    )
+                    state.manipulation_diagnostic = reason
+                    return BaseCommand(
+                        0.0, 0.0, now_ns, now_ns + self._command_ttl_ns
+                    ), None
+                object_id = self._runtime_object_id()
+                class_id = (
+                    state.planned_grasp_context.target_class_id
+                    if isinstance(state.planned_grasp_context, GraspContext)
+                    else (
+                        state.confirmed_grasp_context.target_class_id
+                        if isinstance(state.confirmed_grasp_context, GraspContext)
+                        else ""
+                    )
+                )
+                previous_status = state.last_manipulation_status
+                if fsm_status.global_phase is GlobalPhase.EXECUTE_PICK and (
+                    not isinstance(previous_status, ManipulationStatus)
+                    or previous_status.local_phase
+                    not in {
+                        LocalPhase.TEST_LIFT,
+                        LocalPhase.VERIFY,
+                        LocalPhase.RETREAT,
+                        LocalPhase.TRANSPORT_HOLD,
+                    }
+                ):
+                    baseline = self._latest_matching_observation(
+                        snapshot,
+                        object_id=object_id,
+                        class_id=class_id,
+                        now_ns=now_ns,
+                        at_or_before_ns=now_ns,
+                    )
+                    if baseline is not None:
+                        state.pick_observation_before_lift = baseline
+                if fsm_status.global_phase is GlobalPhase.EXECUTE_PLACE and (
+                    not isinstance(previous_status, ManipulationStatus)
+                    or previous_status.local_phase
+                    not in {LocalPhase.RELEASE, LocalPhase.STOW}
+                ):
+                    release_baseline = self._latest_matching_observation(
+                        snapshot,
+                        object_id=object_id,
+                        class_id=class_id,
+                        now_ns=now_ns,
+                        at_or_before_ns=now_ns,
+                    )
+                    if release_baseline is not None:
+                        state.place_observation_before_release = release_baseline
+                try:
+                    command, status = self._arm_execution.step(
+                        snapshot.joints, now_ns
+                    )
+                except (TypeError, ValueError, RuntimeError) as exc:
+                    state.phase_entry_failure_reason = (
+                        f"ArmExecutionController.step异常：{exc}"
+                    )
+                    return BaseCommand(
+                        0.0, 0.0, now_ns, now_ns + self._command_ttl_ns
+                    ), None
+                state.last_manipulation_status = status
+                state.manipulation_diagnostic = status.failure_reason
+                self._fsm.set_local_phase(status.local_phase)
+                if fsm_status.global_phase is GlobalPhase.EXECUTE_PICK:
+                    if (
+                        status.local_phase is LocalPhase.TEST_LIFT
+                        and state.pick_lift_started_ns is None
+                    ):
+                        state.pick_lift_started_ns = status.timestamp_ns
+                        baseline = state.pick_observation_before_lift
+                        if (
+                            baseline is None
+                            or baseline.timestamp_ns > state.pick_lift_started_ns
+                        ):
+                            state.phase_entry_failure_reason = (
+                                "首次进入TEST_LIFT时缺少不晚于抬升起点的同一物体观测"
+                            )
+                    if (
+                        status.state == "VERIFICATION_PENDING"
+                        and status.local_phase is LocalPhase.VERIFY
+                        and status.timestamp_ns >= (state.phase_entered_ns or 0)
+                    ):
+                        baseline = state.pick_observation_before_lift
+                        lift_started_ns = state.pick_lift_started_ns
+                        if baseline is None or lift_started_ns is None:
+                            state.phase_entry_failure_reason = (
+                                "VERIFICATION_PENDING缺少试抬前观测或LIFT时间边界"
+                            )
+                        elif self._visual_observation_verifier is None:
+                            state.phase_entry_failure_reason = (
+                                self._visual_observation_verifier_unavailable_reason
+                                or "VisualObservationVerifier不可用"
+                            )
+                        else:
+                            consumed_ns = (
+                                state.grasp_verification_after_observation_timestamp
+                                if state.grasp_verification_after_observation_timestamp
+                                is not None
+                                else baseline.timestamp_ns
+                            )
+                            after = self._latest_matching_observation(
+                                snapshot,
+                                object_id=baseline.object_id or "",
+                                class_id=baseline.class_id,
+                                now_ns=now_ns,
+                                after_ns=max(baseline.timestamp_ns, consumed_ns),
+                            )
+                            if (
+                                after is not None
+                                and after.timestamp_ns >= lift_started_ns
+                            ):
+                                verification = (
+                                    self._visual_observation_verifier.verify_test_lift(
+                                        baseline,
+                                        after,
+                                        timestamp_ns=now_ns,
+                                    )
+                                )
+                                try:
+                                    self._arm_execution.accept_grasp_verification(
+                                        verification
+                                    )
+                                except ValueError as exc:
+                                    state.phase_entry_failure_reason = (
+                                        f"抓取验证生命周期拒绝：{exc}"
+                                    )
+                                else:
+                                    state.grasp_verification_after_observation_timestamp = (
+                                        after.timestamp_ns
+                                    )
+                                    state.latest_grasp_verification = verification
+                                    state.latest_grasp_verification_trajectory_id = (
+                                        state.active_trajectory_id
+                                    )
+                    public_verification = (
+                        self._arm_execution.latest_grasp_verification
+                    )
+                    if public_verification is not None:
+                        state.latest_grasp_verification = public_verification
+                        state.latest_grasp_verification_trajectory_id = (
+                            state.active_trajectory_id
+                        )
+                elif status.local_phase is LocalPhase.RELEASE and (
+                    state.place_release_or_completion_ns is None
+                ):
+                    state.place_release_or_completion_ns = status.timestamp_ns
+                if status.state == "MOTION_COMPLETED_PLACE_VERIFICATION_PENDING":
+                    state.place_release_or_completion_ns = status.timestamp_ns
+                if (
+                    not isinstance(command, ManipulationCommand)
+                    or not command.valid
+                    or now_ns >= command.valid_until_ns
+                ):
+                    return BaseCommand(
+                        0.0, 0.0, now_ns, now_ns + self._command_ttl_ns
+                    ), None
+                return BaseCommand(
+                    0.0, 0.0, now_ns, now_ns + self._command_ttl_ns
+                ), command
             return BaseCommand(
                 0.0, 0.0, now_ns, now_ns + self._command_ttl_ns
             ), None
@@ -2654,6 +3491,7 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                     if external_decision.accepted
                     else "manipulation_command"
                 ),
+                runtime_wiring=self._runtime_wiring,
             )
             navigation_transition_stop_authorized = (
                 self._publish_enabled
