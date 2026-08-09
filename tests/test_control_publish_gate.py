@@ -295,6 +295,7 @@ def _execution_config_values() -> dict[str, object]:
             trajectory_max_age_ns=100,
             command_ttl_ns=100,
             max_control_period_ns=100,
+            verification_timeout_ns=100,
             waypoint_timeout_margin_ns=100,
             total_timeout_margin_ns=100,
             max_slide_velocity_m_s=0.1,

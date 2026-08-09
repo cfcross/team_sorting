@@ -192,6 +192,8 @@ arm_execution:
   trajectory_max_age_ns: null
   command_ttl_ns: null
   max_control_period_ns: null
+  # LIFT稳定进入VERIFY后允许接收真实GraspVerification的最大窗口（ns）。
+  verification_timeout_ns: null
   waypoint_timeout_margin_ns: null
   total_timeout_margin_ns: null
   max_slide_velocity_m_s: null
