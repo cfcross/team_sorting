@@ -142,8 +142,9 @@ perception:
       max_angular_delta_rad: 0.20
       max_extent_error_ratio: 0.45
 
-# 提交1只冻结配置契约，不构造ArmPlanner。enabled默认关闭；null表示尚未标定，不能由
-# 代码补隐藏默认值。抓取与放置启用前分别调用ArmPlanningConfig的操作级验证。
+# ROS/FSM组装层已经接入ArmPlanner，但enabled默认关闭；null表示尚未在官方仿真标定，
+# 不能由代码补隐藏默认值。抓取与放置启用前分别调用ArmPlanningConfig的操作级验证，
+# KDL依赖自检失败时仍然失败关闭。
 arm_planning:
   enabled: false
   min_object_confidence: null
@@ -183,8 +184,9 @@ arm_planning:
   right_gripper_closed: null
   gripper_verified_in_official_environment: false
 
-# 提交3A只冻结并实现纯Python轨迹执行；本节全部为显式未标定值，因此运行配置默认关闭。
-# 未来ROS组装层获准接线前必须逐项填写并构造ArmExecutionConfig，执行器不得补默认值。
+# ROS/FSM组装层已经接入纯Python轨迹执行；本节字段与ArmExecutionConfig严格一一对应。
+# 当前值仍全部显式未标定，因此节点不会构造执行器；正式启用前必须逐项填写，执行器
+# 不得补默认值。verification_timeout_ns也必须由lift时长、图像周期和安全裕量共同标定。
 # 夹爪位置范围是[0,1]；max_gripper_velocity_per_s单位为控制量/秒，不受位置上限1约束，
 # 但具体速度仍须在官方仿真中标定。
 arm_execution:
