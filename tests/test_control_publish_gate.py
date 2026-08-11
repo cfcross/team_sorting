@@ -43,6 +43,7 @@ from team_sorting.interfaces import (
     TaskSpec,
 )
 from team_sorting.ros_nodes import (
+    _arm_execution_control_granted,
     _base_planar_transform_snapshot,
     _create_perception_node,
     _create_team_client_node,
@@ -393,6 +394,18 @@ def _execution_config_values() -> dict[str, object]:
             initial_gripper_error_limit=0.1,
         )
     )
+
+
+def _visual_verifier_values() -> dict[str, object]:
+    return {
+        "minimum_lift_delta_m": 0.03,
+        "max_horizontal_drift_m": 0.02,
+        "max_observation_gap_s": 0.5,
+        "minimum_observation_confidence": 0.7,
+        "required_frame_id": "odom",
+        "min_stationary_observations": 3,
+        "max_stationary_spread_m": 0.01,
+    }
 
 
 def _prime_control_state(
@@ -770,8 +783,14 @@ def test_complete_arm_execution_config_constructs_controller_only_once(
     calls = {"construct": 0, "reset": 0}
 
     class ExecutionSpy:
-        def __init__(self, config: ArmExecutionConfig) -> None:
+        def __init__(
+            self,
+            config: ArmExecutionConfig,
+            *,
+            require_control_feedback: bool,
+        ) -> None:
             assert isinstance(config, ArmExecutionConfig)
+            assert require_control_feedback is True
             calls["construct"] += 1
 
         def reset(self) -> None:
@@ -1938,7 +1957,7 @@ def test_current_perception_geometry_gap_keeps_refine_closed_and_never_plans() -
     assert node._runtime_wiring.active_target is None
 
 
-def test_default_team_policy_constructs_visual_verifier_once(
+def test_missing_visual_verifier_config_is_unavailable_without_hidden_policy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[dict[str, object]] = []
@@ -1951,17 +1970,9 @@ def test_default_team_policy_constructs_visual_verifier_once(
     monkeypatch.setattr(ros_nodes_module, "VisualObservationVerifier", construct)
     node = _node()
 
-    assert node._visual_observation_verifier is not None
-    assert node._visual_observation_verifier_unavailable_reason == ""
-    assert calls == [{
-        "minimum_lift_delta_m": 0.03,
-        "max_horizontal_drift_m": 0.02,
-        "max_observation_gap_s": 0.5,
-        "minimum_observation_confidence": 0.65,
-        "required_frame_id": "odom",
-        "min_stationary_observations": 3,
-        "max_stationary_spread_m": 0.01,
-    }]
+    assert node._visual_observation_verifier is None
+    assert "unavailable" in node._visual_observation_verifier_unavailable_reason
+    assert calls == []
 
 
 def test_valid_visual_verifier_config_constructs_once(
@@ -1976,15 +1987,9 @@ def test_valid_visual_verifier_config_constructs_once(
 
     monkeypatch.setattr(ros_nodes_module, "VisualObservationVerifier", construct)
     config = _config()
-    config["perception"]["visual_observation_verifier"] = {
-        "minimum_lift_delta_m": 0.03,
-        "max_horizontal_drift_m": 0.02,
-        "max_observation_gap_s": 0.5,
-        "minimum_observation_confidence": 0.7,
-        "required_frame_id": "odom",
-        "min_stationary_observations": 3,
-        "max_stationary_spread_m": 0.01,
-    }
+    config["perception"]["visual_observation_verifier"] = (
+        _visual_verifier_values()
+    )
     ros = _ros()
     node = _create_team_client_node(ros)(config, ros)
 
@@ -1992,17 +1997,23 @@ def test_valid_visual_verifier_config_constructs_once(
     assert len(calls) == 1
 
 
-def test_invalid_visual_verifier_config_fails_closed() -> None:
+@pytest.mark.parametrize(
+    "configured",
+    [
+        None,
+        {},
+        {**_visual_verifier_values(), "unknown": 1},
+        {**_visual_verifier_values(), "max_observation_gap_s": None},
+        {**_visual_verifier_values(), "max_observation_gap_s": float("nan")},
+        {**_visual_verifier_values(), "max_observation_gap_s": 0.0},
+        {**_visual_verifier_values(), "min_stationary_observations": True},
+    ],
+)
+def test_incomplete_extra_null_or_invalid_visual_verifier_config_fails_closed(
+    configured: object,
+) -> None:
     config = _config()
-    config["perception"]["visual_observation_verifier"] = {
-        "minimum_lift_delta_m": -1.0,
-        "max_horizontal_drift_m": 0.02,
-        "max_observation_gap_s": 0.5,
-        "minimum_observation_confidence": 0.7,
-        "required_frame_id": "odom",
-        "min_stationary_observations": 3,
-        "max_stationary_spread_m": 0.01,
-    }
+    config["perception"]["visual_observation_verifier"] = configured
     ros = _ros()
     node = _create_team_client_node(ros)(config, ros)
 
@@ -2898,7 +2909,12 @@ def test_verify_pick_maps_public_result_and_preserves_sensor_time(
 
 
 def test_verify_place_requires_bounded_stable_same_object_inside_radius() -> None:
-    node = _node()
+    config = _config()
+    config["perception"]["visual_observation_verifier"] = (
+        _visual_verifier_values()
+    )
+    ros = _ros()
+    node = _create_team_client_node(ros)(config, ros)
     state = node._runtime_wiring
     state.run_id, state.task_id, state.attempt = "run-1", 1, 0
     state.confirmed_grasp_context = _grasp_context(confirmed=True)
@@ -2980,6 +2996,80 @@ def test_internal_publish_authorization_accepts_only_bound_arm_execution() -> No
         final_action=final_action,
         now_ns=NOW,
         runtime_wiring=runtime,
+    )
+
+
+def test_arm_execution_control_result_requires_mux_acceptance_and_publish_success() -> None:
+    joints = _joints()
+    status = FSMStatus(
+        1, GlobalPhase.EXECUTE_PICK, LocalPhase.MOVE_PREGRASP,
+        0, False, "", NOW,
+    )
+    accepted = ManipulationCommand(
+        joints.position, (True, *([False] * 16)), LocalPhase.MOVE_PREGRASP,
+        NOW, NOW + 100,
+    )
+    _, accepted_decision = ActionMux().compose_with_decision(
+        BaseCommand(0.0, 0.0, NOW, NOW + 100),
+        accepted,
+        joints,
+        status,
+        NOW,
+    )
+    rejected = replace(accepted, valid=False, failure_reason="injected reject")
+    _, rejected_decision = ActionMux().compose_with_decision(
+        None, rejected, joints, status, NOW
+    )
+    stop_status = replace(status, global_phase=GlobalPhase.SAFE_HOLD)
+    _, stop_decision = ActionMux().compose_with_decision(
+        None, accepted, joints, stop_status, NOW
+    )
+
+    common = {
+        "manipulation_command": accepted,
+        "manipulation_source": "manipulation_command",
+        "internal_publish_authorized": True,
+    }
+    assert not _arm_execution_control_granted(
+        **common, fsm_status=status, mux_decision=rejected_decision,
+        published=True,
+    )
+    assert not _arm_execution_control_granted(
+        **common, fsm_status=stop_status, mux_decision=stop_decision,
+        published=True,
+    )
+    assert not _arm_execution_control_granted(
+        **common, fsm_status=status, mux_decision=accepted_decision,
+        published=False,
+    )
+    assert _arm_execution_control_granted(
+        **common, fsm_status=status, mux_decision=accepted_decision,
+        published=True,
+    )
+
+
+def test_external_candidate_never_grants_arm_execution_clock() -> None:
+    joints = _joints()
+    status = FSMStatus(
+        1, GlobalPhase.EXECUTE_PICK, LocalPhase.MOVE_PREGRASP,
+        0, False, "", NOW,
+    )
+    command = ManipulationCommand(
+        joints.position, (True, *([False] * 16)), LocalPhase.MOVE_PREGRASP,
+        NOW, NOW + 100,
+    )
+    _, decision = ActionMux().compose_with_decision(
+        None, command, joints, status, NOW,
+        manipulation_source="external_candidate",
+    )
+
+    assert not _arm_execution_control_granted(
+        fsm_status=status,
+        manipulation_command=command,
+        mux_decision=decision,
+        manipulation_source="external_candidate",
+        internal_publish_authorized=True,
+        published=True,
     )
 
 

@@ -359,12 +359,17 @@ JointState和TTL全部匹配时才可能取得官方发布授权。执行配置�
 观测；放置验证只收集释放/后撤完成且VERIFY_PLACE入口之后、时间严格递增的同一物体观测，
 使用有界缓存确认稳定后，再按当前F1 world/odom数值对齐约定检查三维中心距离与
 `TaskSpec.place_radius`。该约定不是通用TF，也不会创建假TF。
+TeamClient只在`perception.visual_observation_verifier`完整显式提供全部字段且构造校验通过
+时启用该组件；配置节缺失、null、字段不完整/多余或数值非法均保持不可用并失败关闭，
+不再回退到团队隐藏时间窗或距离阈值。
 
 夹爪绝对位置范围是官方 `[0,1]` 控制量；`max_gripper_velocity_per_s` 的单位是控制量/秒，
 位置范围不能推出速度必须小于等于1，最终速度仍需官方仿真标定。ArmExecution生成的
-`ManipulationCommand`只是候选，不证明 `ActionMux` 已接受或官方控制器已经执行。提交4
-接线前必须保证：候选失去ActionMux控制权或被STOP覆盖时，组装层暂停或reset执行器，
-不得让未实际发布的内部候选历史继续推进。
+`ManipulationCommand`只是候选，不证明 `ActionMux` 已接受或官方控制器已经执行。TeamClient
+会在同周期ActionMux仲裁和正式publisher调用结束后，通过`record_control_result`回报控制权；
+只有内部机械臂候选被接受、未被STOP/安全逻辑覆盖且本地正式发布调用成功的区间才计入轨迹、
+路点和验证预算。拒绝、非机械臂阶段、observe-only及发布失败会暂停预算；运动完成仍必须由
+后续不同时间戳的新鲜真实JointState确认，本地publisher成功不提升为Server接收或实际执行。
 
 同一 `ArmMotionPhase` 允许多个连续路点；`HUG_OPEN`、`VERIFY`、
 `TRANSPORT_HOLD` 等phase终点状态只在该phase最后一个路点到位时产生。提交3A要求一条

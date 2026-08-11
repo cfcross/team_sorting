@@ -113,6 +113,7 @@ from .interfaces import (
     BaseCommand,
     BaseState,
     CameraIntrinsics,
+    CandidateDisposition,
     DepthFrame,
     DispatchGroupRecord,
     DispatchMode,
@@ -231,17 +232,6 @@ class _RuntimeFSMFeedback:
 
 _RUNTIME_ID_UNSET = object()
 _MAX_PHASE_EVENT_KEYS = 32
-# 团队保守联调策略，不是赛事官方阈值：3cm试抬达到三倍1cm静止抖动，2cm水平
-# 漂移大于抖动但仍远小于当前24cm物体宽度；0.5s对应20Hz下10个控制周期。
-# 最低置信度复用部署配置perception.confidence_threshold，避免第二套置信门。
-_TEAM_VISUAL_VERIFIER_POLICY = {
-    "minimum_lift_delta_m": 0.03,
-    "max_horizontal_drift_m": 0.02,
-    "max_observation_gap_s": 0.5,
-    "required_frame_id": "odom",
-    "min_stationary_observations": 3,
-    "max_stationary_spread_m": 0.01,
-}
 _INTERNAL_STOP_PHASES = {
     GlobalPhase.WAIT_READY,
     GlobalPhase.LOAD_TASK,
@@ -498,6 +488,29 @@ def _internal_fsm_publish_authorization(
             and trajectory.trajectory_id == runtime_wiring.active_trajectory_id
         )
     return base_active or arm_active
+
+
+def _arm_execution_control_granted(
+    *,
+    fsm_status: FSMStatus,
+    manipulation_command: ManipulationCommand | None,
+    mux_decision: ActionMuxDecision,
+    manipulation_source: str,
+    internal_publish_authorized: bool,
+    published: bool,
+) -> bool:
+    """只承认同周期通过仲裁且完成正式发布调用的内部机械臂候选。"""
+
+    return (
+        fsm_status.global_phase
+        in {GlobalPhase.EXECUTE_PICK, GlobalPhase.EXECUTE_PLACE}
+        and manipulation_command is not None
+        and manipulation_source == "manipulation_command"
+        and mux_decision.manipulation_disposition
+        is CandidateDisposition.ACCEPTED
+        and internal_publish_authorized
+        and published
+    )
 
 
 class TimestampedCache:
@@ -1318,7 +1331,10 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             self._arm_execution_unavailable_reason = ""
             try:
                 arm_execution_config = _arm_execution_config_from_config(config)
-                self._arm_execution = ArmExecutionController(arm_execution_config)
+                self._arm_execution = ArmExecutionController(
+                    arm_execution_config,
+                    require_control_feedback=True,
+                )
             except (TypeError, ValueError) as exc:
                 self._arm_execution_unavailable_reason = (
                     f"ArmExecutionConfig不可用，执行失败关闭：{exc}"
@@ -3344,6 +3360,30 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
 
             return self._official_publisher is not None and self._context_ok()
 
+        def _record_arm_execution_control_result(
+            self, now_ns: int, control_granted: bool
+        ) -> None:
+            """把同周期仲裁与发布结果回报给活动轨迹执行时钟。"""
+
+            execution = self._arm_execution
+            if execution is None:
+                return
+            recorder = getattr(execution, "record_control_result", None)
+            if not callable(recorder):
+                # 测试替身和旧的纯算法注入对象可以没有新钩子；正式构造的执行器必有。
+                return
+            try:
+                recorder(now_ns, control_granted)
+            except (TypeError, ValueError, RuntimeError) as exc:
+                state = self._runtime_wiring
+                state.manipulation_diagnostic = (
+                    f"ArmExecution控制权回报失败，执行预算保持关闭：{exc}"
+                )
+                try:
+                    recorder(now_ns, False)
+                except (TypeError, ValueError, RuntimeError):
+                    pass
+
         def _control_tick(self) -> None:
             now_ns = self.get_clock().now().nanoseconds
             actual_dt_s = (
@@ -3425,6 +3465,7 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
 
             if joints is None or not joints.valid:
                 # 没有可靠实际关节时绝不能伪造17维全零；此时只能尽力让底盘停车。
+                self._record_arm_execution_control_result(now_ns, False)
                 self._publish_emergency_base_stop(
                     snapshot.failure_reason or "JointState 不可靠，无法构造安全保持动作"
                 )
@@ -3515,6 +3556,21 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 diagnostic_only=(
                     external_decision.accepted and not candidate_publish_authorized
                 ),
+            )
+            arm_control_granted = _arm_execution_control_granted(
+                fsm_status=status,
+                manipulation_command=manipulation_command,
+                mux_decision=mux_decision,
+                manipulation_source=(
+                    "external_candidate"
+                    if external_decision.accepted
+                    else "manipulation_command"
+                ),
+                internal_publish_authorized=internal_publish_authorized,
+                published=published,
+            )
+            self._record_arm_execution_control_result(
+                now_ns, arm_control_granted
             )
             if external_decision.accepted:
                 head_publish_failure_reason = ""
@@ -4244,37 +4300,30 @@ def _official_publish_enabled(control: dict[str, bool]) -> bool:
 def _visual_observation_verifier_from_config(
     config: dict[str, Any],
 ) -> VisualObservationVerifier:
-    """一次性构造验证器；显式私有配置可严格覆盖团队保守联调策略。"""
+    """只从完整显式配置构造验证器；缺失、null或非法值均失败关闭。"""
 
     perception = _config_mapping(config.get("perception"), "perception")
-    raw = perception.get("visual_observation_verifier")
-    if raw is None:
-        confidence = perception.get("confidence_threshold")
-        if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
-            raise RuntimeError(
-                "perception.confidence_threshold必须是有限数且不能是bool"
-            )
-        confidence_value = float(confidence)
-        if not math.isfinite(confidence_value):
-            raise RuntimeError("perception.confidence_threshold必须是有限数")
-        values = {
-            **_TEAM_VISUAL_VERIFIER_POLICY,
-            "minimum_observation_confidence": confidence_value,
-        }
-    else:
-        values = _config_mapping(raw, "perception.visual_observation_verifier")
-        required = {
-            "minimum_lift_delta_m",
-            "max_horizontal_drift_m",
-            "max_observation_gap_s",
-            "minimum_observation_confidence",
-            "required_frame_id",
-            "min_stationary_observations",
-            "max_stationary_spread_m",
-        }
-        _require_exact_config_keys(
-            values, required, "perception.visual_observation_verifier"
+    if "visual_observation_verifier" not in perception:
+        raise RuntimeError(
+            "perception.visual_observation_verifier缺失；"
+            "VisualObservationVerifier unavailable"
         )
+    values = _config_mapping(
+        perception["visual_observation_verifier"],
+        "perception.visual_observation_verifier",
+    )
+    required = {
+        "minimum_lift_delta_m",
+        "max_horizontal_drift_m",
+        "max_observation_gap_s",
+        "minimum_observation_confidence",
+        "required_frame_id",
+        "min_stationary_observations",
+        "max_stationary_spread_m",
+    }
+    _require_exact_config_keys(
+        values, required, "perception.visual_observation_verifier"
+    )
     return VisualObservationVerifier(**values)
 
 

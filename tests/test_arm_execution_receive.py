@@ -292,6 +292,67 @@ def test_place_trajectory_reaches_motion_complete_without_claiming_place_verifie
     assert controller.latest_grasp_verification is None
 
 
+def test_rejected_control_cycles_do_not_consume_trajectory_budget() -> None:
+    controller = _controller(
+        feedback_max_age_ns=20_000_000_000,
+        max_control_period_ns=100_000_000,
+        waypoint_timeout_margin_ns=100_000_000,
+        total_timeout_margin_ns=100_000_000,
+    )
+    start_ns = 2_000
+    controller.start_trajectory(_trajectory(timestamp_ns=start_ns))
+
+    controller.step(_actual(start_ns), start_ns)
+    controller.record_control_result(start_ns, False)
+    later_ns = start_ns + 10_000_000_000
+    command, status = controller.step(_actual(later_ns), later_ns)
+
+    assert command.valid
+    assert status.state != "FAILED"
+    assert "timeout" not in status.failure_reason
+    assert controller._execution_elapsed_ns == 0
+
+
+def test_stop_override_pause_resumes_without_false_waypoint_timeout() -> None:
+    controller = _controller(
+        feedback_max_age_ns=20_000_000_000,
+        max_control_period_ns=200_000_000,
+        waypoint_timeout_margin_ns=100_000_000,
+        total_timeout_margin_ns=100_000_000,
+    )
+    start_ns = 2_000
+    controller.start_trajectory(_trajectory(timestamp_ns=start_ns))
+    controller.step(_actual(start_ns), start_ns)
+    controller.record_control_result(start_ns, True)
+
+    active_ns = start_ns + 50_000_000
+    controller.step(_actual(active_ns), active_ns)
+    controller.record_control_result(active_ns, False)
+    controller.record_control_result(active_ns + 4_000_000_000, False)
+    resume_ns = active_ns + 8_000_000_000
+    controller.record_control_result(resume_ns, False)
+    command, status = controller.step(_actual(resume_ns + 1), resume_ns + 1)
+
+    assert command.valid
+    assert status.state != "FAILED"
+    assert "timeout" not in status.failure_reason
+    assert controller._execution_elapsed_ns == 50_000_000
+
+
+def test_granted_control_and_fresh_feedback_preserve_normal_active_clock() -> None:
+    controller = _controller()
+    start_ns = 2_000
+    controller.start_trajectory(_trajectory(timestamp_ns=start_ns))
+    controller.step(_actual(start_ns), start_ns)
+    controller.record_control_result(start_ns, True)
+    next_ns = start_ns + 100_000_000
+    command, status = controller.step(_actual(next_ns), next_ns)
+
+    assert command.valid
+    assert status.state == "RUNNING"
+    assert controller._execution_elapsed_ns == 100_000_000
+
+
 def test_accept_rejects_without_active_trajectory() -> None:
     with pytest.raises(ValueError, match="有效活动轨迹"):
         _controller().accept_grasp_verification(_verification(10))
