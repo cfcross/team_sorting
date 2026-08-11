@@ -8,7 +8,7 @@
 旁路记录后续 ACT（动作分块 Transformer）/VLA（视觉—语言—动作模型）需要的数据。
 
 > 当前定位是“可导入、可测试、边界清晰的客户端骨架”，不是已经能完成比赛的成品。
-> 真实相机/YOLO/MMK2FK 联调、导航、抓放规划、机械臂执行和比赛闭环仍未完成。
+> 真实相机/YOLO/MMK2FK 联调、导航参数实测标定与全局路径规划、抓放规划、机械臂执行和比赛闭环仍未完成。
 
 ### Stage 2.2 Interface v1
 
@@ -135,10 +135,11 @@ Candidate 已执行、已发布或已被机器人采用。
                  rosbag + JSONL + metadata
 ```
 
-图中 Navigation、Arm Planning 和 Arm Execution 表示目标架构。当前 `team_client_node`
-尚未把完整导航与抓放算法接入控制循环；默认只生成底盘零速候选，不生成主动17维关节
-保持候选。ActionMux仍可基于实际反馈形成诊断FinalAction，但observe-only全局门禁止
-将其发布到官方控制话题。
+图中 Arm Planning 和 Arm Execution 仍主要表示目标架构。`team_client_node` 已在
+`NAV_TO_PICK`、`NAV_TO_PLACE`、`RETURN_END` 阶段把阶段入口生成的同一 `NavGoal`、
+新鲜 Odom、`NavigationController.update()`、`BaseCommand`、`ActionMux` 和真实
+`NavigationStatus` 串联；非导航阶段仍生成底盘零速候选，且不生成主动17维关节保持候选。
+默认 observe-only 全局门仍禁止把 `FinalAction` 发布到官方控制话题。
 
 ## 4. 三个 ROS2 节点
 
@@ -294,7 +295,7 @@ Referee taskinfo / gameinfo / score
 | `RobotJointState` | `/joint_states` 映射出的 17 维**实际反馈**；它不是规划目标，也不是 IK 解。 |
 | `SensorSnapshot` | `team_client_node` 一个周期的轻量快照：任务、底盘、实际关节、三维目标；不含图像。 |
 | `Detection2D` | 图像像素坐标中的类别框、置信度、RGB frame 与时间；稳定器输出还携带非负 `track_id`，不带三维位置。 |
-| `ObjectEstimate3D` | 纯感知事实：目标**物体中心估计**及可选 `object_id`、观测姿态、明确提供的物体局部 XYZ 尺寸；有效中心估计不要求三个可选事实存在，也不携带 `target_body`。当前三维估计器从独立官方模型尺寸配置生产尺寸，并仅在稳定ID的点云姿态多帧收敛后生产姿态。 |
+| `ObjectEstimate3D` | 纯感知事实：目标**物体中心估计**及可选 `object_id`、观测姿态、明确提供的物体局部 XYZ 尺寸；有效中心估计不要求三个可选事实存在，也不携带 `target_body`。当前三维估计器从独立官方模型尺寸配置生产尺寸，并仅在稳定ID的点云中心和姿态多帧收敛后成对生产 refined geometry。 |
 | `Pose3D` | 严格有效 Pose：向量项必须是非bool `numbers.Real`，三项位置有限、四元数归一化非零且 frame 非空；不接受数字字符串，不跨 frame 重命名。 |
 | `NavGoal` | 底盘在指定 frame 中的 XY、yaw 目标和容差；物体放置点不能直接当作停车点。 |
 | `BaseCommand` | 导航模块提交给 `ActionMux` 的短时有效速度**建议**，不是已经发送的动作。 |
@@ -336,24 +337,39 @@ yaw、根据颜色产生姿态，或把确认后的规划关系描述为真实�
 有效路点至少控制一个关节；全False mask不能表示等待、停止或阶段标签。等待由带实际
 目标的路点时间表达，停止仍由正常安全控制链处理。
 
-ArmExecution已实现轨迹运动学执行，但真实抓取验证和confirmed GraspContext仍未实现，
-等待提交3B/集成阶段的真实证据来源。抓取执行到LIFT稳定到位后停在 `VERIFY`，只报告
-`VERIFICATION_PENDING`并输出短TTL保持候选；没有验证入口就不能进入RETREAT，也不能
-提升为抓取成功。放置轨迹结束只报告
-`MOTION_COMPLETED_PLACE_VERIFICATION_PENDING`且 `success=False`，不能表示物体已经
-稳定、脱夹、位于目标范围或获得 `PLACE_VERIFIED`。执行配置无隐藏默认值，当前
-`config.arm_execution` 全部为 `null`，且ROS/FSM尚未接线。
+ArmExecution已把真实抓取验证接入纯Python执行闭环：抓取执行到LIFT稳定到位后进入
+`VERIFY`，只有属于当前 `EXECUTE_PICK`、最后一个LIFT路点且位于显式等待窗口内的
+`GraspVerification` 才能被接收。`success=False` 只表示证据不足并继续等待更新证据；
+`success=True` 时无论明确抓住还是明确未抓住，都保存原始结论并继续安全RETREAT，
+不得伪造业务成功。RETREAT仍需后续不同时间戳的真实JointState满足连续停稳要求，才返回
+`MOTION_COMPLETED_PICK`；同一验证可通过只读 `latest_grasp_verification` 供
+`VERIFY_PICK` 使用。放置撤离到位返回
+`MOTION_COMPLETED_PLACE_VERIFICATION_PENDING`。两个运动完成态的 `success=True` 只表示
+JointTrajectory已由真实关节反馈完整确认，不表示物体抓住、脱夹、位于目标范围或获得
+`PICK_VERIFIED` / `PLACE_VERIFIED`。ROS组装层现已把PLAN_PICK/PLAN_PLACE的规划结果、
+EXECUTE_PICK/EXECUTE_PLACE的短TTL候选、试抬视觉验证和放置后稳定多帧验证接入现有FSM与
+ActionMux；阶段转换当周期会丢弃旧候选，机械臂候选只有在run/task/attempt、轨迹、阶段、
+JointState和TTL全部匹配时才可能取得官方发布授权。执行配置无隐藏默认值；当前部署配置
+仍保留未标定的 `null`，因此默认运行继续失败关闭，不能据此宣称官方机械臂已可执行。
 
 `VisualObservationVerifier` 当前是纯算法组件：它仅接受达到最低置信度且 frame 严格为
 `odom` 的新鲜同目标观测，以 `odom` Z 轴判断试抬高度，并以最大两两距离判断运动后观测
 是否稳定。稳定的运动后观测本身不能证明放置位置正确或物体已释放，因而不得直接触发
-`PLACE_VERIFIED`。观测缓存、验证器实例化、FSM事件及ROS运行时接线由后续组装阶段完成。
+`PLACE_VERIFIED`。TeamClient现为试抬冻结LIFT前同一object_id观测，并只消费更晚的新鲜
+观测；放置验证只收集释放/后撤完成且VERIFY_PLACE入口之后、时间严格递增的同一物体观测，
+使用有界缓存确认稳定后，再按当前F1 world/odom数值对齐约定检查三维中心距离与
+`TaskSpec.place_radius`。该约定不是通用TF，也不会创建假TF。
+TeamClient只在`perception.visual_observation_verifier`完整显式提供全部字段且构造校验通过
+时启用该组件；配置节缺失、null、字段不完整/多余或数值非法均保持不可用并失败关闭，
+不再回退到团队隐藏时间窗或距离阈值。
 
 夹爪绝对位置范围是官方 `[0,1]` 控制量；`max_gripper_velocity_per_s` 的单位是控制量/秒，
 位置范围不能推出速度必须小于等于1，最终速度仍需官方仿真标定。ArmExecution生成的
-`ManipulationCommand`只是候选，不证明 `ActionMux` 已接受或官方控制器已经执行。提交4
-接线前必须保证：候选失去ActionMux控制权或被STOP覆盖时，组装层暂停或reset执行器，
-不得让未实际发布的内部候选历史继续推进。
+`ManipulationCommand`只是候选，不证明 `ActionMux` 已接受或官方控制器已经执行。TeamClient
+会在同周期ActionMux仲裁和正式publisher调用结束后，通过`record_control_result`回报控制权；
+只有内部机械臂候选被接受、未被STOP/安全逻辑覆盖且本地正式发布调用成功的区间才计入轨迹、
+路点和验证预算。拒绝、非机械臂阶段、observe-only及发布失败会暂停预算；运动完成仍必须由
+后续不同时间戳的新鲜真实JointState确认，本地publisher成功不提升为Server接收或实际执行。
 
 同一 `ArmMotionPhase` 允许多个连续路点；`HUG_OPEN`、`VERIFY`、
 `TRANSPORT_HOLD` 等phase终点状态只在该phase最后一个路点到位时产生。提交3A要求一条
@@ -371,7 +387,8 @@ ActionMux接受候选或官方控制器执行动作。
 左右夹爪 `min/max=[0,1]` 来自新版官方离线 `mmk2_control.xml` actuator
 `ctrlrange="0. 1."`，属于已冻结的控制硬范围。`open/closed` 仍为未标定 `null`，
 `gripper_verified_in_official_environment=false`；确认硬范围不代表开闭值或夹持效果已验证，
-所以抓取和放置操作验证继续失败关闭。
+所以默认抓取和放置操作验证继续失败关闭；正式启用前仍须在官方仿真标定并填写完整
+`arm_planning`、`arm_execution`和视觉验证时间窗口。
 
 ## 8. 19 维动作
 
@@ -518,8 +535,9 @@ orphan 规则见
 
 运行参数以 `config/config.yaml` 为准，可通过 `TEAM_SORTING_CONFIG` 指向另一份完整配置。
 `perception.estimator_3d` 使用精确字段校验：旧的外部完整配置必须以当前默认配置为基线，
-补齐 `object_local_size_xyz_m` 下严格覆盖 `pink`、`yellow`、`brown` 的三项映射及完整
-`pose_refinement` 参数；缺失、
+补齐稳定身份重关联字段、`object_local_size_xyz_m` 下严格覆盖 `pink`、`yellow`、`brown`
+的三项映射及完整 `pose_refinement` 参数；`navigation` 同样必须精确覆盖当前
+`NavigationConfig` 的全部字段。缺失、
 多余或非法值都会使 PerceptionNode 拒绝启动，且不会退回复用中心补偿专用的
 `object_dimensions_m`。这是有意的失败关闭配置迁移，不是局部覆盖或向后兼容默认值。
 当前传感器、团队和官方控制话题如下：
@@ -561,9 +579,12 @@ orphan 规则见
 | `perception.stabilizer_2d.min_confirmed_hits` | `2` | 轨迹连续命中两帧后才输出稳定 `track_id` |
 | `perception.estimator_3d.ema_alpha` | `0.5` | 同一稳定 `track_id` 的三维中心 EMA 当前样本权重 |
 | `perception.estimator_3d.max_position_jump_m` | `1.0` | 单轨迹相邻三维中心最大允许跳变 |
+| `perception.estimator_3d.reassociation_*` | 见默认配置 | 二维可见片段中断后按 odom 三维事实恢复稳定 `object_id` 的年龄、距离、尺寸和歧义门限；均为早期仿真初值 |
+| `perception.estimator_3d.max_identity_tracks` | `128` | 活跃片段与休眠稳定身份缓存的硬上限 |
 | `perception.estimator_3d.object_dimensions_m.*` | `[0.24, 0.16, 0.19]` | 启发式中心补偿使用的宽、高、沿相机视线近似深度；不是物体局部XYZ尺寸 |
 | `perception.estimator_3d.object_local_size_xyz_m.*` | `[0.24, 0.16, 0.19]` | 官方模型确认的物体局部坐标系完整XYZ尺寸；只用于`size_xyz_m`，不推断姿态 |
 | `perception.estimator_3d.pose_refinement.*` | `enabled: false`，其余见默认配置 | 框内点云深度带、最少点数、连续帧数及位置/角度/尺寸误差门限；均为待真实相机标定的团队初值，正式联调前默认关闭 |
+| `navigation.*` | 见默认配置 | `NavigationConfig` 的完整显式映射；米、弧度、m/s、rad/s 与 ns 参数均为待官方仿真实测标定的保守初值 |
 | `recorder.enabled` | `false` | 默认不启动记录 |
 | `recorder.record_rosbag` | `true` | 启动 Recorder 时同时管理 rosbag |
 | `recorder.root_dir` | `./team_sorting_dataset` | Recorder schema v1 dataset root；旧扁平目录不自动迁移 |
@@ -591,8 +612,9 @@ orphan 规则见
 零；该静态模型事实本身不能产生实时姿态。启用 `pose_refinement` 后，估计器只取二维框
 内靠近可见表面深度的点，反投影到相机点云并变换到输出 frame；随后以 PCA 主轴和已知
 局部尺寸筛选长方体 OBB，得到点云拟合中心和局部轴到输出 frame 的 `xyzw` 四元数候选；
-只观测到单个表面时，结合相机位置与已知半尺寸从可见面恢复中心。同一稳定 `track_id`
-必须连续满足中心位置、角度和尺寸误差门限达到 `required_frames`，才原子输出 refined
+只观测到单个表面时，结合相机位置与已知半尺寸从可见面恢复中心。同一稳定 `object_id`
+对应的当前可见片段必须连续满足中心位置、角度和尺寸误差门限达到 `required_frames`，
+才原子输出 refined
 中心与姿态；否则继续输出原快速启发式中心且姿态为 `None`。中心对称长方体无法仅凭点云
 区分局部轴的 180° 符号翻转，代码固定选择
 同一有向包围盒中最接近单位姿态的等价代表，不能把它描述为恢复了 MJCF body 轴符号。
@@ -735,6 +757,8 @@ Run/Task/Attempt 层级；Segment 边界不被描述为正式训练 Episode 边�
 - YOLO、MMK2FK、KDL 薄适配器及缺失依赖的清晰报错；
 - YOLO 检测的 RGB frame 传递、二维稳定轨迹 ID 与 PerceptionNode 接线；
 - 三维深度中位数、反投影、配置尺寸中心补偿、独立局部尺寸输出、点云长方体中心/姿态拟合、稳定 ID 多帧 refine、跳变拒绝与三方时帧校验；
+- 机械臂规划、轨迹执行、试抬抓取验证、confirmed GraspContext、放置后稳定观测与
+  `place_radius` 判断的ROS/FSM组装接线，以及执行阶段候选的ActionMux/发布授权门；
 - Recorder schema v1 bootstrap/run-bound 生命周期、manifest/segment/event、只读恢复报告，
   以及兼容 metadata、FSM/动作 JSONL 和分段外部 rosbag 管理链；
 - 几何、任务解析、FSM、19 维动作、安全覆盖与 Recorder 的测试骨架。
@@ -743,15 +767,16 @@ Run/Task/Attempt 层级；Segment 边界不被描述为正式训练 Episode 边�
 
 - 正式 YOLO/相机环境中的检测与二维稳定器参数联调；
 - 点云中心/姿态 refine 在正式相机噪声与遮挡下的参数标定，以及正式 ROS/MMK2FK 环境中的三维坐标、时间同步和 planning frame 端到端验证（通过前默认关闭）；
-- 抓取/放置站位生成、航点导航、精对准和底盘控制；
-- 由物体中心生成抓取/放置末端位姿，以及完整 IK/轨迹规划；
-- ArmExecution与ROS/FSM的运行时接线及官方环境参数标定；
-- 真实抓取验证、confirmed GraspContext、放置验证和失败恢复；
-- 除“REFINE_TARGET收到阶段进入后新鲜、唯一、几何收敛目标才提交TARGET_REFINED”外，业务结果驱动 FSM、底盘与机械臂协同的完整比赛闭环；
+- 导航参数的官方仿真实测标定、障碍物检测与全局路径规划；当前只有站位生成、局部精对准和比例控制闭环；
+- 机械臂KDL、夹爪开闭值、速度、容差、轨迹时长和视觉验证窗口的官方仿真标定；默认
+  配置在这些事实确认前保持关闭/null，因此尚未完成正式环境端到端动作验证；
+- 正式规则下抓放失败恢复、返区和多任务结算的端到端比赛验证；
 - ACT/VLA 数据处理、训练和推理。
 
-当前 `team_client_node` 在默认控制周期中只创建零速 `BaseCommand`，机械臂业务候选为
-`None`；ActionMux基于实际反馈生成诊断FinalAction。默认observe-only不创建官方发布器，
+当前 `team_client_node` 在三个导航阶段使用导航控制器返回的短 TTL `BaseCommand`；机械臂
+执行阶段在完整显式配置与KDL自检成功后使用ArmExecution返回的短TTL
+`ManipulationCommand`，其他普通阶段为零速且不主动生成机械臂保持。所有候选均经ActionMux。
+默认observe-only不创建官方发布器，
 因此“生成诊断FinalAction”不等于“发送位置保持命令”。`create_hold_command()`仍保留给
 未来明确授权的主动保持场景。“仓库骨架完成”绝不等于“比赛代码完成”。
 

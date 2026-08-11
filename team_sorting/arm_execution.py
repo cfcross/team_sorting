@@ -176,18 +176,30 @@ class ArmExecutionController:
 
     正式执行必须显式注入 ``ArmExecutionConfig``。暂时允许无参构造，仅用于尚未获准修改
     的 ROS 骨架兼容；该实例不能装载或执行轨迹，并始终失败关闭，不含任何默认参数。
-    当前只提供 ``accept_grasp_verification`` 接收并缓存验证结果；是否据此解除
-    ``VERIFY`` 锁定，仍由后续 ROS/FSM 接线评审决定，本执行器默认保持关闭。
+    抓取验证只在当前 pick 轨迹的 LIFT/VERIFY 窗口内接收；验证完成后仍必须执行
+    RETREAT，并由后续不同时间戳的真实关节反馈确认整条轨迹运动学完成。
     """
 
-    def __init__(self, config: ArmExecutionConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: ArmExecutionConfig | None = None,
+        *,
+        require_control_feedback: bool = False,
+    ) -> None:
         if config is not None and not isinstance(config, ArmExecutionConfig):
             raise TypeError("config必须是ArmExecutionConfig")
+        if type(require_control_feedback) is not bool:
+            raise TypeError("require_control_feedback必须是严格bool")
         self._config = config
+        self._require_control_feedback = require_control_feedback
         self.local_phase = LocalPhase.IDLE
         self._trajectory: JointTrajectory | None = None
         self._waypoint_index = 0
         self._trajectory_started_ns: int | None = None
+        self._execution_elapsed_ns = 0
+        self._clock_checkpoint_ns: int | None = None
+        self._control_granted_since_checkpoint = not require_control_feedback
+        self._last_step_active_elapsed_ns: int | None = None
         self._stable_cycle_count = 0
         self._last_step_ns: int | None = None
         self._last_feedback_timestamp_ns: int | None = None
@@ -196,15 +208,125 @@ class ArmExecutionController:
         self._terminal_status: ManipulationStatus | None = None
         self._cached_verification: GraspVerification | None = None
         self._verification_received_ns: int | None = None
+        self._verification_consumed_ns: int | None = None
+        self._verification_pending_since_ns: int | None = None
+        self._verification_pending_active_elapsed_ns: int | None = None
+        self._verification_wait_duration_ns = 0
+        self._latest_grasp_verification: GraspVerification | None = None
+        self._latest_grasp_verification_binding: tuple[
+            int, str, GlobalPhase, ArmMotionPhase
+        ] | None = None
+
+    @property
+    def latest_grasp_verification(self) -> GraspVerification | None:
+        """返回绑定当前任务/轨迹/LIFT阶段的结论；新轨迹或 ``reset`` 会清除。"""
+
+        trajectory = self._trajectory
+        if (
+            trajectory is None
+            or _trajectory_error(trajectory)
+            or trajectory.execution_phase is not GlobalPhase.EXECUTE_PICK
+        ):
+            expected_binding = None
+        else:
+            expected_binding = (
+                trajectory.task_id,
+                trajectory.trajectory_id,
+                GlobalPhase.EXECUTE_PICK,
+                ArmMotionPhase.LIFT,
+            )
+        if self._latest_grasp_verification_binding != expected_binding:
+            return None
+        return self._latest_grasp_verification
+
+    def _verification_lifecycle_error(self, timestamp_ns: int) -> str:
+        """检查验证是否严格属于当前抓取试抬窗口，不修改任何运行状态。"""
+
+        if self._config is None:
+            return "ArmExecutionConfig未注入，不能接收抓取验证"
+        if self._trajectory is None or self._terminal_status is not None:
+            return "不存在可接收验证的有效活动轨迹"
+        trajectory_error = _trajectory_error(self._trajectory)
+        if trajectory_error:
+            return f"活动轨迹运行期校验失败：{trajectory_error}"
+        if self._trajectory.execution_phase is not GlobalPhase.EXECUTE_PICK:
+            return "只有EXECUTE_PICK活动轨迹可以接收抓取验证"
+        if not 0 <= self._waypoint_index < len(self._trajectory.waypoints):
+            return "当前轨迹路点位置无效，不能接收抓取验证"
+        waypoint = self._trajectory.waypoints[self._waypoint_index]
+        if (
+            waypoint.phase is not ArmMotionPhase.LIFT
+            or not self._is_last_waypoint_of_current_phase()
+        ):
+            return "只有最后一个LIFT路点稳定到位后才能接收抓取验证"
+        if self.local_phase is not LocalPhase.VERIFY:
+            return "当前局部阶段不是VERIFY，拒绝抓取验证"
+        pending_since_ns = self._verification_pending_since_ns
+        if pending_since_ns is None:
+            return "VERIFY等待窗口尚未建立，拒绝抓取验证"
+        if timestamp_ns < pending_since_ns:
+            return "verification.timestamp_ns不能早于进入VERIFY的时间"
+        pending_active_ns = self._verification_pending_active_elapsed_ns
+        if pending_active_ns is None:
+            return "VERIFY等待窗口缺少活动执行时间上下文"
+        projected_active_ns = self._project_active_elapsed_ns(timestamp_ns)
+        if projected_active_ns - pending_active_ns > self._config.verification_timeout_ns:
+            return "verification已超出verification_timeout_ns等待窗口"
+        return ""
+
+    def _project_active_elapsed_ns(self, timestamp_ns: int) -> int:
+        """投影到给定墙钟时刻的获准控制预算，不修改执行状态。"""
+
+        checkpoint_ns = self._clock_checkpoint_ns
+        if checkpoint_ns is None or timestamp_ns <= checkpoint_ns:
+            return self._execution_elapsed_ns
+        if not self._control_granted_since_checkpoint:
+            return self._execution_elapsed_ns
+        return self._execution_elapsed_ns + timestamp_ns - checkpoint_ns
+
+    def _advance_execution_clock(self, timestamp_ns: int) -> None:
+        """只把上个检查点后实际获准控制的区间计入执行预算。"""
+
+        checkpoint_ns = self._clock_checkpoint_ns
+        if checkpoint_ns is None:
+            self._clock_checkpoint_ns = timestamp_ns
+            return
+        if timestamp_ns < checkpoint_ns:
+            raise ValueError("执行控制权回报时间不得倒退")
+        if self._control_granted_since_checkpoint:
+            self._execution_elapsed_ns += timestamp_ns - checkpoint_ns
+        self._clock_checkpoint_ns = timestamp_ns
+
+    def record_control_result(
+        self, timestamp_ns: int, control_granted: bool
+    ) -> None:
+        """记录本周期 ActionMux 与官方发布边界的实际控制权结果。
+
+        ``control_granted`` 只能在机械臂候选被 ActionMux 接受、未被 STOP/安全逻辑
+        覆盖并且本地官方发布调用成功时为真。它不证明 Server 接收或物理执行；运动
+        完成仍只由后续新鲜、递增时间戳的真实 ``RobotJointState`` 确认。
+        """
+
+        timestamp_ns = _require_integer_ns(
+            timestamp_ns, "timestamp_ns", positive=False
+        )
+        if type(control_granted) is not bool:
+            raise ValueError("control_granted必须是严格bool")
+        self._advance_execution_clock(timestamp_ns)
+        self._control_granted_since_checkpoint = bool(
+            control_granted
+            and self._trajectory is not None
+            and self._terminal_status is None
+        )
 
     def accept_grasp_verification(
         self, verification: "GraspVerification"
     ) -> None:
-        """校验并缓存外部抓取验证，留待后续获批的 ROS/FSM 组装层消费。
+        """校验并缓存严格绑定当前 LIFT/VERIFY 生命周期的抓取验证。
 
-        本入口只负责接收，不确认 ``GraspContext``，也不会改变局部阶段或让
-        ``step`` 自动越过 ``VERIFY``。所有检查在写入前完成，避免非法输入
-        覆盖此前已经接收的有效验证。
+        本入口不确认 ``GraspContext``、不修改路点或局部阶段；只有下一次 ``step``
+        才能消费新验证并决定继续等待或开始安全 RETREAT。所有检查在写入前完成，
+        避免非法输入覆盖此前已经接收的有效验证。
 
         校验规则：
         - ``is_grasped`` / ``success``：严格 ``bool``；
@@ -265,7 +387,12 @@ class ArmExecutionController:
         if type(timestamp_ns) is not int or timestamp_ns < 0:
             raise ValueError("verification.timestamp_ns必须是非负整数且不能是bool")
 
-        # 2. 时间单调性校验（事务式：失败不覆盖缓存）
+        # 2. 生命周期校验（事务式：失败不覆盖缓存）
+        lifecycle_error = self._verification_lifecycle_error(timestamp_ns)
+        if lifecycle_error:
+            raise ValueError(lifecycle_error)
+
+        # 3. 时间单调性校验（事务式：失败不覆盖缓存）
         cached = self._cached_verification
         if cached is not None:
             if timestamp_ns < cached.timestamp_ns:
@@ -279,7 +406,7 @@ class ArmExecutionController:
                     "同一timestamp_ns下收到内容不同的verification，拒绝冲突重复"
                 )
 
-        # 3. 全部校验通过，才覆盖缓存
+        # 4. 全部校验通过，才覆盖缓存；路点只能由step推进。
         self._cached_verification = verification
         self._verification_received_ns = timestamp_ns
 
@@ -329,6 +456,14 @@ class ArmExecutionController:
         self._trajectory = None
         self._waypoint_index = 0
         self._trajectory_started_ns = None
+        self._execution_elapsed_ns = 0
+        self._clock_checkpoint_ns = None
+        # 纯算法离线调用保持既有连续周期语义；生产TeamClient显式要求控制权回报，
+        # 因而在第一次成功仲裁并发布前保持暂停。
+        self._control_granted_since_checkpoint = (
+            not self._require_control_feedback
+        )
+        self._last_step_active_elapsed_ns = None
         self._stable_cycle_count = 0
         self._last_step_ns = None
         self._last_feedback_timestamp_ns = None
@@ -337,6 +472,12 @@ class ArmExecutionController:
         self._terminal_status = None
         self._cached_verification = None
         self._verification_received_ns = None
+        self._verification_consumed_ns = None
+        self._verification_pending_since_ns = None
+        self._verification_pending_active_elapsed_ns = None
+        self._verification_wait_duration_ns = 0
+        self._latest_grasp_verification = None
+        self._latest_grasp_verification_binding = None
         self.local_phase = LocalPhase.IDLE
 
     @staticmethod
@@ -402,6 +543,19 @@ class ArmExecutionController:
             timestamp_ns, timestamp_ns, False, reason,
         )
 
+    def _clear_verification_pending_context(
+        self, *, clear_wait_duration: bool = False
+    ) -> None:
+        """清除仅供 VERIFY 等待/消费使用的上下文，保留已完成的只读结论。"""
+
+        self._cached_verification = None
+        self._verification_received_ns = None
+        self._verification_consumed_ns = None
+        self._verification_pending_since_ns = None
+        self._verification_pending_active_elapsed_ns = None
+        if clear_wait_duration:
+            self._verification_wait_duration_ns = 0
+
     def _fail(
         self, actual: object, timestamp_ns: int, reason: str,
         max_error: float = float("inf"),
@@ -411,6 +565,7 @@ class ArmExecutionController:
             self.local_phase, "FAILED", self._progress(), max_error,
             False, reason, timestamp_ns,
         )
+        self._clear_verification_pending_context(clear_wait_duration=True)
         self._terminal_status = status
         return self._inactive_command(actual, timestamp_ns, reason), status
 
@@ -566,8 +721,6 @@ class ArmExecutionController:
             return self._inactive_command(actual_joints, timestamp_ns, reason), ManipulationStatus(
                 LocalPhase.IDLE, "NO_TRAJECTORY", 0.0, float("inf"), False, reason, timestamp_ns,
             )
-        if self._last_step_ns is not None and timestamp_ns - self._last_step_ns > self._config.max_control_period_ns:
-            return self._fail(actual_joints, timestamp_ns, "控制周期间隔超过max_control_period_ns")
         trajectory_error = _trajectory_error(self._trajectory)
         if trajectory_error:
             return self._fail(
@@ -589,21 +742,110 @@ class ArmExecutionController:
                 if initial_error:
                     return self._fail(actual_joints, timestamp_ns, initial_error)
 
+        try:
+            self._advance_execution_clock(timestamp_ns)
+        except ValueError as exc:
+            return self._fail(actual_joints, timestamp_ns, str(exc))
+        active_step_delta_ns = (
+            0
+            if self._last_step_active_elapsed_ns is None
+            else self._execution_elapsed_ns - self._last_step_active_elapsed_ns
+        )
+        if active_step_delta_ns > self._config.max_control_period_ns:
+            return self._fail(
+                actual_joints, timestamp_ns,
+                "获准控制的活动控制周期间隔超过max_control_period_ns",
+            )
+
         assert self._trajectory_started_ns is not None
         assert self._initial_position is not None
         assert self._last_command is not None
-        elapsed_ns = timestamp_ns - self._trajectory_started_ns
+
+        # 【返工：抓取验证闭环】accept只缓存；路点推进严格发生在持有真实反馈的step内。
+        verification_unlocked_this_step = False
         waypoint = self._trajectory.waypoints[self._waypoint_index]
-        waypoint_time_ns = int(round(waypoint.time_from_start_s * 1_000_000_000))
-        final_time_ns = int(round(self._trajectory.waypoints[-1].time_from_start_s * 1_000_000_000))
-        if elapsed_ns > final_time_ns + self._config.total_timeout_margin_ns:
-            return self._fail(actual_joints, timestamp_ns, "整条轨迹超过total_timeout_margin_ns")
         waiting_for_verification = (
             self._trajectory.execution_phase is GlobalPhase.EXECUTE_PICK
             and waypoint.phase is ArmMotionPhase.LIFT
             and self._is_last_waypoint_of_current_phase()
             and self.local_phase is LocalPhase.VERIFY
         )
+        if waiting_for_verification:
+            pending_since_ns = self._verification_pending_since_ns
+            if pending_since_ns is None:
+                return self._fail(
+                    actual_joints, timestamp_ns,
+                    "VERIFY阶段缺少verification pending时间上下文",
+                )
+            pending_active_ns = self._verification_pending_active_elapsed_ns
+            if pending_active_ns is None:
+                return self._fail(
+                    actual_joints, timestamp_ns,
+                    "VERIFY阶段缺少活动执行时间上下文",
+                )
+            cached = self._cached_verification
+            if (
+                cached is not None
+                and cached.timestamp_ns != self._verification_consumed_ns
+            ):
+                if cached.timestamp_ns > timestamp_ns:
+                    return self._fail(
+                        actual_joints, timestamp_ns,
+                        "GraspVerification.timestamp_ns不得来自step未来",
+                    )
+                self._verification_consumed_ns = cached.timestamp_ns
+                if cached.success:
+                    # success仅表示验证已得出结论；is_grasped真/假都必须安全撤离。
+                    self._latest_grasp_verification = cached
+                    self._latest_grasp_verification_binding = (
+                        self._trajectory.task_id,
+                        self._trajectory.trajectory_id,
+                        GlobalPhase.EXECUTE_PICK,
+                        ArmMotionPhase.LIFT,
+                    )
+                    self._verification_wait_duration_ns += (
+                        self._execution_elapsed_ns
+                        - pending_active_ns
+                    )
+                    self._clear_verification_pending_context()
+                    self._stable_cycle_count = 0
+                    self._waypoint_index += 1
+                    if (
+                        self._waypoint_index >= len(self._trajectory.waypoints)
+                        or self._trajectory.waypoints[self._waypoint_index].phase
+                        is not ArmMotionPhase.RETREAT
+                    ):
+                        return self._fail(
+                            actual_joints, timestamp_ns,
+                            "验证完成后缺少安全RETREAT路点，执行失败关闭",
+                        )
+                    self.local_phase = LocalPhase.RETREAT
+                    verification_unlocked_this_step = True
+                    waypoint = self._trajectory.waypoints[self._waypoint_index]
+                    waiting_for_verification = False
+            if (
+                waiting_for_verification
+                and self._execution_elapsed_ns
+                - pending_active_ns
+                > self._config.verification_timeout_ns
+            ):
+                return self._fail(
+                    actual_joints, timestamp_ns,
+                    "等待GraspVerification超过verification_timeout_ns",
+                )
+
+        # VERIFY是显式暂停段，等待时间不侵占后续RETREAT的轨迹/总超时预算。
+        elapsed_ns = (
+            self._execution_elapsed_ns
+            - self._verification_wait_duration_ns
+        )
+        waypoint_time_ns = int(round(waypoint.time_from_start_s * 1_000_000_000))
+        final_time_ns = int(round(self._trajectory.waypoints[-1].time_from_start_s * 1_000_000_000))
+        if (
+            not waiting_for_verification
+            and elapsed_ns > final_time_ns + self._config.total_timeout_margin_ns
+        ):
+            return self._fail(actual_joints, timestamp_ns, "整条轨迹超过total_timeout_margin_ns")
         if (
             not waiting_for_verification
             and elapsed_ns > waypoint_time_ns + self._config.waypoint_timeout_margin_ns
@@ -625,7 +867,7 @@ class ArmExecutionController:
                 desired[index] = start_position[index] + alpha * (
                     waypoint.joint_position[index] - start_position[index]
                 )
-        dt_s = 0.0 if self._last_step_ns is None else (timestamp_ns - self._last_step_ns) / 1_000_000_000
+        dt_s = active_step_delta_ns / 1_000_000_000
         limited = list(actual)
         for index in range(17):
             if not waypoint.controlled_mask[index]:
@@ -640,14 +882,21 @@ class ArmExecutionController:
             abs(actual[i] - waypoint.joint_position[i]) <= self._tolerance_for_index(i, self._config)
             for i in range(17) if waypoint.controlled_mask[i]
         )
-        if not reached:
+        # 解锁RETREAT的本周期反馈采样早于RETREAT候选发布，不能拿来证明撤离已执行。
+        if verification_unlocked_this_step:
+            self._stable_cycle_count = 0
+        elif not reached:
             self._stable_cycle_count = 0
         elif is_new_feedback:
             self._stable_cycle_count = min(
                 self._config.settle_cycles,
                 self._stable_cycle_count + 1,
             )
-        settled = reached and self._stable_cycle_count >= self._config.settle_cycles
+        settled = (
+            not verification_unlocked_this_step
+            and reached
+            and self._stable_cycle_count >= self._config.settle_cycles
+        )
         self.local_phase = self._phase_for_current(settled)
         max_error = max(errors)
         command = ManipulationCommand(
@@ -656,6 +905,7 @@ class ArmExecutionController:
         )
         self._last_command = tuple(limited)
         self._last_step_ns = timestamp_ns
+        self._last_step_active_elapsed_ns = self._execution_elapsed_ns
 
         if settled and elapsed_ns >= waypoint_time_ns:
             if (
@@ -664,27 +914,51 @@ class ArmExecutionController:
                 and self._is_last_waypoint_of_current_phase()
             ):
                 self.local_phase = LocalPhase.VERIFY
+                if self._verification_pending_since_ns is None:
+                    self._verification_pending_since_ns = timestamp_ns
+                    self._verification_pending_active_elapsed_ns = (
+                        self._execution_elapsed_ns
+                    )
                 command = ManipulationCommand(
                     tuple(limited), tuple(waypoint.controlled_mask), self.local_phase,
                     timestamp_ns, timestamp_ns + self._config.command_ttl_ns, True, "",
                 )
+                cached = self._cached_verification
+                evidence_insufficient = (
+                    cached is not None
+                    and cached.timestamp_ns == self._verification_consumed_ns
+                    and not cached.success
+                )
+                pending_reason = (
+                    "最新GraspVerification证据不足，继续等待窗口内更新证据"
+                    if evidence_insufficient
+                    else "LIFT已稳定到位，等待真实GraspVerification；不得确认GraspContext"
+                )
                 return command, ManipulationStatus(
                     self.local_phase, "VERIFICATION_PENDING", self._progress(),
-                    max_error, False,
-                    "LIFT已稳定到位，等待真实GraspVerification；不得确认GraspContext",
+                    max_error, False, pending_reason,
                     timestamp_ns,
                 )
         if settled and is_new_feedback and elapsed_ns >= waypoint_time_ns:
             self._stable_cycle_count = 0
             self._waypoint_index += 1
             if self._waypoint_index == len(self._trajectory.waypoints):
+                completion_phase = self._trajectory.execution_phase
                 self.local_phase = LocalPhase.IDLE
-                reason = "放置轨迹运动学执行完成；物体位置与裁判语义仍待外部验证"
+                if completion_phase is GlobalPhase.EXECUTE_PICK:
+                    state = "MOTION_COMPLETED_PICK"
+                    reason = (
+                        "抓取轨迹已由真实关节反馈完整确认；抓取业务结论仍由"
+                        "latest_grasp_verification供VERIFY_PICK判定"
+                    )
+                else:
+                    state = "MOTION_COMPLETED_PLACE_VERIFICATION_PENDING"
+                    reason = "放置轨迹运动学执行完成；物体位置与裁判语义仍待外部验证"
                 status = ManipulationStatus(
-                    self.local_phase,
-                    "MOTION_COMPLETED_PLACE_VERIFICATION_PENDING",
-                    1.0, max_error, False, reason, timestamp_ns,
+                    self.local_phase, state,
+                    1.0, max_error, True, reason, timestamp_ns,
                 )
+                self._clear_verification_pending_context(clear_wait_duration=True)
                 self._terminal_status = status
                 return self._inactive_command(actual_joints, timestamp_ns, status.failure_reason or "轨迹运动学执行已完成"), status
 

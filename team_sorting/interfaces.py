@@ -1626,6 +1626,7 @@ class ArmExecutionConfig:
     trajectory_max_age_ns: int
     command_ttl_ns: int
     max_control_period_ns: int
+    verification_timeout_ns: int
     waypoint_timeout_margin_ns: int
     total_timeout_margin_ns: int
     max_slide_velocity_m_s: float
@@ -1645,6 +1646,7 @@ class ArmExecutionConfig:
             "trajectory_max_age_ns",
             "command_ttl_ns",
             "max_control_period_ns",
+            "verification_timeout_ns",
             "waypoint_timeout_margin_ns",
             "total_timeout_margin_ns",
         ):
@@ -1749,8 +1751,9 @@ class ManipulationStatus:
     FSM。它是基于反馈的执行评估，不能由目标轨迹或候选命令直接充当。
 
     ``max_joint_error`` 单位为对应关节单位，``progress`` 建议范围 0～1。``success=True``
-    不得表示尚未验证的抓取或放置：提交3A的抓取停在 ``VERIFY`` 等待真实证据，放置只
-    报告运动学完成并等待外部验证。``ManipulationCommand`` 只是候选，不能证明
+    只对应由不同时间戳的真实关节反馈确认整条轨迹完成的显式运动学完成态；它不表示
+    物体一定抓住或放对。抓放业务结果仍由 ``VERIFY_PICK`` / ``VERIFY_PLACE`` 判断。
+    ``ManipulationCommand`` 只是候选，不能证明
     ``ActionMux`` 已接受或官方控制器已经执行；未验证、超时和轨迹错误都需说明原因。
     """
 
@@ -1766,7 +1769,8 @@ class ManipulationStatus:
         _require_enum(self.local_phase, LocalPhase, "ManipulationStatus.local_phase")
         _require_string(self.state, "ManipulationStatus.state", nonempty=True)
         allowed_states = {
-            "FAILED", "LOADED", "MOTION_COMPLETED_PLACE_VERIFICATION_PENDING",
+            "FAILED", "LOADED", "MOTION_COMPLETED_PICK",
+            "MOTION_COMPLETED_PLACE_VERIFICATION_PENDING",
             "NO_TRAJECTORY", "REJECTED", "RUNNING", "VERIFICATION_PENDING",
         }
         if self.state not in allowed_states:
@@ -1780,8 +1784,15 @@ class ManipulationStatus:
         if math.isnan(error) or error == float("-inf") or error < 0.0:
             raise ValueError("ManipulationStatus.max_joint_error 必须是非负有限数或 +Inf 哨兵")
         _strict_bool(self.success, "ManipulationStatus.success")
-        if self.success:
-            raise ValueError("当前 ManipulationStatus 状态集合尚无已验证成功状态")
+        motion_completed_states = {
+            "MOTION_COMPLETED_PICK",
+            # 保留既有名称以兼容调用方；VERIFICATION_PENDING 仅说明业务验证仍待进行。
+            "MOTION_COMPLETED_PLACE_VERIFICATION_PENDING",
+        }
+        if self.success != (self.state in motion_completed_states):
+            raise ValueError(
+                "ManipulationStatus.success 必须且只能对应真实反馈确认的运动学完成态"
+            )
         _require_string(self.failure_reason, "ManipulationStatus.failure_reason")
         _strict_nonnegative_ns(self.timestamp_ns, "ManipulationStatus.timestamp_ns")
 
@@ -1806,7 +1817,9 @@ class GraspVerification:
     置信度建议为 0～1，视觉和 effort 证据为可读摘要。该结果来自机器人观测，不得用
     裁判最终 JSON 伪装成逐帧抓取真值。证据不足时 ``success=False``。
 
-    当前骨架状态：该接口已预留，抓取验证闭环尚未完成。
+    ``success`` 只表示本次验证过程是否得到结论；仅在 ``success=True`` 时，
+    ``is_grasped`` 才分别表达明确抓住或明确未抓住。运动轨迹是否完整执行由
+    ``ManipulationStatus`` 的运动学完成态独立表达。
     """
 
     is_grasped: bool
@@ -1835,7 +1848,6 @@ class GraspVerification:
         _strict_nonnegative_ns(
             self.timestamp_ns, "GraspVerification.timestamp_ns"
         )
-
 
 # FSM与最终动作
 

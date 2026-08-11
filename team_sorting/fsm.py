@@ -216,9 +216,6 @@ class FSMEvent(str, Enum):
     # 安全监控明确确认恢复条件已经满足。只能从SAFE_HOLD恢复到原阶段，不会越级
     # 宣称任何感知、导航、规划或执行步骤成功。当前ros_nodes尚未接入真实生产者。
     SAFETY_RECOVERED = "SAFETY_RECOVERED"
-    # ————————————————————————————————
-
-
 # 官方任务JSON解析
 
 class InstructionParser:
@@ -620,7 +617,8 @@ class GlobalFSM:
             return False
         if event is FSMEvent.SAFETY_HOLD:
             return self._enter_safe_hold(
-                timestamp_ns, reason or "安全监控请求进入SAFE_HOLD"
+                timestamp_ns,
+                reason or "安全监控请求进入SAFE_HOLD",
             )
         # ————————————————————————————————
         # ————————————————————————————————
@@ -793,11 +791,6 @@ class GlobalFSM:
             return False
         # ————————————————————————————————
         # ————————————————————————————————
-        # 【Codex修改-6：阶段超时直接失败】
-        # 1. 修改前超时进入SAFE_HOLD，恢复后因预算耗尽会立刻再次超时并形成循环。
-        # 2. 当前在活动时间达到边界时直接进入FAILED，并记录阶段、实际时间和配置限制。
-        # 3. 这样超时不会伪装成可恢复暂停，也不会自动成功、重试或驱动机器人返区。
-        # 4. check_timeout签名和默认空策略兼容性保持不变。
         timeout_ns = self._phase_timeouts_ns.get(self.phase)
         if timeout_ns is None:
             return False
@@ -955,7 +948,8 @@ class GlobalFSM:
             # 不扩展 FSMStatus 字段，同时保留原失败与安全暂停原因。
             if self.failure_reason and self._safe_hold_reason:
                 displayed_reason = (
-                    f"原失败：{self.failure_reason}；安全暂停：{self._safe_hold_reason}"
+                    f"原失败：{self.failure_reason}；"
+                    f"安全暂停：{self._safe_hold_reason}"
                 )
             else:
                 displayed_reason = self._safe_hold_reason or self.failure_reason
@@ -1058,7 +1052,11 @@ class GlobalFSM:
     # 2. 当前拒绝终止态和重复暂停，并在进入SAFE_HOLD前保存当前业务阶段。
     # 3. 这样终止任务不会被安全事件复活，恢复也只能回到确实被中断的阶段。
     # 4. 仅新增私有辅助方法，外部仍通过handle_event提交既有事件。
-    def _enter_safe_hold(self, timestamp_ns: int, reason: str) -> bool:
+    def _enter_safe_hold(
+        self,
+        timestamp_ns: int,
+        reason: str,
+    ) -> bool:
         if self.phase in self._TERMINAL_PHASES or self.phase is GlobalPhase.SAFE_HOLD:
             return False
         self._interrupted_phase = self.phase

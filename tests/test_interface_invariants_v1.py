@@ -72,6 +72,31 @@ def _manipulation_status() -> ManipulationStatus:
     )
 
 
+@pytest.mark.parametrize(
+    "state",
+    (
+        "MOTION_COMPLETED_PICK",
+        "MOTION_COMPLETED_PLACE_VERIFICATION_PENDING",
+    ),
+)
+def test_manipulation_status_motion_completion_requires_success_true(
+    state: str,
+) -> None:
+    completed = ManipulationStatus(
+        LocalPhase.IDLE, state, 1.0, 0.0, True,
+        "运动完成但业务验证保持独立", NOW,
+    )
+    assert completed.success is True
+
+    with pytest.raises(ValueError, match="运动学完成态"):
+        replace(completed, success=False)
+
+
+def test_manipulation_status_noncompletion_rejects_success_true() -> None:
+    with pytest.raises(ValueError, match="运动学完成态"):
+        replace(_manipulation_status(), success=True)
+
+
 def _fsm_status() -> FSMStatus:
     return FSMStatus(
         1, GlobalPhase.SEARCH_TARGET, LocalPhase.IDLE, 0, False, "", NOW
