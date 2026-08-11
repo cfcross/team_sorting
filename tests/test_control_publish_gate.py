@@ -459,6 +459,52 @@ def _official_message_count(node: Any) -> int:
     return sum(len(node.publishers[topic].messages) for topic in OFFICIAL_TOPICS)
 
 
+def _policy_node() -> Any:
+    ros = _ros()
+    config = _config(observe_only=False, enable_official_publish=True)
+    config["pi05_policy_control"].update(
+        enabled=True,
+        enable_actuation=True,
+        simulation_publish_enabled=True,
+        max_policy_response_latency_ms=250.0,
+        candidate_ttl_ms=250.0,
+        watchdog_timeout_ms=300.0,
+    )
+    node = _create_team_client_node(ros)(config, ros)
+    node._system_ready_submitted = True
+    node._on_instruction(_message(json.dumps(OFFICIAL_TASKS)))
+    _feed_official_context(node, task=1, attempt=0)
+    _set_active_fsm(node)
+    return node
+
+
+def _policy_candidate_json(node: Any, request_id: int = 1) -> str:
+    identity = node._policy_control._context_key
+    assert identity is not None
+    return json.dumps({
+        "schema_name": "MMK2Pi05PolicyControlCandidate",
+        "schema_version": 1,
+        "request_id": request_id,
+        "generation_id": "process:1",
+        "run_id": identity[0],
+        "episode_id": identity[0],
+        "task_id": identity[1],
+        "attempt_count": identity[2],
+        "instruction_fingerprint": identity[3],
+        "task_set_fingerprint": identity[4],
+        "active_task_fingerprint": identity[5],
+        "model_id": "pi05_mmk2_task1_lora",
+        "action_horizon": 15,
+        "action_dim": 19,
+        "actions": [[0.1, 0.2, *([0.1] * 17)] for _ in range(15)],
+        "response_latency_ms": 100.0,
+        "context_valid": True,
+        "valid": True,
+        "failure_reason": "",
+        "published_to_robot": False,
+    })
+
+
 def test_default_config_is_observe_only_and_creates_no_official_publishers() -> None:
     config = _config()
     assert {
@@ -2607,6 +2653,137 @@ def test_accepted_external_candidate_cannot_cross_observe_only_gate() -> None:
     assert audit["official_publish_success"] is False
 
 
+def test_control_tick_policy_exclusive_ignores_only_placeholder_and_full_dispatches():
+    node = _policy_node()
+    _prime_control_state(node)
+    control_results: list[tuple[int, bool]] = []
+    node._arm_execution = SimpleNamespace(
+        record_control_result=lambda timestamp_ns, granted: control_results.append(
+            (timestamp_ns, granted)
+        )
+    )
+    node._on_policy_control_candidate(_message(_policy_candidate_json(node)))
+
+    node._control_tick()
+
+    assert _official_message_count(node) == 5
+    dispatch = json.loads(node.publishers["/team/action_dispatch"].messages[-1].data)
+    assert dispatch["dispatch_mode"] == "full"
+    action = json.loads(node.publishers["/team/final_action"].messages[-1].data)
+    assert action["action"][:2] == [0.1, 0.2]
+    assert control_results == [(NOW, False)]
+
+
+def test_control_tick_policy_without_candidate_outputs_zero_and_actual_hold():
+    node = _policy_node()
+    actual = RobotJointState(
+        position=tuple(0.01 * index for index in range(17)),
+        velocity=(0.0,) * 17, effort=(0.0,) * 17, timestamp_ns=NOW,
+    )
+    _prime_control_state(node, actual)
+
+    node._control_tick()
+
+    assert _official_message_count(node) == 0
+    action = json.loads(node.publishers["/team/final_action"].messages[-1].data)
+    assert action["action"][:2] == [0.0, 0.0]
+    assert action["action"][2:] == list(actual.position)
+
+
+def test_control_tick_external_candidate_conflicts_with_policy_chunk():
+    node = _policy_node()
+    _prime_control_state(node)
+    node._on_policy_control_candidate(_message(_policy_candidate_json(node)))
+    node._external_candidate.take = lambda **_kwargs: ExternalCandidateDecision(
+        "candidate_consumed", NOW, True, command=_external_command()
+    )
+    seen = []
+    original_take = node._policy_control.take
+
+    def take(**kwargs):
+        decision = original_take(**kwargs)
+        seen.append(decision)
+        return decision
+
+    node._policy_control.take = take
+
+    node._control_tick()
+
+    assert seen[-1].failure_reason == "exclusive_control_conflict"
+    assert not node._policy_control.pending
+    assert _official_message_count(node) == 0
+
+
+def test_control_tick_real_business_candidate_is_not_overwritten_by_policy():
+    node = _policy_node()
+    _prime_control_state(node)
+    node._on_policy_control_candidate(_message(_policy_candidate_json(node)))
+    real_base = BaseCommand(0.05, 0.0, NOW, NOW + 100_000_000)
+    node._compute_candidate_commands = lambda *_args: (real_base, None)
+    seen = []
+    original_take = node._policy_control.take
+
+    def take(**kwargs):
+        decision = original_take(**kwargs)
+        seen.append(decision)
+        return decision
+
+    node._policy_control.take = take
+
+    node._control_tick()
+
+    assert seen[-1].failure_reason == "exclusive_control_conflict"
+    assert _official_message_count(node) == 0
+    action = json.loads(node.publishers["/team/final_action"].messages[-1].data)
+    assert action["action"][0] == 0.05
+
+
+@pytest.mark.parametrize("odom_mode", ["missing", "stale", "invalid"])
+def test_control_tick_invalid_odom_clears_policy_and_never_full_dispatches(odom_mode):
+    node = _policy_node()
+    node._joint_cache.put(NOW, _joints())
+    if odom_mode == "stale":
+        stale = replace(_base(), timestamp_ns=NOW - node._state_max_delta_ns - 1)
+        node._base_cache.put(stale.timestamp_ns, stale)
+    elif odom_mode == "invalid":
+        invalid = replace(_base(), valid=False, failure_reason="invalid odom")
+        node._base_cache.put(NOW, invalid)
+    node._on_policy_control_candidate(_message(_policy_candidate_json(node)))
+
+    node._control_tick()
+
+    assert not node._policy_control.pending
+    assert _official_message_count(node) == 0
+    dispatch = json.loads(node.publishers["/team/action_dispatch"].messages[-1].data)
+    assert dispatch["dispatch_mode"] == "none"
+    action = json.loads(node.publishers["/team/final_action"].messages[-1].data)
+    assert action["action"][:2] == [0.0, 0.0]
+
+
+def test_control_tick_stale_joints_clears_policy_and_cannot_full_dispatch():
+    node = _policy_node()
+    control_results: list[tuple[int, bool]] = []
+    node._arm_execution = SimpleNamespace(
+        record_control_result=lambda timestamp_ns, granted: control_results.append(
+            (timestamp_ns, granted)
+        )
+    )
+    node._base_cache.put(NOW, _base())
+    stale = replace(_joints(), timestamp_ns=NOW - node._state_max_delta_ns - 1)
+    node._joint_cache.put(stale.timestamp_ns, stale)
+    node._on_policy_control_candidate(_message(_policy_candidate_json(node)))
+
+    node._control_tick()
+
+    assert not node._policy_control.pending
+    assert control_results == [(NOW, False)]
+    assert all(
+        len(node.publishers[topic].messages) == 0
+        for topic in OFFICIAL_TOPICS
+        if topic != "/cmd_vel"
+    )
+
+
 class _OfficialSpy:
     def __init__(self, events: list[str]) -> None:
         self.events = events
@@ -3048,7 +3225,10 @@ def test_arm_execution_control_result_requires_mux_acceptance_and_publish_succes
     )
 
 
-def test_external_candidate_never_grants_arm_execution_clock() -> None:
+@pytest.mark.parametrize(
+    "source", ["external_candidate", "pi05_policy_control"]
+)
+def test_non_fsm_candidate_never_grants_arm_execution_clock(source: str) -> None:
     joints = _joints()
     status = FSMStatus(
         1, GlobalPhase.EXECUTE_PICK, LocalPhase.MOVE_PREGRASP,
@@ -3060,14 +3240,14 @@ def test_external_candidate_never_grants_arm_execution_clock() -> None:
     )
     _, decision = ActionMux().compose_with_decision(
         None, command, joints, status, NOW,
-        manipulation_source="external_candidate",
+        manipulation_source=source,
     )
 
     assert not _arm_execution_control_granted(
         fsm_status=status,
         manipulation_command=command,
         mux_decision=decision,
-        manipulation_source="external_candidate",
+        manipulation_source=source,
         internal_publish_authorized=True,
         published=True,
     )

@@ -2086,6 +2086,7 @@ class ActionMuxDecision:
             "base_command",
             "manipulation_command",
             "external_candidate",
+            "pi05_policy_control",
         }
         if (
             not isinstance(self.base_source, str)
@@ -2110,8 +2111,8 @@ class ActionMuxDecision:
             if any((*commanded[:2], *clipped[:2])):
                 raise ValueError("无 BaseCommand 时 base commanded/clipped 必须全 false")
         else:
-            if self.base_source != "base_command":
-                raise ValueError("存在 BaseCommand 时 base_source 必须为 base_command")
+            if self.base_source not in {"base_command", "pi05_policy_control"}:
+                raise ValueError("存在 BaseCommand 时 base_source 无效")
             if self.base_disposition is CandidateDisposition.ABSENT:
                 raise ValueError("存在 BaseCommand 时 base_disposition 不能为 absent")
         if self.base_disposition is CandidateDisposition.ACCEPTED and commanded[:2] != (
@@ -2139,6 +2140,7 @@ class ActionMuxDecision:
             if self.manipulation_source not in {
                 "manipulation_command",
                 "external_candidate",
+                "pi05_policy_control",
             }:
                 raise ValueError(
                     "存在 ManipulationCommand 时 manipulation_source 无效"

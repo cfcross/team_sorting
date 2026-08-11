@@ -103,6 +103,11 @@ from .external_candidate import (
     ExternalCandidateConsumer,
     ExternalCandidateDecision,
 )
+from .pi05_policy_control import (
+    PolicyControlConfig,
+    PolicyControlConsumer,
+    PolicyControlDecision,
+)
 from .fsm import FSMEvent, GlobalFSM, InstructionParser
 from .interfaces import (
     ActionDispatchRecord,
@@ -506,6 +511,7 @@ def _arm_execution_control_granted(
         in {GlobalPhase.EXECUTE_PICK, GlobalPhase.EXECUTE_PLACE}
         and manipulation_command is not None
         and manipulation_source == "manipulation_command"
+        and mux_decision.manipulation_source == "manipulation_command"
         and mux_decision.manipulation_disposition
         is CandidateDisposition.ACCEPTED
         and internal_publish_authorized
@@ -1350,6 +1356,14 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 self._external_candidate_config
             )
             self._external_candidate_subscription: Optional[Any] = None
+            try:
+                self._policy_control_config = PolicyControlConfig.from_mapping(
+                    config.get("pi05_policy_control", {})
+                )
+            except ValueError as exc:
+                raise RuntimeError(f"pi05_policy_control 配置无效：{exc}") from exc
+            self._policy_control = PolicyControlConsumer(self._policy_control_config)
+            self._policy_control_subscription: Optional[Any] = None
             self._last_control_tick_ns: Optional[int] = None
             control = _validated_control_config(config)
             self._observe_only = control["observe_only"]
@@ -1405,6 +1419,13 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                     ros.String,
                     self._external_candidate_config.topic,
                     self._on_external_candidate,
+                    10,
+                )
+            if _policy_control_subscription_enabled(self._policy_control_config):
+                self._policy_control_subscription = self.create_subscription(
+                    ros.String,
+                    self._policy_control_config.topic,
+                    self._on_policy_control_candidate,
                     10,
                 )
             self.create_subscription(ros.Odometry, topics["odom"], self._on_odom, 30)
@@ -1467,6 +1488,7 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             self._context_pub.publish(message)
             self._active_context = context
             self._synchronize_runtime_context(context)
+            self._policy_control.update_context(context)
             if not context.valid or context.finished or context.active_task is None:
                 return
             active_instruction = json.dumps(
@@ -1525,6 +1547,15 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 )
                 return
             self._log_external_candidate_decision(decision)
+
+        def _on_policy_control_candidate(self, message: Any) -> None:
+            """Reserve a validated chunk using subscriber-local ROS time only."""
+            now_ns = self.get_clock().now().nanoseconds
+            decision = self._policy_control.receive(message.data, now_ns)
+            if not decision.accepted:
+                self.get_logger().warning(
+                    f"pi05_policy_control_rejected:{decision.failure_reason}"
+                )
 
         @staticmethod
         def _task_semantic_fingerprint(task: TaskSpec) -> tuple[Any, ...]:
@@ -2264,6 +2295,13 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             base_command, manipulation_command = self._compute_candidate_commands(
                 snapshot, fsm_status, now_ns
             )
+            if (
+                self._policy_control_config.enabled
+                and self._policy_control_config.enable_actuation
+            ):
+                # π0.5 是显式 exclusive 控制模式。保留 FSM 状态与入口接线用于
+                # 诊断，但不让其业务反馈或候选在本周期竞争、推进状态机。
+                return base_command, manipulation_command, None
             state = self._runtime_wiring
             phase = fsm_status.global_phase
             if phase in {
@@ -3007,6 +3045,13 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 return None, None
             if snapshot.joints is None or not snapshot.joints.valid:
                 return None, None
+            if (
+                self._policy_control_config.enabled
+                and self._policy_control_config.enable_actuation
+            ):
+                # exclusive 模式只允许 π0.5 full-19D 候选进入后续 ActionMux；
+                # 没有新鲜合法 policy chunk 时保持诊断输出，不回退到 FSM 控制。
+                return None, None
             if fsm_status.global_phase in {
                 GlobalPhase.NAV_TO_PICK,
                 GlobalPhase.NAV_TO_PLACE,
@@ -3261,6 +3306,7 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             decision: ActionMuxDecision,
             head_publish_authorized: bool = False,
             internal_fsm_publish_authorized: bool = False,
+            policy_control_publish_authorized: bool = False,
             safety_exit_authorized: bool = False,
             diagnostic_only: bool = False,
         ) -> bool:
@@ -3308,6 +3354,16 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                     group_records = exc.group_records
                     dispatch_failure_reason = str(exc)
                     self._publish_emergency_base_stop(f"官方控制发布失败：{exc}")
+                    published = False
+            elif policy_control_publish_authorized:
+                dispatch_mode = DispatchMode.FULL
+                try:
+                    group_records = self._official_publisher.publish_with_trace(action)
+                    published = True
+                except OfficialPublishError as exc:
+                    group_records = exc.group_records
+                    dispatch_failure_reason = str(exc)
+                    self._publish_emergency_base_stop(f"pi05官方仿真发布失败：{exc}")
                     published = False
             elif not head_publish_authorized:
                 published = False
@@ -3466,6 +3522,7 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             if joints is None or not joints.valid:
                 # 没有可靠实际关节时绝不能伪造17维全零；此时只能尽力让底盘停车。
                 self._record_arm_execution_control_result(now_ns, False)
+                self._policy_control.invalidate()
                 self._publish_emergency_base_stop(
                     snapshot.failure_reason or "JointState 不可靠，无法构造安全保持动作"
                 )
@@ -3488,6 +3545,24 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             elif external_decision.failure_reason != "no_pending_candidate":
                 self._log_external_candidate_decision(external_decision)
 
+            policy_decision = PolicyControlDecision(False, "policy_control_disabled")
+            if self._policy_control_config.enabled:
+                if base is None or not base.valid:
+                    self._policy_control.invalidate()
+                    policy_decision = PolicyControlDecision(
+                        False, "policy_control_requires_fresh_valid_odom"
+                    )
+                else:
+                    policy_decision = self._policy_control.take(
+                        now_ns=now_ns,
+                        fsm_status=status,
+                        existing_base=base_command,
+                        existing_manipulation=manipulation_command,
+                    )
+                    if policy_decision.accepted:
+                        base_command = policy_decision.base_command
+                        manipulation_command = policy_decision.manipulation_command
+
             if snapshot.failure_reason:
                 # Odom陈旧时不继续普通策略；可靠JointState只用于生成诊断保持动作。
                 self._log_control_warning_on_change(
@@ -3501,10 +3576,15 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 joints,
                 status,
                 now_ns,
+                base_source=(
+                    "pi05_policy_control"
+                    if policy_decision.accepted
+                    else "base_command"
+                ),
                 manipulation_source=(
-                    "external_candidate"
-                    if external_decision.accepted
-                    else "manipulation_command"
+                    "pi05_policy_control" if policy_decision.accepted else
+                    "external_candidate" if external_decision.accepted else
+                    "manipulation_command"
                 ),
             )
             candidate_publish_authorized = (
@@ -3517,6 +3597,13 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 self._log_control_warning_on_change(
                     "External Candidate不是严格head_yaw-only mask，禁止官方发布"
                 )
+            manipulation_source = (
+                "pi05_policy_control"
+                if policy_decision.accepted
+                else "external_candidate"
+                if external_decision.accepted
+                else "manipulation_command"
+            )
             internal_publish_authorized = _internal_fsm_publish_authorization(
                 observe_only=self._observe_only,
                 enable_official_publish=self._publish_enabled,
@@ -3527,11 +3614,7 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 manipulation_command=manipulation_command,
                 final_action=final_action,
                 now_ns=now_ns,
-                manipulation_source=(
-                    "external_candidate"
-                    if external_decision.accepted
-                    else "manipulation_command"
-                ),
+                manipulation_source=manipulation_source,
                 runtime_wiring=self._runtime_wiring,
             )
             navigation_transition_stop_authorized = (
@@ -3553,6 +3636,10 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 head_publish_authorized=candidate_publish_authorized,
                 internal_fsm_publish_authorized=internal_publish_authorized,
                 safety_exit_authorized=navigation_transition_stop_authorized,
+                policy_control_publish_authorized=(
+                    policy_decision.accepted
+                    and self._policy_control_config.publish_authorized
+                ),
                 diagnostic_only=(
                     external_decision.accepted and not candidate_publish_authorized
                 ),
@@ -3561,11 +3648,7 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 fsm_status=status,
                 manipulation_command=manipulation_command,
                 mux_decision=mux_decision,
-                manipulation_source=(
-                    "external_candidate"
-                    if external_decision.accepted
-                    else "manipulation_command"
-                ),
+                manipulation_source=manipulation_source,
                 internal_publish_authorized=internal_publish_authorized,
                 published=published,
             )
@@ -3648,6 +3731,7 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 # context失效后不再调用ROS clock；consumer只需一个诊断时间戳。
                 now_ns = self.get_clock().now().nanoseconds if context_valid else 0
                 self._external_candidate.shutdown(now_ns)
+                self._policy_control.shutdown()
             except Exception as exc:  # noqa: BLE001 - 记录后仍继续父节点销毁
                 errors.append(f"清空External Candidate失败：{exc}")
             if errors:
@@ -4345,6 +4429,11 @@ def _rclpy_context_ok(ros: SimpleNamespace, node: Optional[Any]) -> bool:
 def _external_candidate_subscription_enabled(config: ExternalCandidateConfig) -> bool:
     """Keep the ROS subscription absent unless the first gate is explicitly enabled."""
 
+    return config.enabled
+
+
+def _policy_control_subscription_enabled(config: PolicyControlConfig) -> bool:
+    """Do not create the independent policy subscriber behind a closed gate."""
     return config.enabled
 
 

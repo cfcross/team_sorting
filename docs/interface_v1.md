@@ -76,8 +76,8 @@ ActionMux 是唯一仲裁入口，只有 `OfficialCommandPublisher` 可以创建
 | instruction | `/material/instruction` | receive time；放置点`world` | 源码timer 2Hz，非协议保证 | 无有效任务/source_verified |
 | CompetitionContext | `/team/competition_context` | 严格JSON生成时间 | event-driven | 身份依赖记录fail closed/frozen |
 | referee三项 | `/referee/taskinfo`,`gameinfo`,`score` | receive time | 源码timer 2Hz，非协议保证 | 不推断转换/source_verified |
-| FSMStatus | `/team/fsm_status` | generated timestamp | 配置20Hz，非协议保证 | 不推断成功/provisional |
-| ActionDispatch | `/team/action_dispatch` | 与FinalAction同一生成时间 | 配置20Hz，非协议保证 | 不推断dispatch/frozen |
+| FSMStatus | `/team/fsm_status` | generated timestamp | Team runtime nominal 40Hz，非协议保证；π0.5 timeline仍为24Hz | 不推断成功/provisional |
+| ActionDispatch | `/team/action_dispatch` | 与FinalAction同一生成时间 | Team runtime nominal 40Hz，非协议保证；π0.5 timeline仍为24Hz | 不推断dispatch/frozen |
 | execution feedback | JointState + Odom | 两个异步sensor stamp及receive time | 无统一保证 | 执行保持未确认/provisional |
 
 ## 6. 时间戳与frame规则

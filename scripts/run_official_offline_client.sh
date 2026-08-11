@@ -10,6 +10,48 @@ CLEAN_BUILD="${TEAM_SORTING_CLEAN_BUILD:-0}"
 YOLO_CHECKPOINT="${MATERIAL_SORTING_YOLO_CHECKPOINT:-}"
 MJCF_PATH="${TEAM_SORTING_MJCF:-}"
 ROS_LOCALHOST_ONLY_VALUE="${ROS_LOCALHOST_ONLY:-1}"
+CONFIG_EXPLICIT=0
+if [[ -n "${TEAM_SORTING_CONFIG:-}" ]]; then
+    CONFIG_EXPLICIT=1
+    CONFIG_HOST_PATH="${TEAM_SORTING_CONFIG}"
+else
+    CONFIG_HOST_PATH="${PROJECT_ROOT}/config/config.yaml"
+fi
+if [[ ! -f "${CONFIG_HOST_PATH}" ]]; then
+    echo "错误：TEAM_SORTING_CONFIG不存在或不是文件：${CONFIG_HOST_PATH}" >&2
+    exit 1
+fi
+CONFIG_HOST_PATH="$(realpath "${CONFIG_HOST_PATH}")"
+GATE_REPORT="$(TEAM_SORTING_GATE_CONFIG="${CONFIG_HOST_PATH}" python3 - <<'PY'
+import os
+from pathlib import Path
+
+try:
+    import yaml
+except ImportError as exc:
+    raise SystemExit(f"错误：无法解析TEAM_SORTING_CONFIG（缺少PyYAML）：{exc}")
+
+path = Path(os.environ["TEAM_SORTING_GATE_CONFIG"])
+try:
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    control = data["control"]
+    policy = data["pi05_policy_control"]
+except Exception as exc:
+    raise SystemExit(f"错误：无法解析TEAM_SORTING_CONFIG {path}: {exc}")
+fields = (
+    ("control.observe_only", control.get("observe_only")),
+    ("control.enable_official_publish", control.get("enable_official_publish")),
+    ("control.simulation_only", control.get("simulation_only")),
+    ("pi05_policy_control.enabled", policy.get("enabled")),
+    ("pi05_policy_control.enable_actuation", policy.get("enable_actuation")),
+    ("pi05_policy_control.simulation_publish_enabled", policy.get("simulation_publish_enabled")),
+)
+if any(type(value) is not bool for _, value in fields):
+    raise SystemExit("错误：控制诊断gate必须全部是严格bool")
+for name, value in fields:
+    print(f"{name}={'true' if value else 'false'}")
+PY
+)"
 
 if [[ -n "${TEAM_SORTING_RUNTIME_VOLUME+x}" ]]; then
     RUNTIME_VOLUME="${TEAM_SORTING_RUNTIME_VOLUME}"
@@ -62,6 +104,12 @@ command=(docker run --rm -it --network host --ipc host
     -v "${PROJECT_ROOT}:/workspace/baseline:ro"
     -v "${OFFICIAL_ROOT}:/workspace/official:ro"
     -v "${RUNTIME_VOLUME}:/opt/team_sorting_runtime")
+if [[ "${CONFIG_EXPLICIT}" == "1" ]]; then
+    command+=(
+        -e TEAM_SORTING_CONFIG=/workspace/runtime/team_sorting_config.yaml
+        -v "${CONFIG_HOST_PATH}:/workspace/runtime/team_sorting_config.yaml:ro"
+    )
+fi
 case "${CLIENT_GPUS}" in
     ""|none)
         GPU_BEHAVIOR="disabled (no --gpus argument)"
@@ -251,10 +299,25 @@ for executable in perception_node team_client_node dataset_recorder_node; do
     exit 1
   fi
 done
-printf "baseline=%s (read-only)\nofficial=%s (read-only)\nruntime=%s\nros_prefix=%s\npip_cache=%s\nROS_LOCALHOST_ONLY=%s\nobserve_only=true\n" \
+printf "baseline=%s (read-only)\nofficial=%s (read-only)\nruntime=%s\nros_prefix=%s\npip_cache=%s\nROS_LOCALHOST_ONLY=%s\n" \
   /workspace/baseline "${MATERIAL_SORTING_OFFICIAL_ROOT}" \
   "${TEAM_SORTING_RUNTIME_ROOT}" "${TEAM_SORTING_ROS_PREFIX}" "${PIP_CACHE_DIR}" \
   "${ROS_LOCALHOST_ONLY}"
+python3 - <<'"'"'PY'"'"'
+from team_sorting.ros_nodes import _load_config
+
+data = _load_config()
+fields = (
+    ("control.observe_only", data["control"]["observe_only"]),
+    ("control.enable_official_publish", data["control"]["enable_official_publish"]),
+    ("control.simulation_only", data["control"]["simulation_only"]),
+    ("pi05_policy_control.enabled", data["pi05_policy_control"]["enabled"]),
+    ("pi05_policy_control.enable_actuation", data["pi05_policy_control"]["enable_actuation"]),
+    ("pi05_policy_control.simulation_publish_enabled", data["pi05_policy_control"]["simulation_publish_enabled"]),
+)
+for name, value in fields:
+    print(f"{name}={str(value).lower()}")
+PY
 ros2 launch team_sorting team.launch.xml')
 
 if [[ "${DRY_RUN}" == "1" ]]; then
@@ -278,7 +341,13 @@ printf 'Pip cache: /opt/team_sorting_runtime/pip-cache\n'
 printf 'Clean build: %s\n' "${CLEAN_BUILD}"
 printf 'Source fingerprint: stable SHA256 over setup.py/setup.cfg/package.xml/resource/team_sorting/launch/config\n'
 printf 'Install mode: offline pip (--no-index --no-deps --no-build-isolation)\n'
-printf 'observe_only=true\n'
+printf 'Config source: %s\n' "${CONFIG_HOST_PATH}"
+if [[ "${CONFIG_EXPLICIT}" == "1" ]]; then
+    printf 'Config mode: explicit TEAM_SORTING_CONFIG\n'
+else
+    printf 'Config mode: default safe config.yaml\n'
+fi
+printf '%s\n' "${GATE_REPORT}"
 printf 'Command:'; printf ' %q' "${command[@]}"; printf '\n'
 if [[ "${DRY_RUN}" == "1" ]]; then
     exit 0
