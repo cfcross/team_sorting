@@ -4,7 +4,10 @@ from hashlib import sha256
 import os
 from pathlib import Path
 import subprocess
+import sys
 import xml.etree.ElementTree as ET
+
+import yaml
 
 
 SCRIPT = Path("scripts/run_official_offline_client.sh").resolve()
@@ -18,6 +21,7 @@ def _run(tmp_path: Path, **overrides: str) -> subprocess.CompletedProcess[str]:
         "TEAM_SORTING_COLCON_CACHE_VOLUME",
         "TEAM_SORTING_CLEAN_BUILD",
         "ROS_LOCALHOST_ONLY",
+        "TEAM_SORTING_CONFIG",
     ):
         env.pop(name, None)
     env.update({"DRY_RUN": "1", **overrides})
@@ -75,8 +79,93 @@ def test_default_dry_run_is_offline_runtime_install_and_observe_only(tmp_path):
     assert "--no-index" in output
     assert "--no-deps" in output
     assert "--no-build-isolation" in output
-    assert "observe_only=true" in output
+    assert "control.observe_only=true" in output
+    assert "control.enable_official_publish=false" in output
+    assert "control.simulation_only=true" in output
+    assert "pi05_policy_control.enabled=false" in output
+    assert "pi05_policy_control.enable_actuation=false" in output
+    assert "pi05_policy_control.simulation_publish_enabled=false" in output
     assert "colcon build" not in output
+
+
+def test_generated_container_gate_diagnostic_is_executable(tmp_path):
+    capture = tmp_path / "container-command.sh"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    docker = bin_dir / "docker"
+    docker.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "if [[ \"${1:-}\" == image && \"${2:-}\" == inspect ]]; then\n"
+        "  printf 'sha256:test-image\\n'\n"
+        "  exit 0\n"
+        "fi\n"
+        "if [[ \"${1:-}\" == run ]]; then\n"
+        "  last=''\n"
+        "  for argument in \"$@\"; do last=\"${argument}\"; done\n"
+        "  printf '%s' \"${last}\" > \"${CAPTURED_CONTAINER_COMMAND}\"\n"
+        "  exit 0\n"
+        "fi\n"
+        "exit 97\n",
+        encoding="utf-8",
+    )
+    docker.chmod(0o755)
+    result = _run(
+        tmp_path,
+        DRY_RUN="0",
+        MATERIAL_SORTING_OFFICIAL_ROOT=str(_official_root(tmp_path)),
+        PATH=f"{bin_dir}:{os.environ['PATH']}",
+        CAPTURED_CONTAINER_COMMAND=str(capture),
+    )
+    assert result.returncode == 0, result.stderr
+
+    container_command = capture.read_text(encoding="utf-8")
+    marker = "python3 - <<'PY'\n"
+    diagnostic_start = container_command.rindex(marker) + len(marker)
+    diagnostic_end = container_command.index(
+        "\nPY\nros2 launch team_sorting team.launch.xml", diagnostic_start
+    )
+    diagnostic = container_command[diagnostic_start:diagnostic_end]
+
+    shim = tmp_path / "shim/team_sorting"
+    shim.mkdir(parents=True)
+    (shim / "__init__.py").write_text("", encoding="utf-8")
+    (shim / "ros_nodes.py").write_text(
+        "def _load_config():\n"
+        "    return {\n"
+        "        'control': {\n"
+        "            'observe_only': True,\n"
+        "            'enable_official_publish': False,\n"
+        "            'simulation_only': True,\n"
+        "        },\n"
+        "        'pi05_policy_control': {\n"
+        "            'enabled': True,\n"
+        "            'enable_actuation': True,\n"
+        "            'simulation_publish_enabled': False,\n"
+        "        },\n"
+        "    }\n",
+        encoding="utf-8",
+    )
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(shim.parent)
+    executed = subprocess.run(
+        [sys.executable, "-c", diagnostic],
+        cwd=tmp_path,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert executed.returncode == 0, executed.stderr
+    assert "NameError" not in executed.stderr
+    assert executed.stdout.splitlines() == [
+        "control.observe_only=true",
+        "control.enable_official_publish=false",
+        "control.simulation_only=true",
+        "pi05_policy_control.enabled=true",
+        "pi05_policy_control.enable_actuation=true",
+        "pi05_policy_control.simulation_publish_enabled=false",
+    ]
 
 
 def test_ros_localhost_only_defaults_to_one_in_summary_and_docker_command(tmp_path):
@@ -338,3 +427,52 @@ def test_dry_run_does_not_inspect_or_execute_docker(tmp_path):
     inspect = source.index("docker image inspect", dry_branch)
     exec_docker = source.index('exec "${command[@]}"', inspect)
     assert dry_branch < inspect < exec_docker
+
+
+def test_explicit_config_is_mounted_and_reports_actual_control_gates(tmp_path):
+    config = yaml.safe_load(Path("config/config.yaml").read_text(encoding="utf-8"))
+    config["control"]["observe_only"] = False
+    config["control"]["enable_official_publish"] = True
+    config["pi05_policy_control"].update(
+        enabled=True,
+        enable_actuation=True,
+        simulation_publish_enabled=True,
+        max_policy_response_latency_ms=250.0,
+        candidate_ttl_ms=250.0,
+        watchdog_timeout_ms=300.0,
+    )
+    path = tmp_path / "m10.yaml"
+    path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    result = _run(
+        tmp_path,
+        MATERIAL_SORTING_OFFICIAL_ROOT=str(_official_root(tmp_path)),
+        TEAM_SORTING_CONFIG=str(path),
+    )
+    assert result.returncode == 0, result.stderr
+    assert "Config mode: explicit TEAM_SORTING_CONFIG" in result.stdout
+    assert "control.observe_only=false" in result.stdout
+    assert "control.enable_official_publish=true" in result.stdout
+    assert "pi05_policy_control.enabled=true" in result.stdout
+    assert "pi05_policy_control.enable_actuation=true" in result.stdout
+    assert "pi05_policy_control.simulation_publish_enabled=true" in result.stdout
+    assert "TEAM_SORTING_CONFIG=/workspace/runtime/team_sorting_config.yaml" in result.stdout
+    assert "/workspace/runtime/team_sorting_config.yaml:ro" in result.stdout
+
+
+def test_missing_or_malformed_explicit_config_fails_closed(tmp_path):
+    official = str(_official_root(tmp_path))
+    missing = _run(
+        tmp_path,
+        MATERIAL_SORTING_OFFICIAL_ROOT=official,
+        TEAM_SORTING_CONFIG=str(tmp_path / "missing.yaml"),
+    )
+    assert missing.returncode != 0 and "TEAM_SORTING_CONFIG不存在" in missing.stderr
+    malformed_path = tmp_path / "malformed.yaml"
+    malformed_path.write_text("control: []\n", encoding="utf-8")
+    malformed = _run(
+        tmp_path,
+        MATERIAL_SORTING_OFFICIAL_ROOT=official,
+        TEAM_SORTING_CONFIG=str(malformed_path),
+    )
+    assert malformed.returncode != 0
+    assert "无法解析TEAM_SORTING_CONFIG" in malformed.stderr

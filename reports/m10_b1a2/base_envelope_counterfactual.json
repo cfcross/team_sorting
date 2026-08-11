@@ -1,0 +1,228 @@
+{
+  "schema_name": "M10B1A2BaseEnvelopeCounterfactual",
+  "schema_version": 1,
+  "input": {
+    "archive": "/home/ljc/Projects/m10_b1a_runs/m10_b1a_20260808_225300.tar.gz",
+    "archive_sha256": "f7c49502bb0338bccb8dfa9c267c833d9f6004590845aeeb2010c995f0d24df2",
+    "read_only_direct_sqlite": true,
+    "candidate_chunks": 190,
+    "raw_candidate_rows": 2850
+  },
+  "official_task1_baseline_envelope": {
+    "base_v_m_s": 0.45,
+    "base_w_rad_s": 1.2,
+    "source": "/home/ljc/Projects/material_sorting_official_offline/examples/material_sorting/client_task_1.py",
+    "source_sha256": "b93e9d730fbea443a061a883062b8dfaf12e40e83f8313174ed89f6562a3d2cd",
+    "assignment_line": 134,
+    "limit_to_cmd_vel_chain_verified": true
+  },
+  "team_current_base_envelope": {
+    "base_v_m_s": 0.25,
+    "base_w_rad_s": 0.5,
+    "config_source": "/home/ljc/Projects/team_sorting/config/config.yaml",
+    "config_sha256": "29eb5b4ace74a30e61e6508bfd3abd6cbd920aab6b91ad4d8a0a62aea1808c50"
+  },
+  "reconstruction": {
+    "method": "candidate bag timestamp selects the 24 Hz row; unclipped FinalAction dimensions supply exact pre-clamp values; two-step handoff alpha is inferred from shared unclipped dimensions and then applied to clipped dimensions",
+    "callback_receipt_timestamp_archived": false,
+    "policy_ticks": 2147,
+    "handoff_fit_ticks": 622,
+    "max_alpha_ratio_spread": 1.7350565428841946e-12,
+    "max_unclipped_handoff_fit_abs_residual": 2.220446049250313e-16,
+    "e0_base_masks_match_every_tick": true,
+    "limitation": "clipped components are reconstructed through the shared scheduler formula, not independently recorded pre-clamp samples"
+  },
+  "envelopes": {
+    "E0_CURRENT_TEAM": {
+      "limits": {
+        "base_v_m_s": 0.25,
+        "base_w_rad_s": 0.5
+      },
+      "base_v": {
+        "total_relevant_ticks": 2147,
+        "clipping_ticks": 78,
+        "clipping_pct": 3.632976245924546,
+        "raw_min": -0.20574319414673892,
+        "raw_max": 0.3920327294471666,
+        "exceedance_magnitude_clipped_ticks": {
+          "p50": 0.01878173668601721,
+          "p95": 0.1398830333965435,
+          "p99": 0.14094732840318733,
+          "max": 0.1420327294471666
+        },
+        "abs_raw_minus_clipped_all_ticks": {
+          "mean": 0.001571920874387771,
+          "p50": 0.0,
+          "p95": 0.0,
+          "max": 0.1420327294471666
+        }
+      },
+      "base_w": {
+        "total_relevant_ticks": 2147,
+        "clipping_ticks": 720,
+        "clipping_pct": 33.53516534699581,
+        "raw_min": -0.3264957068177864,
+        "raw_max": 1.0376727162059491,
+        "exceedance_magnitude_clipped_ticks": {
+          "p50": 0.23324183984696867,
+          "p95": 0.46011229956319566,
+          "p99": 0.5028251933936005,
+          "max": 0.5376727162059491
+        },
+        "abs_raw_minus_clipped_all_ticks": {
+          "mean": 0.0811329836016331,
+          "p50": 0.0,
+          "p95": 0.407244915030922,
+          "max": 0.5376727162059491
+        }
+      },
+      "combined": {
+        "at_least_one_changed_ticks": 798,
+        "at_least_one_changed_pct_of_policy_ticks": 37.16814159292036,
+        "both_changed_ticks": 0,
+        "mean_absolute_base_command_distortion_per_component": 0.04135245223801043,
+        "mean_l1_distortion_per_tick": 0.08270490447602086,
+        "total_l1_distortion": 177.5674299100165,
+        "mean_l2_distortion_per_tick": 0.08270490447602086,
+        "total_l2_distortion": 177.5674299100165
+      }
+    },
+    "E2_INTERMEDIATE_REFERENCE": {
+      "limits": {
+        "base_v_m_s": 0.35,
+        "base_w_rad_s": 0.8
+      },
+      "base_v": {
+        "total_relevant_ticks": 2147,
+        "clipping_ticks": 9,
+        "clipping_pct": 0.4191895668374476,
+        "raw_min": -0.20574319414673892,
+        "raw_max": 0.3920327294471666,
+        "exceedance_magnitude_clipped_ticks": {
+          "p50": 0.03988303339654353,
+          "p95": 0.04146888474899557,
+          "p99": 0.04191996050753242,
+          "max": 0.04203272944716663
+        },
+        "abs_raw_minus_clipped_all_ticks": {
+          "mean": 0.00013527183148922945,
+          "p50": 0.0,
+          "p95": 0.0,
+          "max": 0.04203272944716663
+        }
+      },
+      "base_w": {
+        "total_relevant_ticks": 2147,
+        "clipping_ticks": 220,
+        "clipping_pct": 10.246856078248719,
+        "raw_min": -0.3264957068177864,
+        "raw_max": 1.0376727162059491,
+        "exceedance_magnitude_clipped_ticks": {
+          "p50": 0.10645563962385152,
+          "p95": 0.1967657987401913,
+          "p99": 0.21205627155565726,
+          "max": 0.2376727162059491
+        },
+        "abs_raw_minus_clipped_all_ticks": {
+          "mean": 0.010898250546480526,
+          "p50": 0.0,
+          "p95": 0.1072449150309219,
+          "max": 0.2376727162059491
+        }
+      },
+      "combined": {
+        "at_least_one_changed_ticks": 229,
+        "at_least_one_changed_pct_of_policy_ticks": 10.666045645086166,
+        "both_changed_ticks": 0,
+        "mean_absolute_base_command_distortion_per_component": 0.0055167611889848775,
+        "mean_l1_distortion_per_tick": 0.011033522377969755,
+        "total_l1_distortion": 23.688972545501066,
+        "mean_l2_distortion_per_tick": 0.011033522377969755,
+        "total_l2_distortion": 23.688972545501066
+      }
+    },
+    "E1_OFFICIAL_TASK1_BASELINE": {
+      "limits": {
+        "base_v_m_s": 0.45,
+        "base_w_rad_s": 1.2
+      },
+      "base_v": {
+        "total_relevant_ticks": 2147,
+        "clipping_ticks": 0,
+        "clipping_pct": 0.0,
+        "raw_min": -0.20574319414673892,
+        "raw_max": 0.3920327294471666,
+        "exceedance_magnitude_clipped_ticks": {
+          "p50": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "abs_raw_minus_clipped_all_ticks": {
+          "mean": 0.0,
+          "p50": 0.0,
+          "p95": 0.0,
+          "max": 0.0
+        }
+      },
+      "base_w": {
+        "total_relevant_ticks": 2147,
+        "clipping_ticks": 0,
+        "clipping_pct": 0.0,
+        "raw_min": -0.3264957068177864,
+        "raw_max": 1.0376727162059491,
+        "exceedance_magnitude_clipped_ticks": {
+          "p50": null,
+          "p95": null,
+          "p99": null,
+          "max": null
+        },
+        "abs_raw_minus_clipped_all_ticks": {
+          "mean": 0.0,
+          "p50": 0.0,
+          "p95": 0.0,
+          "max": 0.0
+        }
+      },
+      "combined": {
+        "at_least_one_changed_ticks": 0,
+        "at_least_one_changed_pct_of_policy_ticks": 0.0,
+        "both_changed_ticks": 0,
+        "mean_absolute_base_command_distortion_per_component": 0.0,
+        "mean_l1_distortion_per_tick": 0.0,
+        "total_l1_distortion": 0.0,
+        "mean_l2_distortion_per_tick": 0.0,
+        "total_l2_distortion": 0.0
+      }
+    }
+  },
+  "e1_reduction_pct_from_e0": {
+    "base_v": 100.0,
+    "base_w": 100.0
+  },
+  "e1_max_remaining_exceedance": {
+    "base_v": 0.0,
+    "base_w": 0.0
+  },
+  "slide_negative_raw_candidates": {
+    "raw_rows": 2850,
+    "negative_rows": 487,
+    "negative_pct": 17.087719298245613,
+    "occurrence_time_from_first_candidate_s": {
+      "first": 0.285452532,
+      "median": 5.593245816,
+      "last": 12.949678752
+    },
+    "negative_value_distribution": {
+      "min": -0.07806584188549352,
+      "p01": -0.0682627463227003,
+      "p05": -0.06013317041711138
+    },
+    "time_method": "candidate bag timestamp plus nominal action-row offset at 24 Hz",
+    "observed_timing_classification": "EARLY_PRESENT"
+  },
+  "decision": {
+    "base_envelope_mismatch": "PROVEN",
+    "ready_for_b1a2_sim": "YES"
+  }
+}

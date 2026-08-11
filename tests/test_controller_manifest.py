@@ -155,10 +155,19 @@ def test_base_uses_twist_limits_not_internal_wheel_motor_range() -> None:
 def test_loaded_config_exactly_matches_manifest() -> None:
     config = _config()
     validate_controller_config(config)
+    assert config["timing"]["control_rate_hz"] == 40.0
+    assert MMK2_CONTROLLER_MANIFEST_V1.nominal_control_frequency_hz == 40.0
     action_mux = config["action_mux"]
     actions = MMK2_CONTROLLER_MANIFEST_V1.actions
     assert tuple(action_mux["joint_lower"]) == tuple(item.safe_min for item in actions[2:])
     assert tuple(action_mux["joint_upper"]) == tuple(item.safe_max for item in actions[2:])
+
+
+def test_legacy_20hz_config_is_rejected_by_40hz_manifest() -> None:
+    config = _config()
+    config["timing"]["control_rate_hz"] = 20.0
+    with pytest.raises(ValueError, match="control_rate_hz"):
+        validate_controller_config(config)
 
 
 @pytest.mark.parametrize("bad_value", [True, float("nan"), float("inf")])

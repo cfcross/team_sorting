@@ -79,8 +79,8 @@ topics:
     right_arm: "/right_arm_forward_position_controller/commands"
 
 timing:
-  # 当前均为团队保守初值，仍需结合真实消息延迟和Server watchdog测试；本轮不调参。
-  control_rate_hz: 20.0       # Hz；20 Hz约等于每0.05秒执行一次控制周期
+  # 40Hz是团队runtime nominal consumer/control频率；不是π0.5 action timeline。
+  control_rate_hz: 40.0       # Hz；40 Hz约等于每0.025秒执行一次控制周期
   command_ttl_s: 0.20         # 秒；TeamClientNode生成候选命令的短期有效时间
   state_max_delta_s: 0.15     # 秒；Odom/JointState/三维估计允许的最大时间差，必须非负
 
@@ -287,6 +287,22 @@ external_candidate:
   # 必须由启动方显式配置，consumer绝不从Candidate反向采信episode_id。
   expected_episode_id: ""
   request_id_cache_size: 128
+
+# M10-A π0.5全19维官方仿真控制。独立于fixed_head_yaw通道，默认完全关闭。
+# action_step_period_s来自已核验LeRobot task1_v1 fps=24；不是Adapter 10Hz请求周期。
+pi05_policy_control:
+  enabled: false
+  enable_actuation: false
+  simulation_only: true
+  simulation_publish_enabled: false
+  topic: "/mmk2_pi05_adapter/policy_control_candidate"
+  expected_model_id: "pi05_mmk2_task1_lora"
+  allowed_task_ids: [1]
+  action_step_period_s: 0.0416666667
+  # B0.5/B1初始实验gate，不代表已经证明为最终真实运动阈值。
+  max_policy_response_latency_ms: 625.0
+  candidate_ttl_ms: 700.0
+  watchdog_timeout_ms: 625.0
 
 recorder:
   # 普通launch默认不创建Recorder；record_data:=true时launch创建节点并显式覆盖为true。

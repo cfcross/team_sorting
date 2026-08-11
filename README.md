@@ -564,7 +564,7 @@ orphan 规则见
 
 | 配置项 | 值 | 含义 |
 |---|---:|---|
-| `timing.control_rate_hz` | `20.0` | 客户端控制周期频率 |
+| `timing.control_rate_hz` | `40.0` | Team runtime nominal consumer/control频率；π0.5 action timeline仍为24Hz |
 | `timing.command_ttl_s` | `0.20` | 底盘/机械臂候选命令有效期 |
 | `timing.state_max_delta_s` | `0.15` | 图像或控制时刻可接受的邻近状态最大时间差 |
 | `control.observe_only` | `true` | 最高优先级观察模式；不创建或调用官方发布器 |
