@@ -4595,17 +4595,17 @@ def test_arm_planning_config_validates_place_without_grasp_calibration() -> None
         config.validate_for_grasp()
 
 
-def test_arm_planning_config_yaml_is_disabled_and_uncalibrated() -> None:
+def test_arm_planning_config_yaml_is_calibrated() -> None:
     config = yaml.safe_load((Path(__file__).parents[1] / "config/config.yaml").read_text())
     enabled, planning = _arm_planning_config_from_config(config)
     arm = config["arm_planning"]
     assert enabled is False
     assert isinstance(planning, ArmPlanningConfig)
-    assert planning.gripper_verified_in_official_environment is False
+    assert planning.gripper_verified_in_official_environment is True
     assert planning.left_gripper_min == planning.right_gripper_min == 0.0
     assert planning.left_gripper_max == planning.right_gripper_max == 1.0
-    assert planning.left_gripper_open is planning.left_gripper_closed is None
-    assert planning.right_gripper_open is planning.right_gripper_closed is None
+    assert planning.left_gripper_open == planning.right_gripper_open == 1.0
+    assert planning.left_gripper_closed == planning.right_gripper_closed == 0.1
     assert all(
         value is None
         for key, value in arm.items()
@@ -4616,6 +4616,10 @@ def test_arm_planning_config_yaml_is_disabled_and_uncalibrated() -> None:
             "left_gripper_max",
             "right_gripper_min",
             "right_gripper_max",
+            "left_gripper_open",
+            "left_gripper_closed",
+            "right_gripper_open",
+            "right_gripper_closed",
         }
     )
     with pytest.raises(ValueError):

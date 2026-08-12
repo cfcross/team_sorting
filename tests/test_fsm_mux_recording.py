@@ -2869,11 +2869,27 @@ def test_arm_execution_gripper_velocity_above_one_is_allowed() -> None:
     assert config.max_gripper_velocity_per_s == 2.0
 
 
-def test_arm_execution_yaml_is_explicitly_unconfigured_and_disabled() -> None:
+def test_arm_execution_yaml_is_calibrated_and_complete() -> None:
     data = yaml.safe_load(Path("config/config.yaml").read_text(encoding="utf-8"))
     expected_fields = set(ArmExecutionConfig.__dataclass_fields__)
     assert set(data["arm_execution"]) == expected_fields
-    assert all(data["arm_execution"][field] is None for field in expected_fields)
+    calibrated = {
+        "max_control_period_ns": 41_666_667,
+        "max_slide_velocity_m_s": 0.15,
+        "max_arm_velocity_rad_s": 0.6,
+        "max_gripper_velocity_per_s": 0.6,
+        "slide_tolerance_m": 0.01,
+        "arm_tolerance_rad": 0.01,
+        "gripper_tolerance": 0.02,
+        "settle_cycles": 3,
+    }
+    assert {
+        field: data["arm_execution"][field] for field in calibrated
+    } == calibrated
+    assert all(
+        data["arm_execution"][field] is None
+        for field in expected_fields - calibrated.keys()
+    )
 
 
 def test_arm_execution_no_trajectory_returns_invalid_feedback_hold() -> None:
