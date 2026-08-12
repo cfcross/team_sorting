@@ -142,8 +142,8 @@ perception:
       max_angular_delta_rad: 0.20
       max_extent_error_ratio: 0.45
 
-# ROS/FSM组装层已经接入ArmPlanner，但enabled默认关闭；null表示尚未在官方仿真标定，
-# 不能由代码补隐藏默认值。抓取与放置启用前分别调用ArmPlanningConfig的操作级验证，
+# ROS/FSM组装层已经接入ArmPlanner，但enabled默认关闭；未标定字段保留null，不能由代码
+# 补隐藏默认值。抓取与放置启用前分别调用ArmPlanningConfig的操作级验证，
 # KDL依赖自检失败时仍然失败关闭。
 arm_planning:
   enabled: false
@@ -177,37 +177,37 @@ arm_planning:
   left_gripper_max: 1.0
   right_gripper_min: 0.0
   right_gripper_max: 1.0
-  # 硬范围已确认不等于开闭值或夹持效果已标定；以下值继续显式关闭。
-  left_gripper_open: null
-  left_gripper_closed: null
-  right_gripper_open: null
-  right_gripper_closed: null
-  gripper_verified_in_official_environment: false
+  # 2026-08-12在官方server:latest实测：左右夹爪均为1.0开、0.1闭。
+  left_gripper_open: 1.0
+  left_gripper_closed: 0.1
+  right_gripper_open: 1.0
+  right_gripper_closed: 0.1
+  gripper_verified_in_official_environment: true
 
 # ROS/FSM组装层已经接入纯Python轨迹执行；本节字段与ArmExecutionConfig严格一一对应。
-# 当前值仍全部显式未标定，因此节点不会构造执行器；正式启用前必须逐项填写，执行器
-# 不得补默认值。verification_timeout_ns也必须由lift时长、图像周期和安全裕量共同标定。
+# 2026-08-12在官方server:latest标定的速度/容差及4.3A安全参数已写入；
+# verification_timeout_ns保留null，因此节点仍不会构造执行器。执行器不得补默认值。
 # 夹爪位置范围是[0,1]；max_gripper_velocity_per_s单位为控制量/秒，不受位置上限1约束，
 # 但具体速度仍须在官方仿真中标定。
 arm_execution:
-  feedback_max_age_ns: null
-  trajectory_max_age_ns: null
-  command_ttl_ns: null
-  max_control_period_ns: null
+  feedback_max_age_ns: 131175150          # 实测反馈年龄峰值43725050ns × 3
+  trajectory_max_age_ns: 76103892         # 实测生成到首次执行25367964ns × 3
+  command_ttl_ns: 74720790                 # 实测命令到新反馈回调24906930ns × 3
+  max_control_period_ns: 41666667
   # LIFT稳定进入VERIFY后允许接收真实GraspVerification的最大窗口（ns）。
   verification_timeout_ns: null
-  waypoint_timeout_margin_ns: null
-  total_timeout_margin_ns: null
-  max_slide_velocity_m_s: null
-  max_arm_velocity_rad_s: null
-  max_gripper_velocity_per_s: null
-  slide_tolerance_m: null
-  arm_tolerance_rad: null
-  gripper_tolerance: null
-  settle_cycles: null
-  initial_slide_error_limit_m: null
-  initial_arm_error_limit_rad: null
-  initial_gripper_error_limit: null
+  waypoint_timeout_margin_ns: 2737458938  # 实测最长相邻路点转换1824972625ns × 1.5
+  total_timeout_margin_ns: 9075055791     # 实测最长整轨迹执行6050037194ns × 1.5
+  max_slide_velocity_m_s: 0.15
+  max_arm_velocity_rad_s: 0.6
+  max_gripper_velocity_per_s: 0.6
+  slide_tolerance_m: 0.01
+  arm_tolerance_rad: 0.01
+  gripper_tolerance: 0.02
+  settle_cycles: 3
+  initial_slide_error_limit_m: 0.16        # 实测首路点slide偏差0.08m × 2
+  initial_arm_error_limit_rad: 0.24        # 实测首路点arm偏差0.12rad × 2
+  initial_gripper_error_limit: 0.20        # 实测首路点gripper偏差0.10 × 2
 
 fsm:
   # 客户端在抓取失败后重新进入REFINE_TARGET的次数，不等于裁判允许的总尝试规则。

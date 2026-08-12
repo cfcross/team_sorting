@@ -4595,17 +4595,18 @@ def test_arm_planning_config_validates_place_without_grasp_calibration() -> None
         config.validate_for_grasp()
 
 
-def test_arm_planning_config_yaml_is_disabled_and_uncalibrated() -> None:
+def test_arm_planning_config_yaml_is_calibrated() -> None:
     config = yaml.safe_load((Path(__file__).parents[1] / "config/config.yaml").read_text())
     enabled, planning = _arm_planning_config_from_config(config)
     arm = config["arm_planning"]
+    execution = config["arm_execution"]
     assert enabled is False
     assert isinstance(planning, ArmPlanningConfig)
-    assert planning.gripper_verified_in_official_environment is False
+    assert planning.gripper_verified_in_official_environment is True
     assert planning.left_gripper_min == planning.right_gripper_min == 0.0
     assert planning.left_gripper_max == planning.right_gripper_max == 1.0
-    assert planning.left_gripper_open is planning.left_gripper_closed is None
-    assert planning.right_gripper_open is planning.right_gripper_closed is None
+    assert planning.left_gripper_open == planning.right_gripper_open == 1.0
+    assert planning.left_gripper_closed == planning.right_gripper_closed == 0.1
     assert all(
         value is None
         for key, value in arm.items()
@@ -4616,12 +4617,39 @@ def test_arm_planning_config_yaml_is_disabled_and_uncalibrated() -> None:
             "left_gripper_max",
             "right_gripper_min",
             "right_gripper_max",
+            "left_gripper_open",
+            "left_gripper_closed",
+            "right_gripper_open",
+            "right_gripper_closed",
         }
     )
     with pytest.raises(ValueError):
         planning.validate_for_grasp()
     with pytest.raises(ValueError):
         planning.validate_for_place()
+    assert {
+        key: execution[key]
+        for key in (
+            "feedback_max_age_ns",
+            "trajectory_max_age_ns",
+            "command_ttl_ns",
+            "waypoint_timeout_margin_ns",
+            "total_timeout_margin_ns",
+            "initial_slide_error_limit_m",
+            "initial_arm_error_limit_rad",
+            "initial_gripper_error_limit",
+        )
+    } == {
+        "feedback_max_age_ns": 131_175_150,
+        "trajectory_max_age_ns": 76_103_892,
+        "command_ttl_ns": 74_720_790,
+        "waypoint_timeout_margin_ns": 2_737_458_938,
+        "total_timeout_margin_ns": 9_075_055_791,
+        "initial_slide_error_limit_m": 0.16,
+        "initial_arm_error_limit_rad": 0.24,
+        "initial_gripper_error_limit": 0.20,
+    }
+    assert execution["verification_timeout_ns"] is None
 
 
 @pytest.mark.parametrize(

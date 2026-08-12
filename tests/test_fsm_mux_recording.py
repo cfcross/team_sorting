@@ -2869,11 +2869,37 @@ def test_arm_execution_gripper_velocity_above_one_is_allowed() -> None:
     assert config.max_gripper_velocity_per_s == 2.0
 
 
-def test_arm_execution_yaml_is_explicitly_unconfigured_and_disabled() -> None:
+def test_arm_execution_yaml_is_calibrated_and_complete() -> None:
     data = yaml.safe_load(Path("config/config.yaml").read_text(encoding="utf-8"))
     expected_fields = set(ArmExecutionConfig.__dataclass_fields__)
     assert set(data["arm_execution"]) == expected_fields
-    assert all(data["arm_execution"][field] is None for field in expected_fields)
+    calibrated = {
+        "feedback_max_age_ns": 131_175_150,
+        "trajectory_max_age_ns": 76_103_892,
+        "command_ttl_ns": 74_720_790,
+        "max_control_period_ns": 41_666_667,
+        "waypoint_timeout_margin_ns": 2_737_458_938,
+        "total_timeout_margin_ns": 9_075_055_791,
+        "max_slide_velocity_m_s": 0.15,
+        "max_arm_velocity_rad_s": 0.6,
+        "max_gripper_velocity_per_s": 0.6,
+        "slide_tolerance_m": 0.01,
+        "arm_tolerance_rad": 0.01,
+        "gripper_tolerance": 0.02,
+        "settle_cycles": 3,
+        "initial_slide_error_limit_m": 0.16,
+        "initial_arm_error_limit_rad": 0.24,
+        "initial_gripper_error_limit": 0.20,
+    }
+    assert {
+        field: data["arm_execution"][field] for field in calibrated
+    } == calibrated
+    uncalibrated = expected_fields - calibrated.keys()
+    assert uncalibrated == {"verification_timeout_ns"}
+    assert all(
+        data["arm_execution"][field] is None
+        for field in uncalibrated
+    )
 
 
 def test_arm_execution_no_trajectory_returns_invalid_feedback_hold() -> None:
