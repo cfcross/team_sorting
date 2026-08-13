@@ -150,12 +150,7 @@ from .interfaces import (
     fsm_status_from_json,
     fsm_status_to_json,
 )
-from .navigation import (
-    Bounds3D,
-    NavigationConfig,
-    NavigationController,
-    classify_slot_type,
-)
+from .navigation import NavigationConfig, NavigationController
 from .perception_2d import Detection2DStabilizer, OfficialYoloAdapter
 from .perception_3d import (
     CameraTransformProvider,
@@ -246,6 +241,40 @@ _INTERNAL_STOP_PHASES = {
 }
 
 
+@dataclass(frozen=True)
+class _SourceSlotConfig:
+    """当前官方offline场景的初始source target槽位事实。
+
+    该对象只服务抓取前的任务感知选择；它不是移动物体的永久世界边界，也不从颜色
+    推断slot。未知感知姿态的补全只在候选已匹配当前任务source slot后发生。
+    """
+
+    frame_id: str
+    match_tolerance_m: float
+    centers_by_slot: dict[str, tuple[tuple[float, float, float], ...]]
+    yaw_by_slot: dict[str, float]
+    task_source_slots: dict[int, str]
+
+    def slot_for_task(self, task: TaskSpec) -> str:
+        slot = self.task_source_slots.get(task.task_id)
+        if slot is None:
+            raise ValueError(f"TaskSpec.task_id={task.task_id}没有官方source-slot映射")
+        return slot
+
+    def matches(self, task: TaskSpec, position_xyz: tuple[float, float, float]) -> bool:
+        slot = self.slot_for_task(task)
+        centers = self.centers_by_slot[slot]
+        return any(
+            math.dist(position_xyz, center) <= self.match_tolerance_m
+            for center in centers
+        )
+
+    def fallback_orientation_xyzw(self, task: TaskSpec) -> tuple[float, float, float, float]:
+        yaw = self.yaw_by_slot[self.slot_for_task(task)]
+        half_yaw = yaw / 2.0
+        return (0.0, 0.0, math.sin(half_yaw), math.cos(half_yaw))
+
+
 def _select_target_estimate(
     estimates: tuple[ObjectEstimate3D, ...],
     task: TaskSpec,
@@ -255,6 +284,9 @@ def _select_target_estimate(
     phase_entered_ns: Optional[int] = None,
     preferred_object_id: Optional[str] = None,
     require_geometry: bool = False,
+    source_slots: Optional[_SourceSlotConfig] = None,
+    require_source_slot: bool = False,
+    resolve_unknown_orientation: bool = False,
 ) -> Optional[ObjectEstimate3D]:
     """确定性选择当前任务的odom目标，不产生FSM事件或补造感知事实。"""
 
@@ -268,6 +300,10 @@ def _select_target_estimate(
         type(phase_entered_ns) is not int or phase_entered_ns < 0
     ):
         raise ValueError("phase_entered_ns必须是真正非负整数或None")
+    if require_source_slot and source_slots is None:
+        raise ValueError("source-slot校验要求有效配置")
+    if resolve_unknown_orientation and not require_source_slot:
+        raise ValueError("未知姿态只能由已验证的source-slot解析")
     preferred = (
         preferred_object_id.strip()
         if isinstance(preferred_object_id, str) and preferred_object_id.strip()
@@ -298,6 +334,17 @@ def _select_target_estimate(
             continue
         if phase_entered_ns is not None and estimate.timestamp_ns < phase_entered_ns:
             continue
+        if require_source_slot:
+            assert source_slots is not None
+            if estimate.frame_id != source_slots.frame_id or not source_slots.matches(
+                task, estimate.position_xyz
+            ):
+                continue
+            if resolve_unknown_orientation and estimate.orientation_xyzw is None:
+                estimate = replace(
+                    estimate,
+                    orientation_xyzw=source_slots.fallback_orientation_xyzw(task),
+                )
         if require_geometry and (
             estimate.orientation_xyzw is None or estimate.size_xyz_m is None
         ):
@@ -1266,6 +1313,10 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             self._fsm = GlobalFSM(max_pick_retries=int(config["fsm"]["max_pick_retries"]))
             self._mux = ActionMux(_action_mux_config(config))
             self._runtime_wiring = _RuntimeWiringState()
+            try:
+                self._source_slots = _source_slot_config_from_config(config)
+            except (RuntimeError, TypeError, ValueError) as exc:
+                raise RuntimeError(f"source_slots配置无效，拒绝启动：{exc}") from exc
 
             self._visual_observation_verifier: Optional[
                 VisualObservationVerifier
@@ -2711,6 +2762,9 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                     else None
                 ),
                 require_geometry=phase is GlobalPhase.REFINE_TARGET,
+                source_slots=self._source_slots,
+                require_source_slot=True,
+                resolve_unknown_orientation=True,
             )
             if selected is None:
                 state.phase_entry_failure_reason = (
@@ -2959,9 +3013,7 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
         def _on_estimates(self, message: Any) -> None:
             try:
                 estimates = _estimates_from_vision(message)
-                table = _bounds_from_config(self._config["slot_bounds"]["table"])
-                shelf = _bounds_from_config(self._config["slot_bounds"]["shelf"])
-                # slot_type 只在 team client 收到米制三维位置后计算，不进入 ROS 消息。
+                # source slot只在抓取前的任务选择时校验；这里不把移动物体全局分类/拒绝。
                 self._latest_estimates = tuple(
                     ObjectEstimate3D(
                         class_id=item.class_id,
@@ -2969,7 +3021,7 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                         confidence=item.confidence,
                         frame_id=item.frame_id,
                         timestamp_ns=item.timestamp_ns,
-                        slot_type=classify_slot_type(item.position_xyz, table, shelf),
+                        slot_type=SlotType.UNKNOWN,
                         valid=item.valid,
                         failure_reason=item.failure_reason,
                         object_id=item.object_id,
@@ -4665,10 +4717,93 @@ def _positive_config_number(value: Any, name: str) -> float:
     return number
 
 
-def _bounds_from_config(values: list[float]) -> Bounds3D:
-    if len(values) != 6:
-        raise ValueError("slot_bounds 每个区域必须是 [xmin,xmax,ymin,ymax,zmin,zmax]")
-    return Bounds3D(*(float(value) for value in values))
+def _source_slot_config_from_config(config: Mapping[str, Any]) -> _SourceSlotConfig:
+    """严格读取当前官方offline场景的初始source-slot事实。"""
+
+    if not isinstance(config, Mapping):
+        raise ValueError("config必须是Mapping")
+    section = config.get("source_slots")
+    if not isinstance(section, Mapping):
+        raise ValueError("source_slots必须是Mapping")
+    required = {"frame_id", "source_slot_match_tolerance_m", "slots", "task_source_slots"}
+    if set(section) != required:
+        raise ValueError(
+            "source_slots字段不完整："
+            f"缺失={sorted(required - set(section))}，未知={sorted(set(section) - required)}"
+        )
+    frame_id = section["frame_id"]
+    if frame_id != "odom":
+        raise ValueError('source_slots.frame_id必须严格为"odom"')
+    tolerance = _positive_config_number(
+        section["source_slot_match_tolerance_m"],
+        "source_slots.source_slot_match_tolerance_m",
+    )
+    slots = section["slots"]
+    if not isinstance(slots, Mapping):
+        raise ValueError("source_slots.slots必须是Mapping")
+    expected_slots = {"table_side", "table_top", "shelf"}
+    if set(slots) != expected_slots:
+        raise ValueError(
+            "source_slots.slots字段不完整："
+            f"缺失={sorted(expected_slots - set(slots))}，未知={sorted(set(slots) - expected_slots)}"
+        )
+    centers_by_slot: dict[str, tuple[tuple[float, float, float], ...]] = {}
+    yaw_by_slot: dict[str, float] = {}
+    for slot_name in sorted(expected_slots):
+        value = slots[slot_name]
+        if not isinstance(value, Mapping) or set(value) != {"centers", "yaw_rad"}:
+            raise ValueError(f"source_slots.slots.{slot_name}必须只包含centers/yaw_rad")
+        raw_centers = value["centers"]
+        if not isinstance(raw_centers, list) or not raw_centers:
+            raise ValueError(f"source_slots.slots.{slot_name}.centers必须是非空列表")
+        centers: list[tuple[float, float, float]] = []
+        for index, raw_center in enumerate(raw_centers):
+            if not isinstance(raw_center, (list, tuple)) or len(raw_center) != 3:
+                raise ValueError(
+                    f"source_slots.slots.{slot_name}.centers[{index}]必须是三维坐标"
+                )
+            center = tuple(
+                _finite_source_slot_number(
+                    component,
+                    f"source_slots.slots.{slot_name}.centers[{index}]",
+                )
+                for component in raw_center
+            )
+            centers.append(center)  # type: ignore[arg-type]
+        centers_by_slot[slot_name] = tuple(centers)
+        yaw_by_slot[slot_name] = _finite_source_slot_number(
+            value["yaw_rad"], f"source_slots.slots.{slot_name}.yaw_rad"
+        )
+    task_slots = section["task_source_slots"]
+    if not isinstance(task_slots, Mapping):
+        raise ValueError("source_slots.task_source_slots必须是Mapping")
+    expected_task_ids = {1, 2, 3}
+    if set(task_slots) != expected_task_ids:
+        raise ValueError(
+            "source_slots.task_source_slots必须严格覆盖官方Task 1/2/3"
+        )
+    normalized_task_slots: dict[int, str] = {}
+    for task_id in expected_task_ids:
+        slot = task_slots[task_id]
+        if not isinstance(slot, str) or slot not in expected_slots:
+            raise ValueError(f"Task {task_id}的source slot无效")
+        normalized_task_slots[task_id] = slot
+    return _SourceSlotConfig(
+        frame_id=frame_id,
+        match_tolerance_m=tolerance,
+        centers_by_slot=centers_by_slot,
+        yaw_by_slot=yaw_by_slot,
+        task_source_slots=normalized_task_slots,
+    )
+
+
+def _finite_source_slot_number(value: Any, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name}必须是有限实数，不能使用bool")
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"{name}必须是有限实数")
+    return number
 
 
 def _log_input_issue_on_change(

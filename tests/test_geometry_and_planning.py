@@ -80,6 +80,8 @@ from team_sorting.ros_nodes import (
     _estimates_to_vision,
     _navigation_config_from_config,
     _perception_pipeline_from_config,
+    _source_slot_config_from_config,
+    _select_target_estimate,
     _validate_vision_schema,
 )
 
@@ -974,7 +976,7 @@ def test_config_has_required_mapping_sections_and_absolute_topics() -> None:
         "timing",
         "perception",
         "fsm",
-        "slot_bounds",
+        "source_slots",
         "action_mux",
         "recorder",
         "joint_aliases",
@@ -1174,22 +1176,27 @@ def test_perception_config_reader_rejects_invalid_local_size_schema(
         assert "pink" in message and "bool" in message
 
 
-def test_config_bounds_and_action_limits_have_safe_static_shapes() -> None:
-    """只锁定当前团队安全占位和17维顺序，不证明官方区域或限位已验证。"""
+def test_config_source_slots_and_action_limits_have_frozen_official_values() -> None:
+    """冻结当前官方offline场景的source-slot事实和17维动作限位。"""
 
     config = _project_config()
-    slot_bounds = config["slot_bounds"]
+    source_slots = config["source_slots"]
     action_mux = config["action_mux"]
-    assert isinstance(slot_bounds, dict)
+    assert isinstance(source_slots, dict)
     assert isinstance(action_mux, dict)
-
-    for name in ("table", "shelf"):
-        values = slot_bounds[name]
-        assert isinstance(values, list) and len(values) == 6
-        numbers = tuple(_strict_finite_number(value) for value in values)
-        # 当前每个轴都故意min>max，让未确认区域安全地分类为UNKNOWN。
-        assert all(numbers[index] > numbers[index + 1] for index in (0, 2, 4))
-
+    frozen = _source_slot_config_from_config(config)
+    assert frozen.frame_id == "odom"
+    assert frozen.match_tolerance_m == pytest.approx(0.05)
+    assert frozen.task_source_slots == {1: "table_side", 2: "shelf", 3: "table_top"}
+    assert frozen.centers_by_slot == {
+        "table_side": ((-1.0, 2.2, 0.834), (-0.18, 2.2, 0.834)),
+        "table_top": ((-0.54, 2.3, 1.004),),
+        "shelf": ((-2.63, 0.778, 0.508), (-2.63, 0.778, 0.837), (-2.63, 0.778, 1.166)),
+    }
+    assert frozen.yaw_by_slot["table_side"] == pytest.approx(0.0)
+    assert frozen.yaw_by_slot["table_top"] == pytest.approx(math.pi / 2.0)
+    assert frozen.yaw_by_slot["shelf"] == pytest.approx(math.pi / 2.0)
+    assert config["perception"]["estimator_3d"]["pose_refinement"]["enabled"] is False
     lower = action_mux["joint_lower"]
     upper = action_mux["joint_upper"]
     assert isinstance(lower, list) and isinstance(upper, list)
@@ -1198,6 +1205,106 @@ def test_config_bounds_and_action_limits_have_safe_static_shapes() -> None:
     upper_numbers = tuple(_strict_finite_number(value) for value in upper)
     assert all(low <= high for low, high in zip(lower_numbers, upper_numbers))
 
+
+def _source_slot_task(task_id: int, color: str = "pink") -> TaskSpec:
+    return TaskSpec(
+        task_id=task_id,
+        instruction="official source-slot task",
+        target_kind="cuboid_box",
+        target_body=f"box_{color}",
+        target_color=color,
+        place_type="table_point",
+        place_world_xyz=(-1.0, 2.2, 0.834),
+        place_frame_id="world",
+        place_radius=0.28,
+        timestamp_ns=100,
+    )
+
+
+def _source_slot_estimate(
+    position: tuple[float, float, float],
+    *,
+    orientation: tuple[float, float, float, float] | None = None,
+) -> ObjectEstimate3D:
+    return ObjectEstimate3D(
+        "pink", position, 0.9, "odom", 100, object_id="stable:source",
+        orientation_xyzw=orientation, size_xyz_m=(0.24, 0.16, 0.19),
+    )
+
+
+def test_source_slot_selection_is_task_aware_and_resolves_only_unknown_orientation() -> None:
+    slots = _source_slot_config_from_config(_project_config())
+
+    task1 = _source_slot_task(1)
+    assert _select_target_estimate(
+        (_source_slot_estimate((-1.0, 2.2, 0.834)),), task1, 120, 100,
+        source_slots=slots, require_source_slot=True, resolve_unknown_orientation=True,
+    ).orientation_xyzw == pytest.approx((0.0, 0.0, 0.0, 1.0))
+    assert _select_target_estimate(
+        (_source_slot_estimate((-0.18, 2.2, 0.834)),), task1, 120, 100,
+        source_slots=slots, require_source_slot=True,
+    ) is not None
+    assert _select_target_estimate(
+        (_source_slot_estimate((-2.63, 0.778, 0.837)),), task1, 120, 100,
+        source_slots=slots, require_source_slot=True,
+    ) is None
+
+    task2 = _source_slot_task(2)
+    selected2 = _select_target_estimate(
+        (_source_slot_estimate((-2.63, 0.778, 1.166)),), task2, 120, 100,
+        source_slots=slots, require_source_slot=True, resolve_unknown_orientation=True,
+    )
+    assert selected2 is not None
+    assert selected2.orientation_xyzw == pytest.approx(
+        (0.0, 0.0, math.sqrt(0.5), math.sqrt(0.5))
+    )
+    assert _select_target_estimate(
+        (_source_slot_estimate((-1.0, 2.2, 0.834)),), task2, 120, 100,
+        source_slots=slots, require_source_slot=True,
+    ) is None
+
+    task3 = _source_slot_task(3)
+    selected3 = _select_target_estimate(
+        (_source_slot_estimate((-0.54, 2.3, 1.004)),), task3, 120, 100,
+        source_slots=slots, require_source_slot=True, resolve_unknown_orientation=True,
+    )
+    assert selected3 is not None
+    assert selected3.orientation_xyzw == pytest.approx(
+        (0.0, 0.0, math.sqrt(0.5), math.sqrt(0.5))
+    )
+    assert _select_target_estimate(
+        (_source_slot_estimate((-0.18, 2.2, 0.834)),), task3, 120, 100,
+        source_slots=slots, require_source_slot=True,
+    ) is None
+
+    at_limit = _source_slot_estimate((-0.951, 2.2, 0.834))
+    beyond_limit = _source_slot_estimate((-0.949, 2.2, 0.834))
+    assert _select_target_estimate(
+        (at_limit,), task1, 120, 100, source_slots=slots, require_source_slot=True,
+    ) is not None
+    assert _select_target_estimate(
+        (beyond_limit,), task1, 120, 100, source_slots=slots, require_source_slot=True,
+    ) is None
+
+    observed = _source_slot_estimate(
+        (-1.0, 2.2, 0.834), orientation=(0.0, 0.0, 0.2, math.sqrt(0.96))
+    )
+    assert _select_target_estimate(
+        (observed,), task1, 120, 100,
+        source_slots=slots, require_source_slot=True, resolve_unknown_orientation=True,
+    ).orientation_xyzw == observed.orientation_xyzw
+
+
+def test_source_slot_gate_is_not_a_global_post_grasp_object_gate() -> None:
+    slots = _source_slot_config_from_config(_project_config())
+    moved_after_grasp = _source_slot_estimate((-2.68, 0.54, 0.498))
+    assert _select_target_estimate(
+        (moved_after_grasp,), _source_slot_task(3), 120, 100,
+    ) is moved_after_grasp
+    assert _select_target_estimate(
+        (moved_after_grasp,), _source_slot_task(3), 120, 100,
+        source_slots=slots, require_source_slot=True,
+    ) is None
 
 def test_config_recorder_aliases_and_current_frame_defaults() -> None:
     """当前值是仓库约定；测试通过不等于已用官方Docker核对frame、话题或关节名。"""

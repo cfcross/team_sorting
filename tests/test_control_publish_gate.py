@@ -289,7 +289,7 @@ def _estimate(
 ) -> ObjectEstimate3D:
     return ObjectEstimate3D(
         class_id="pink",
-        position_xyz=(1.0, 0.0, 0.5),
+        position_xyz=(-1.0, 2.2, 0.834),
         confidence=confidence,
         frame_id="odom",
         timestamp_ns=timestamp_ns,
@@ -1921,7 +1921,7 @@ def test_same_search_observation_is_submitted_only_once() -> None:
     assert calls == [FSMEvent.TARGET_FOUND]
 
 
-def test_refine_entry_preserves_only_identity_and_rejects_old_or_missing_geometry() -> None:
+def test_refine_entry_preserves_identity_rejects_old_or_missing_size_and_resolves_yaw() -> None:
     node = _node()
     state = node._runtime_wiring
     original = _estimate("target-a", 0.9, timestamp_ns=NOW - 200)
@@ -1941,12 +1941,19 @@ def test_refine_entry_preserves_only_identity_and_rejects_old_or_missing_geometr
         "target-a", 1.0, timestamp_ns=NOW - 10, orientation=False
     )
     missing_size = _estimate("target-a", 1.0, timestamp_ns=NOW - 10, size=False)
-    for estimate in (old_complete, missing_orientation, missing_size):
+    for estimate in (old_complete, missing_size):
         result = node._run_current_phase(
             replace(snapshot, object_estimates=(estimate,)), status, None, NOW
         )
         assert result[2] is None
         assert state.active_target is None
+
+    _, _, feedback = node._run_current_phase(
+        replace(snapshot, object_estimates=(missing_orientation,)), status, None, NOW
+    )
+    assert feedback is not None and feedback.event is FSMEvent.TARGET_REFINED
+    assert state.active_target is not missing_orientation
+    assert state.active_target.orientation_xyzw == pytest.approx((0.0, 0.0, 0.0, 1.0))
 
 
 def test_refine_prefers_original_identity_and_uses_only_new_complete_geometry() -> None:
