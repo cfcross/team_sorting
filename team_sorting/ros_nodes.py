@@ -566,6 +566,44 @@ def _arm_execution_control_granted(
     )
 
 
+def _navigation_control_granted(
+    *,
+    fsm_status: FSMStatus,
+    base_command: BaseCommand | None,
+    mux_decision: ActionMuxDecision,
+    now_ns: int,
+    internal_publish_authorized: bool,
+    published: bool,
+) -> bool:
+    """只承认同周期通过仲裁且完成正式发布调用的内部导航候选。"""
+
+    return (
+        type(now_ns) is int
+        and now_ns >= 0
+        and isinstance(fsm_status, FSMStatus)
+        and fsm_status.global_phase
+        in {
+            GlobalPhase.NAV_TO_PICK,
+            GlobalPhase.NAV_TO_PLACE,
+            GlobalPhase.RETURN_END,
+        }
+        and isinstance(base_command, BaseCommand)
+        and base_command.valid
+        and base_command.timestamp_ns == now_ns
+        and now_ns < base_command.valid_until_ns
+        and isinstance(mux_decision, ActionMuxDecision)
+        and mux_decision.timestamp_ns == now_ns
+        and mux_decision.global_phase is fsm_status.global_phase
+        and mux_decision.base_candidate_present
+        and mux_decision.base_source == "base_command"
+        and mux_decision.base_disposition is CandidateDisposition.ACCEPTED
+        and mux_decision.commanded_mask[0:2] == (True, True)
+        and mux_decision.safety_override_mask[0:2] == (False, False)
+        and internal_publish_authorized is True
+        and published is True
+    )
+
+
 class TimestampedCache:
     """按纳秒时间保存并查找最近状态的有界缓存。
 
@@ -1641,13 +1679,22 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
 
             state = self._runtime_wiring
             reset_failure = ""
+            navigation_reset = getattr(self._navigation, "reset", None)
+            if callable(navigation_reset):
+                try:
+                    navigation_reset()
+                except Exception as exc:  # noqa: BLE001 - 清理其余状态仍必须继续
+                    reset_failure = f"NavigationController.reset失败：{exc}"
             if self._arm_execution is not None:
                 try:
                     # ArmExecution.reset只清除软件执行状态，不等于真实机器人已经停止；
                     # 真实安全动作仍必须由ActionMux统一仲裁。
                     self._arm_execution.reset()
                 except Exception as exc:  # noqa: BLE001 - 清理其余状态仍必须继续
-                    reset_failure = f"ArmExecutionController.reset失败：{exc}"
+                    arm_reset_failure = f"ArmExecutionController.reset失败：{exc}"
+                    reset_failure = "；".join(
+                        reason for reason in (reset_failure, arm_reset_failure) if reason
+                    )
             if run_id is not _RUNTIME_ID_UNSET:
                 state.run_id = "" if run_id is None else str(run_id)
             if task_id is not _RUNTIME_ID_UNSET:
@@ -1703,8 +1750,8 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             self,
             previous_phase: Optional[GlobalPhase],
             current_phase: GlobalPhase,
-        ) -> None:
-            """只清理新阶段已明确失效的业务缓存。"""
+        ) -> bool:
+            """清理新阶段失效缓存；返回阶段入口是否可安全继续。"""
 
             state = self._runtime_wiring
             state.phase_entry_failure_reason = ""
@@ -1716,7 +1763,28 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 and current_phase not in {GlobalPhase.DONE, GlobalPhase.FAILED}
             ):
                 # 安全暂停及恢复不能破坏被暂停阶段的业务生命周期。
-                return
+                return True
+            navigation_phases = {
+                GlobalPhase.NAV_TO_PICK,
+                GlobalPhase.NAV_TO_PLACE,
+                GlobalPhase.RETURN_END,
+            }
+            terminal_phases = {GlobalPhase.DONE, GlobalPhase.FAILED}
+            if (
+                previous_phase in navigation_phases
+                or current_phase in navigation_phases
+                or current_phase in terminal_phases
+            ):
+                navigation_reset = getattr(self._navigation, "reset", None)
+                if callable(navigation_reset):
+                    try:
+                        navigation_reset()
+                    except (TypeError, ValueError, RuntimeError) as exc:
+                        state.phase_entry_failure_reason = (
+                            f"NavigationController.reset失败：{exc}"
+                        )
+                        state.navigation_diagnostic = state.phase_entry_failure_reason
+                        return False
             state.phase_generation += 1
             state.navigation_success_submitted = False
             state.navigation_failure_submitted = False
@@ -1869,6 +1937,7 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 state.latest_place_verification_observation = None
                 state.last_navigation_status = None
                 state.last_manipulation_status = None
+            return True
 
         def _synchronize_runtime_context(
             self, context: Optional[CompetitionContext]
@@ -1938,7 +2007,7 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             if state.last_handled_phase is phase:
                 return False
             previous_phase = state.last_handled_phase
-            self._prepare_phase_transition(previous_phase, phase)
+            transition_ready = self._prepare_phase_transition(previous_phase, phase)
             state.last_handled_phase = phase
             state.phase_entered_ns = (
                 self._fsm.phase_entered_ns
@@ -1946,6 +2015,8 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 and self._fsm.phase_entered_ns >= 0
                 else now_ns
             )
+            if not transition_ready:
+                return True
             if previous_phase is GlobalPhase.SAFE_HOLD and phase not in {
                 GlobalPhase.DONE,
                 GlobalPhase.FAILED,
@@ -3492,8 +3563,45 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 except (TypeError, ValueError, RuntimeError):
                     pass
 
+        def _record_navigation_control_result(
+            self, now_ns: int, control_granted: bool
+        ) -> None:
+            """把同周期底盘仲裁与发布结果回报给导航执行预算。"""
+
+            navigation = self._navigation
+            if navigation is None:
+                return
+            recorder = getattr(navigation, "record_control_result", None)
+            if not callable(recorder):
+                # 测试替身和旧的纯算法注入对象可以没有反馈钩子。
+                return
+            try:
+                recorder(now_ns, control_granted)
+            except (TypeError, ValueError, RuntimeError) as exc:
+                self._runtime_wiring.navigation_diagnostic = (
+                    f"Navigation控制权回报失败，执行预算保持关闭：{exc}"
+                )
+                try:
+                    recorder(now_ns, False)
+                except (TypeError, ValueError, RuntimeError):
+                    pass
+
         def _control_tick(self) -> None:
-            now_ns = self.get_clock().now().nanoseconds
+            try:
+                now_ns = self.get_clock().now().nanoseconds
+            except Exception:
+                # 无可信timestamp时不能结算上一授权区间；只保守撤权并保留原始异常。
+                navigation = self._navigation
+                revoke = getattr(navigation, "_revoke_control_without_timestamp", None)
+                if callable(revoke):
+                    try:
+                        revoke()
+                    except Exception:
+                        pass
+                raise
+            # 先结算上一周期已确认的授权区间并默认撤权；只有本周期完整控制链成功后，
+            # 才在相同timestamp提升为True。后续任意异常或提前return都会保持False。
+            self._record_navigation_control_result(now_ns, False)
             actual_dt_s = (
                 None
                 if self._last_control_tick_ns is None
@@ -3707,6 +3815,16 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             self._record_arm_execution_control_result(
                 now_ns, arm_control_granted
             )
+            navigation_control_granted = _navigation_control_granted(
+                fsm_status=status,
+                base_command=base_command,
+                mux_decision=mux_decision,
+                now_ns=now_ns,
+                internal_publish_authorized=internal_publish_authorized,
+                published=published,
+            )
+            if navigation_control_granted:
+                self._record_navigation_control_result(now_ns, True)
             if external_decision.accepted:
                 head_publish_failure_reason = ""
                 if (
