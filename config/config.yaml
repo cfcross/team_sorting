@@ -233,12 +233,30 @@ navigation:
   settled_required_cycles: 3               # 不同Odom帧的连续停稳周期数
   settled_max_odom_gap_ns: 200000000       # ns
 
-# 轴对齐区域顺序：[xmin,xmax,ymin,ymax,zmin,zmax]，单位米，必须和frames.planning一致。
-# 当前每组最小值大于最大值是故意的安全占位，使分类返回UNKNOWN而不是猜测桌面/货架。
-# 联调前必须由系统、视觉和导航共同确认真实frame及区域；这里不能填写推测坐标。
-slot_bounds:
-  table: [1.0, -1.0, 1.0, -1.0, 1.0, -1.0]
-  shelf: [1.0, -1.0, 1.0, -1.0, 1.0, -1.0]
+# 当前官方 offline 场景的初始 source-slot 唯一定义。world==odom 只适用于该官方离线
+# bridge；这些中心仅在SEARCH_TARGET/REFINE_TARGET选择尚未抓取的source target时消费，
+# 不能作为物体整个任务生命周期的全局位置gate。颜色经官方随机shuffle分配到slot，因此
+# 必须以当前Task的source_slot映射选择，不能由颜色猜测。
+source_slots:
+  frame_id: "odom"
+  # Stage 2静态实测1.2–3.4cm后的5cm engineering error budget：只用于source-slot
+  # matching；不是navigation.position_tolerance_m，也不是运行时GT perception-error gate。
+  # 数值仍须由后续Integration Validation在换站位、距离、货架/遮挡条件下确认。
+  source_slot_match_tolerance_m: 0.05
+  slots:
+    table_side:
+      centers: [[-1.00, 2.20, 0.834], [-0.18, 2.20, 0.834]]
+      yaw_rad: 0.0
+    table_top:
+      centers: [[-0.54, 2.30, 1.004]]
+      yaw_rad: 1.5707963267948966
+    shelf:
+      centers: [[-2.63, 0.778, 0.508], [-2.63, 0.778, 0.837], [-2.63, 0.778, 1.166]]
+      yaw_rad: 1.5707963267948966
+  task_source_slots:
+    1: table_side
+    2: shelf
+    3: table_top
 
 action_mux:
   # TeamClientNode读取后构造ActionMuxConfig；底盘值是团队初始安全上限，不是官方性能值。
