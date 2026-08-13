@@ -76,6 +76,7 @@ from team_sorting.perception_3d import (
 )
 from team_sorting.ros_nodes import (
     _arm_planning_config_from_config,
+    _base_state_from_odom,
     _estimates_from_vision,
     _estimates_to_vision,
     _navigation_config_from_config,
@@ -84,6 +85,45 @@ from team_sorting.ros_nodes import (
     _select_target_estimate,
     _validate_vision_schema,
 )
+
+
+def _odom_message(
+    *,
+    frame_id: str = "/odom",
+    sec: object = 12,
+    nanosec: object = 345,
+    position: tuple[object, object, object] = (1.25, -2.5, 0.75),
+    quaternion: tuple[object, object, object, object] = (0.0, 0.0, 0.0, 1.0),
+    linear: tuple[object, object, object] = (-0.4, 0.3, 0.2),
+    angular: tuple[object, object, object] = (0.1, -0.2, 0.3),
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        header=SimpleNamespace(
+            stamp=SimpleNamespace(sec=sec, nanosec=nanosec), frame_id=frame_id
+        ),
+        child_frame_id="base_footprint",
+        pose=SimpleNamespace(
+            pose=SimpleNamespace(
+                position=SimpleNamespace(
+                    x=position[0], y=position[1], z=position[2]
+                ),
+                orientation=SimpleNamespace(
+                    x=quaternion[0],
+                    y=quaternion[1],
+                    z=quaternion[2],
+                    w=quaternion[3],
+                ),
+            )
+        ),
+        twist=SimpleNamespace(
+            twist=SimpleNamespace(
+                linear=SimpleNamespace(x=linear[0], y=linear[1], z=linear[2]),
+                angular=SimpleNamespace(
+                    x=angular[0], y=angular[1], z=angular[2]
+                ),
+            )
+        ),
+    )
 
 
 def _visual_verifier() -> VisualObservationVerifier:
@@ -322,6 +362,82 @@ def test_interfaces_and_geometry() -> None:
     shelf = Bounds3D(3.0, 4.0, 0.0, 1.0, 0.0, 2.0)
     assert classify_slot_type(estimate.position_xyz, table, shelf) is SlotType.TABLE
     assert classify_slot_type((9.0, 9.0, 9.0), table, shelf) is SlotType.UNKNOWN
+
+
+def test_odom_adapter_maps_all_base_state_fields() -> None:
+    state = _base_state_from_odom(
+        _odom_message(quaternion=(0.0, 0.0, 0.0, 2.0))
+    )
+    assert state.timestamp_ns == 12_000_000_345
+    assert state.frame_id == "odom"
+    assert state.position_xyz == pytest.approx((1.25, -2.5, 0.75))
+    assert state.orientation_xyzw == pytest.approx((0.0, 0.0, 0.0, 1.0))
+    assert state.linear_velocity_xyz == pytest.approx((-0.4, 0.3, 0.2))
+    assert state.angular_velocity_xyz == pytest.approx((0.1, -0.2, 0.3))
+    assert state.yaw == pytest.approx(0.0)
+    assert state.valid is True
+    assert state.failure_reason == ""
+
+
+@pytest.mark.parametrize(
+    "yaw",
+    (0.0, math.pi / 2.0, -math.pi / 2.0, math.pi - 1.0e-7, -math.pi + 1.0e-7),
+)
+def test_odom_adapter_converts_unit_quaternion_to_expected_yaw(yaw: float) -> None:
+    quaternion = (0.0, 0.0, math.sin(yaw / 2.0), math.cos(yaw / 2.0))
+    state = _base_state_from_odom(_odom_message(quaternion=quaternion))
+    assert state.yaw == pytest.approx(yaw, abs=1.0e-9)
+
+
+@pytest.mark.parametrize("frame_id", ("/odom", "odom"))
+def test_odom_adapter_normalizes_supported_odom_frame(frame_id: str) -> None:
+    assert _base_state_from_odom(_odom_message(frame_id=frame_id)).frame_id == "odom"
+
+
+def test_odom_adapter_rejects_empty_frame() -> None:
+    with pytest.raises(ValueError, match="frame_id规范化后不能为空"):
+        _base_state_from_odom(_odom_message(frame_id=""))
+
+
+def test_non_odom_frame_is_preserved_then_navigation_fails_closed() -> None:
+    state = _base_state_from_odom(_odom_message(frame_id="map"))
+    assert state.frame_id == "map"
+    command, status = NavigationController().update(
+        state,
+        _nav_goal(1.0, 0.0, 0.0),
+        state.timestamp_ns,
+    )
+    assert not command.valid
+    assert (command.v, command.w) == (0.0, 0.0)
+    assert status.state == "failed"
+    assert "frame" in status.failure_reason
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "failure"),
+    (
+        ({"position": (math.nan, 0.0, 0.0)}, "位置包含 NaN/Inf"),
+        ({"position": (math.inf, 0.0, 0.0)}, "位置包含 NaN/Inf"),
+        ({"quaternion": (math.nan, 0.0, 0.0, 1.0)}, "四元数包含 NaN/Inf"),
+        ({"quaternion": (0.0, 0.0, math.inf, 1.0)}, "四元数包含 NaN/Inf"),
+        ({"quaternion": (0.0, 0.0, 0.0, 0.0)}, "四元数范数为零"),
+        ({"sec": -1}, "时间戳范围无效"),
+        ({"nanosec": 1_000_000_000}, "时间戳范围无效"),
+        ({"sec": True}, "时间戳格式无效"),
+    ),
+)
+def test_odom_adapter_rejects_nonfinite_quaternion_and_invalid_time(
+    kwargs: dict[str, object], failure: str
+) -> None:
+    with pytest.raises(ValueError, match=failure):
+        _base_state_from_odom(_odom_message(**kwargs))  # type: ignore[arg-type]
+
+
+def test_odom_adapter_rejects_missing_required_fields() -> None:
+    message = _odom_message()
+    del message.pose.pose.position
+    with pytest.raises(ValueError, match="Odom 字段格式无效"):
+        _base_state_from_odom(message)
 
 
 # ---------------------------------------------------------------------------
