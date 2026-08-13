@@ -182,6 +182,90 @@ def test_clipped_mask_is_per_dimension_and_command_remains_accepted() -> None:
     assert action.clipped is True
 
 
+def test_negative_linear_velocity_is_preserved_through_official_twist_publish() -> None:
+    _assert_signed_base_twist(v=-0.12, w=0.0)
+
+
+def test_negative_angular_velocity_is_preserved_through_official_twist_publish() -> None:
+    _assert_signed_base_twist(v=0.0, w=-0.23)
+
+
+def test_combined_negative_base_velocity_is_not_swapped_or_reversed() -> None:
+    _assert_signed_base_twist(v=-0.12, w=-0.23)
+
+
+def _assert_signed_base_twist(*, v: float, w: float) -> None:
+    action, decision = ActionMux().compose_with_decision(
+        _base(v=v, w=w), None, _joints(), _status(GlobalPhase.NAV_TO_PICK), NOW
+    )
+    assert decision.base_disposition is CandidateDisposition.ACCEPTED
+    assert decision.commanded_mask[0:2] == (True, True)
+    assert action.values[0:2] == pytest.approx((v, w))
+
+    publisher, node = _publisher()
+    groups = publisher.publish_with_trace(action)
+    twist = node.publishers[OFFICIAL_TOPICS["cmd_vel"]].messages[-1]
+    assert (twist.linear.x, twist.linear.y, twist.linear.z) == pytest.approx(
+        (v, 0.0, 0.0)
+    )
+    assert (twist.angular.x, twist.angular.y, twist.angular.z) == pytest.approx(
+        (0.0, 0.0, w)
+    )
+    base_payload = groups[0].exact_payload
+    assert isinstance(base_payload, TwistExactPayload)
+    assert base_payload.linear_xyz == pytest.approx((v, 0.0, 0.0))
+    assert base_payload.angular_xyz == pytest.approx((0.0, 0.0, w))
+
+
+def test_negative_linear_velocity_clips_to_configured_negative_limit() -> None:
+    mux = ActionMux()
+    limit = mux.config.max_abs_base_v
+    action, decision = mux.compose_with_decision(
+        _base(v=-(limit * 2.0), w=0.13),
+        None,
+        _joints(),
+        _status(GlobalPhase.NAV_TO_PICK),
+        NOW,
+    )
+    assert action.values[0:2] == pytest.approx((-limit, 0.13))
+    assert decision.base_disposition is CandidateDisposition.ACCEPTED
+    assert decision.commanded_mask[0:2] == (True, True)
+    assert decision.clipped_mask[0:2] == (True, False)
+
+
+def test_negative_angular_velocity_clips_to_configured_negative_limit() -> None:
+    mux = ActionMux()
+    limit = mux.config.max_abs_base_w
+    action, decision = mux.compose_with_decision(
+        _base(v=0.13, w=-(limit * 2.0)),
+        None,
+        _joints(),
+        _status(GlobalPhase.NAV_TO_PICK),
+        NOW,
+    )
+    assert action.values[0:2] == pytest.approx((0.13, -limit))
+    assert decision.base_disposition is CandidateDisposition.ACCEPTED
+    assert decision.commanded_mask[0:2] == (True, True)
+    assert decision.clipped_mask[0:2] == (False, True)
+
+
+def test_combined_negative_base_velocity_clips_without_swap_or_sign_change() -> None:
+    mux = ActionMux()
+    v_limit = mux.config.max_abs_base_v
+    w_limit = mux.config.max_abs_base_w
+    action, decision = mux.compose_with_decision(
+        _base(v=-(v_limit * 2.0), w=-(w_limit * 2.0)),
+        None,
+        _joints(),
+        _status(GlobalPhase.NAV_TO_PICK),
+        NOW,
+    )
+    assert action.values[0:2] == pytest.approx((-v_limit, -w_limit))
+    assert decision.base_disposition is CandidateDisposition.ACCEPTED
+    assert decision.commanded_mask[0:2] == (True, True)
+    assert decision.clipped_mask[0:2] == (True, True)
+
+
 def test_compose_remains_compatible_with_compose_with_decision() -> None:
     args = (_base(v=0.1), _manipulation((1,), values={1: 0.1}), _joints(), _status(), NOW)
     old_action = ActionMux().compose(*args)
