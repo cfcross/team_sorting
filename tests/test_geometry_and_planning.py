@@ -833,10 +833,9 @@ def test_navigation_rejects_invalid_settling_configuration(
         NavigationConfig(**kwargs)  # type: ignore[arg-type]
 
 
-def test_navigation_update_safely_stops_on_timeout_invalid_and_stale_odom() -> None:
+def test_navigation_update_safely_stops_on_invalid_and_stale_odom() -> None:
     controller = NavigationController()
     cases = (
-        (_nav_base(), _nav_goal(1.0, 0.0, 0.0, deadline=999_999_999)),
         (_nav_base(valid=False), _nav_goal(1.0, 0.0, 0.0)),
         (_nav_base(stamp=800_000_000), _nav_goal(1.0, 0.0, 0.0)),
         (_nav_base(), _unchecked_nav_goal(math.nan, 0.0, 0.0)),
@@ -849,16 +848,165 @@ def test_navigation_update_safely_stops_on_timeout_invalid_and_stale_odom() -> N
         assert status.failure_reason
 
 
-def test_navigation_deadline_is_exclusive_and_stops_at_equal_timestamp() -> None:
-    command, status = NavigationController().update(
-        _nav_base(),
-        _nav_goal(1.0, 0.0, 0.0, deadline=1_000_000_000),
-        1_000_000_000,
-    )
-    assert (command.v, command.w) == (0.0, 0.0)
+def test_navigation_deadline_metadata_does_not_consume_paused_budget() -> None:
+    controller = NavigationController(NavigationConfig(goal_timeout_ns=100))
+    goal = _nav_goal(1.0, 0.0, 0.0, deadline=1)
+    command, status = controller.update(_nav_base(stamp=1_000), goal, 1_000)
+    controller.record_control_result(10_000, False)
+    command, status = controller.update(_nav_base(stamp=10_000), goal, 10_000)
+    assert command.valid
+    assert status.state != "timeout"
+
+
+def test_navigation_control_budget_starts_paused_and_resumes_without_backfill() -> None:
+    controller = NavigationController(NavigationConfig(goal_timeout_ns=100))
+    goal = _nav_goal(1.0, 0.0, 0.0, deadline=1)
+    controller.update(_nav_base(stamp=1_000), goal, 1_000)
+    controller.record_control_result(10_000, False)
+    controller.record_control_result(20_000, True)
+    _, resumed = controller.update(_nav_base(stamp=20_000), goal, 20_000)
+    assert resumed.state != "timeout"
+    controller.record_control_result(20_099, True)
+    _, below = controller.update(_nav_base(stamp=20_099), goal, 20_099)
+    assert below.state != "timeout"
+    controller.record_control_result(20_100, True)
+    command, timed_out = controller.update(_nav_base(stamp=20_100), goal, 20_100)
     assert not command.valid
-    assert status.state == "timeout"
-    assert not status.success
+    assert timed_out.state == "timeout"
+
+
+def test_navigation_control_budget_only_accumulates_true_intervals() -> None:
+    controller = NavigationController(NavigationConfig(goal_timeout_ns=100))
+    goal = _nav_goal(1.0, 0.0, 0.0)
+    controller.update(_nav_base(stamp=1_000), goal, 1_000)
+    for timestamp, granted in (
+        (1_010, True), (1_040, True), (1_050, False),
+        (5_000, False), (6_000, True), (6_059, True),
+    ):
+        controller.record_control_result(timestamp, granted)
+    _, below = controller.update(_nav_base(stamp=6_059), goal, 6_059)
+    assert below.state != "timeout"
+    controller.record_control_result(6_060, True)
+    _, timed_out = controller.update(_nav_base(stamp=6_060), goal, 6_060)
+    assert timed_out.state == "timeout"
+
+
+def test_navigation_control_budget_matches_production_update_record_order() -> None:
+    controller = NavigationController(NavigationConfig(goal_timeout_ns=100))
+    goal = _nav_goal(1.0, 0.0, 0.0)
+
+    _, at_n = controller.update(_nav_base(stamp=1_000), goal, 1_000)
+    assert at_n.state != "timeout"
+    controller.record_control_result(1_000, True)
+
+    _, at_n1 = controller.update(_nav_base(stamp=1_040), goal, 1_040)
+    assert at_n1.state != "timeout"
+    controller.record_control_result(1_040, False)
+
+    _, paused = controller.update(_nav_base(stamp=9_000), goal, 9_000)
+    assert paused.state != "timeout"
+    controller.record_control_result(9_000, True)
+
+    command, at_n3 = controller.update(_nav_base(stamp=9_060), goal, 9_060)
+    assert not command.valid
+    assert at_n3.state == "timeout"
+
+
+def test_navigation_same_timestamp_feedback_is_idempotent() -> None:
+    controller = NavigationController(NavigationConfig(goal_timeout_ns=50))
+    goal = _nav_goal(1.0, 0.0, 0.0)
+    controller.update(_nav_base(stamp=1_000), goal, 1_000)
+    controller.record_control_result(1_000, False)
+    controller.record_control_result(1_000, True)
+
+    _, before = controller.update(_nav_base(stamp=1_049), goal, 1_049)
+    assert before.state != "timeout"
+    controller.record_control_result(1_049, True)
+    _, boundary = controller.update(_nav_base(stamp=1_050), goal, 1_050)
+    assert boundary.state == "timeout"
+
+
+def test_navigation_revoke_without_timestamp_is_idempotent_and_excludes_unknown_time() -> None:
+    controller = NavigationController(NavigationConfig(goal_timeout_ns=100))
+    goal = _nav_goal(1.0, 0.0, 0.0)
+    controller.update(_nav_base(stamp=1_000), goal, 1_000)
+    controller.record_control_result(1_000, True)
+    elapsed_before = controller._execution_elapsed_ns
+    checkpoint_before = controller._clock_checkpoint_ns
+
+    controller._revoke_control_without_timestamp()
+    controller._revoke_control_without_timestamp()
+
+    assert controller._control_granted_since_checkpoint is False
+    assert controller._execution_elapsed_ns == elapsed_before
+    assert controller._clock_checkpoint_ns == checkpoint_before
+    controller.record_control_result(9_000, False)
+    assert controller._execution_elapsed_ns == elapsed_before
+
+
+def test_navigation_new_goal_and_reset_do_not_leak_control_budget() -> None:
+    controller = NavigationController(NavigationConfig(goal_timeout_ns=100))
+    first = _nav_goal(1.0, 0.0, 0.0)
+    second = NavGoal("second", "place", (1.0, 0.0, 0.0), "odom", 0.05, 0.1, 2)
+    controller.update(_nav_base(stamp=1_000), first, 1_000)
+    controller.record_control_result(1_000, True)
+    controller.record_control_result(1_099, True)
+    _, fresh = controller.update(_nav_base(stamp=1_100), second, 1_100)
+    assert fresh.state != "timeout"
+    controller.record_control_result(1_200, True)
+    _, still_fresh = controller.update(_nav_base(stamp=1_200), second, 1_200)
+    assert still_fresh.state != "timeout"
+    controller.reset()
+    controller.update(_nav_base(stamp=2_000), first, 2_000)
+    controller.record_control_result(3_000, False)
+    _, reset_status = controller.update(_nav_base(stamp=3_000), first, 3_000)
+    assert reset_status.state != "timeout"
+
+
+def test_navigation_invalid_odom_terminates_goal_and_replacement_resets_budget() -> None:
+    controller = NavigationController(NavigationConfig(goal_timeout_ns=100))
+    first = _nav_goal(1.0, 0.0, 0.0)
+    controller.update(_nav_base(stamp=1_000), first, 1_000)
+    controller.record_control_result(1_000, True)
+    command, failed = controller.update(
+        _nav_base(stamp=1_010, valid=False), first, 1_010
+    )
+    assert not command.valid and failed.state == "failed"
+    controller.record_control_result(2_000, True)
+    assert controller._control_granted_since_checkpoint is False
+
+    replacement = NavGoal(
+        "after-odom-failure", "pick", (1.0, 0.0, 0.0), "odom",
+        0.05, 0.1, 2,
+    )
+    _, fresh = controller.update(_nav_base(stamp=2_000), replacement, 2_000)
+    assert fresh.state != "timeout"
+
+
+@pytest.mark.parametrize("timestamp", [True, -1, 1.0, "1"])
+def test_navigation_control_feedback_invalid_time_fails_closed(timestamp: object) -> None:
+    controller = NavigationController(NavigationConfig(goal_timeout_ns=100))
+    goal = _nav_goal(1.0, 0.0, 0.0)
+    controller.update(_nav_base(stamp=1_000), goal, 1_000)
+    controller.record_control_result(1_000, True)
+    with pytest.raises(ValueError):
+        controller.record_control_result(timestamp, True)  # type: ignore[arg-type]
+    controller.record_control_result(2_000, False)
+    _, status = controller.update(_nav_base(stamp=2_000), goal, 2_000)
+    assert status.state != "timeout"
+
+
+def test_navigation_control_feedback_rejects_bad_flag_and_time_regression() -> None:
+    controller = NavigationController(NavigationConfig(goal_timeout_ns=100))
+    goal = _nav_goal(1.0, 0.0, 0.0)
+    controller.update(_nav_base(stamp=1_000), goal, 1_000)
+    controller.record_control_result(1_000, True)
+    for timestamp, granted in ((999, True), (1_001, 1)):
+        with pytest.raises(ValueError):
+            controller.record_control_result(timestamp, granted)  # type: ignore[arg-type]
+    controller.record_control_result(2_000, False)
+    _, status = controller.update(_nav_base(stamp=2_000), goal, 2_000)
+    assert status.state != "timeout"
 
 
 @pytest.mark.parametrize("timestamp", [True, -1, 1.0])

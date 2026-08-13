@@ -17,6 +17,8 @@ from team_sorting.action_mux import ActionMux
 from team_sorting.competition_context import CompetitionContext
 from team_sorting.external_candidate import ExternalCandidateDecision
 from team_sorting.fsm import FSMEvent
+from team_sorting.navigation import NavigationConfig, NavigationController
+from team_sorting.pi05_policy_control import PolicyControlDecision
 from team_sorting.interfaces import (
     ArmExecutionConfig,
     ArmMotionPhase,
@@ -48,6 +50,7 @@ from team_sorting.ros_nodes import (
     _create_perception_node,
     _create_team_client_node,
     _internal_fsm_publish_authorization,
+    _navigation_control_granted,
     _select_target_estimate,
     _spin,
 )
@@ -1491,6 +1494,120 @@ def test_safe_hold_and_recovery_preserve_runtime_context_without_execution_reset
     assert reset_calls["count"] == 0
 
 
+@pytest.mark.parametrize("terminal", [GlobalPhase.DONE, GlobalPhase.FAILED])
+def test_safe_hold_terminal_transition_resets_navigation_lifecycle(
+    terminal: GlobalPhase,
+) -> None:
+    node = _node()
+    reset_calls = {"count": 0}
+    node._navigation = SimpleNamespace(
+        reset=lambda: reset_calls.__setitem__("count", reset_calls["count"] + 1)
+    )
+    node._prepare_phase_transition(GlobalPhase.NAV_TO_PICK, GlobalPhase.SAFE_HOLD)
+    node._prepare_phase_transition(GlobalPhase.SAFE_HOLD, GlobalPhase.NAV_TO_PICK)
+    assert reset_calls["count"] == 0
+
+    node._prepare_phase_transition(GlobalPhase.NAV_TO_PICK, GlobalPhase.SAFE_HOLD)
+    node._prepare_phase_transition(GlobalPhase.SAFE_HOLD, terminal)
+    assert reset_calls["count"] == 1
+    node._navigation.reset()
+    assert reset_calls["count"] == 2
+
+
+@pytest.mark.parametrize("terminal", [GlobalPhase.DONE, GlobalPhase.FAILED])
+def test_direct_navigation_terminal_transition_resets_lifecycle(
+    terminal: GlobalPhase,
+) -> None:
+    node = _node()
+    reset_calls = {"count": 0}
+    node._navigation = SimpleNamespace(
+        reset=lambda: reset_calls.__setitem__("count", reset_calls["count"] + 1)
+    )
+    assert node._prepare_phase_transition(GlobalPhase.NAV_TO_PICK, terminal)
+    assert reset_calls["count"] == 1
+
+
+def test_runtime_navigation_reset_is_repeatable() -> None:
+    node = _node()
+    controller = node._navigation
+    controller._active_goal_key = ("old-goal",)
+    controller._execution_elapsed_ns = 50
+    controller._control_granted_since_checkpoint = True
+    node._reset_runtime_wiring(reason="first")
+    node._reset_runtime_wiring(reason="second")
+    assert controller._active_goal_key is None
+    assert controller._execution_elapsed_ns == 0
+    assert controller._control_granted_since_checkpoint is False
+
+
+def test_safe_hold_pause_resume_preserves_navigation_budget() -> None:
+    node = _node()
+    controller = NavigationController(NavigationConfig(goal_timeout_ns=100))
+    node._navigation = controller
+    goal = NavGoal(
+        "safe-hold-goal", "pick", (1.0, 0.0, 0.0), "odom", 0.05, 0.1, 1
+    )
+    node._runtime_wiring.active_nav_goal = goal
+    controller.update(replace(_base(), timestamp_ns=1_000), goal, 1_000)
+    controller.record_control_result(1_000, True)
+    controller.update(replace(_base(), timestamp_ns=1_040), goal, 1_040)
+    controller.record_control_result(1_040, False)
+
+    node._prepare_phase_transition(GlobalPhase.NAV_TO_PICK, GlobalPhase.SAFE_HOLD)
+    controller.record_control_result(9_000, False)
+    node._prepare_phase_transition(GlobalPhase.SAFE_HOLD, GlobalPhase.NAV_TO_PICK)
+    assert node._runtime_wiring.active_nav_goal is goal
+    _, resumed = controller.update(
+        replace(_base(), timestamp_ns=9_000), goal, 9_000
+    )
+    assert resumed.state != "timeout"
+    controller.record_control_result(9_000, True)
+    _, timed_out = controller.update(
+        replace(_base(), timestamp_ns=9_060), goal, 9_060
+    )
+    assert timed_out.state == "timeout"
+
+
+def test_navigation_reset_failure_blocks_phase_entry_and_preserves_diagnostic() -> None:
+    node = _node(observe_only=False, enable_official_publish=True)
+    state = node._runtime_wiring
+    state.active_target = _estimate("target-a", 0.9)
+    state.search_target = state.active_target
+    build_calls = {"count": 0}
+
+    class FailingResetNavigation:
+        def reset(self) -> None:
+            raise RuntimeError("injected navigation reset failure")
+
+        def build_pick_goal(self, *_args: object) -> NavGoal:
+            build_calls["count"] += 1
+            return NavGoal(
+                "must-not-build", "pick", (1.0, 0.0, 0.0), "odom",
+                0.05, 0.1, NOW + 100,
+            )
+
+    node._navigation = FailingResetNavigation()
+    snapshot = SensorSnapshot(_task(), _base(), _joints(), (), NOW, True)
+    status = FSMStatus(
+        1, GlobalPhase.NAV_TO_PICK, LocalPhase.IDLE, 0, False, "", NOW
+    )
+
+    node._handle_phase_entry(snapshot, status, None, NOW)
+
+    assert build_calls["count"] == 0
+    assert state.active_nav_goal is None
+    assert "injected navigation reset failure" in state.phase_entry_failure_reason
+    command, _ = node._compute_candidate_commands(snapshot, status, NOW)
+    assert command is not None and not command.valid
+    action, decision = node._mux.compose_with_decision(
+        command, None, _joints(), status, NOW
+    )
+    assert not node._publish_final_action(
+        action, decision=decision, internal_fsm_publish_authorized=False
+    )
+    assert _official_message_count(node) == 0
+
+
 def test_full_lifecycle_resets_call_execution_reset() -> None:
     node = _node()
     reset_calls = {"count": 0}
@@ -1847,6 +1964,214 @@ def test_real_search_feedback_advances_only_through_existing_event_adapter() -> 
 
     assert node._fsm.phase is GlobalPhase.NAV_TO_PICK
     assert node._runtime_wiring.active_target.object_id == "stable:7"
+
+
+def test_control_tick_reports_same_cycle_navigation_publish_result() -> None:
+    node = _node(observe_only=False, enable_official_publish=True)
+    _prime_control_state(node)
+    node._control_tick()
+    node._on_instruction(_message(json.dumps(OFFICIAL_TASKS)))
+    _feed_official_context(node, task=1, attempt=0)
+    node._latest_estimates = (_estimate("stable:7", 0.9, timestamp_ns=NOW),)
+    results: list[tuple[int, bool]] = []
+    original_record = node._navigation.record_control_result
+
+    def record(timestamp_ns: int, granted: bool) -> None:
+        results.append((timestamp_ns, granted))
+        original_record(timestamp_ns, granted)
+
+    node._navigation.record_control_result = record
+    node._control_tick()
+    assert node._fsm.phase is GlobalPhase.NAV_TO_PICK
+    node._control_tick()
+
+    assert results[-1] == (NOW, True)
+    assert _official_message_count(node) >= 5
+
+
+def test_control_tick_early_return_revokes_navigation_control() -> None:
+    node = _node(observe_only=False, enable_official_publish=True)
+    results: list[tuple[int, bool]] = []
+    node._navigation = SimpleNamespace(
+        record_control_result=lambda timestamp_ns, granted: results.append(
+            (timestamp_ns, granted)
+        )
+    )
+    node._base_cache.put(NOW, _base())
+
+    node._control_tick()
+
+    assert results == [(NOW, False)]
+
+
+def test_control_tick_exception_after_previous_true_revokes_navigation_clock() -> None:
+    node = _node(observe_only=False, enable_official_publish=True)
+    _prime_control_state(node)
+    controller = node._navigation
+    controller._active_goal_key = ("active",)
+    controller._clock_checkpoint_ns = NOW
+    controller._control_granted_since_checkpoint = True
+    node.now_ns = NOW + 40
+    node._check_readiness = lambda *_args: None
+    node._synchronize_runtime_context = lambda *_args: None
+    node._handle_phase_entry = lambda *_args: False
+    node._run_current_phase = lambda *_args: (None, None, None)
+    node._mux.compose_with_decision = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        RuntimeError("injected mux failure")
+    )
+
+    with pytest.raises(RuntimeError, match="injected mux failure"):
+        node._control_tick()
+
+    assert controller._execution_elapsed_ns == 40
+    assert controller._control_granted_since_checkpoint is False
+    node.now_ns = NOW + 10_000
+    controller.record_control_result(node.now_ns, False)
+    assert controller._execution_elapsed_ns == 40
+
+
+def test_control_tick_clock_exception_revokes_without_fabricating_timestamp() -> None:
+    node = _node(observe_only=False, enable_official_publish=True)
+    controller, results = _start_internal_navigation_with_control_feedback(node)
+    elapsed_before = controller._execution_elapsed_ns
+    checkpoint_before = controller._clock_checkpoint_ns
+    clock_error = RuntimeError("injected clock read failure")
+
+    def fail_clock() -> object:
+        raise clock_error
+
+    node.get_clock = fail_clock
+    with pytest.raises(RuntimeError) as caught:
+        node._control_tick()
+
+    assert caught.value is clock_error
+    assert results[-1] == (NOW, True)
+    assert controller._control_granted_since_checkpoint is False
+    assert controller._execution_elapsed_ns == elapsed_before
+    assert controller._clock_checkpoint_ns == checkpoint_before
+    controller.record_control_result(NOW + 10_000, False)
+    assert controller._execution_elapsed_ns == elapsed_before
+
+
+def _start_internal_navigation_with_control_feedback(
+    node: Any,
+) -> tuple[Any, list[tuple[int, bool]]]:
+    _prime_control_state(node)
+    node._control_tick()
+    node._on_instruction(_message(json.dumps(OFFICIAL_TASKS)))
+    _feed_official_context(node, task=1, attempt=0)
+    node._latest_estimates = (_estimate("stable:clock", 0.9, timestamp_ns=NOW),)
+    node._control_tick()
+    assert node._fsm.phase is GlobalPhase.NAV_TO_PICK
+    controller = node._navigation
+    results: list[tuple[int, bool]] = []
+    original_record = controller.record_control_result
+
+    def record(timestamp_ns: int, granted: bool) -> None:
+        results.append((timestamp_ns, granted))
+        original_record(timestamp_ns, granted)
+
+    controller.record_control_result = record
+    node._control_tick()
+    assert results[-2:] == [(NOW, False), (NOW, True)]
+    return controller, results
+
+
+def test_reset_failure_with_stale_goal_blocks_real_tick_authorization_and_publish() -> None:
+    node = _node(observe_only=False, enable_official_publish=True)
+    controller, _ = _start_internal_navigation_with_control_feedback(node)
+    state = node._runtime_wiring
+    stale_goal = state.active_nav_goal
+    assert stale_goal is not None
+    state.last_handled_phase = GlobalPhase.SEARCH_TARGET
+    state.navigation_failure_submitted = False
+    state.last_event_tick_ns = None
+    state.event_attempted_this_tick = False
+    build_calls = {"count": 0}
+    original_build = controller.build_pick_goal
+    reset_error = RuntimeError("injected stale-goal reset failure")
+
+    def fail_reset() -> None:
+        raise reset_error
+
+    def count_build(*args: object, **kwargs: object) -> NavGoal:
+        build_calls["count"] += 1
+        return original_build(*args, **kwargs)
+
+    controller.reset = fail_reset
+    controller.build_pick_goal = count_build
+    received_events: list[tuple[FSMEvent, str]] = []
+
+    def reject_transition(event: FSMEvent, _timestamp_ns: int, reason: str = "") -> bool:
+        received_events.append((event, reason))
+        return False
+
+    node._fsm.handle_event = reject_transition
+    decisions: list[Any] = []
+    original_compose = node._mux.compose_with_decision
+
+    def capture_decision(*args: object, **kwargs: object) -> tuple[Any, Any]:
+        action, decision = original_compose(*args, **kwargs)
+        decisions.append(decision)
+        return action, decision
+
+    node._mux.compose_with_decision = capture_decision
+    publish_authorizations: list[bool] = []
+    original_publish = node._publish_final_action
+
+    def capture_publish(*args: object, **kwargs: object) -> bool:
+        publish_authorizations.append(
+            bool(kwargs.get("internal_fsm_publish_authorized", False))
+        )
+        return original_publish(*args, **kwargs)
+
+    node._publish_final_action = capture_publish
+    cmd_vel_before = len(node.publishers["/cmd_vel"].messages)
+
+    node._control_tick()
+
+    assert build_calls["count"] == 0
+    assert state.active_nav_goal is stale_goal
+    assert received_events and received_events[-1][0] is FSMEvent.FAILURE
+    assert "injected stale-goal reset failure" in received_events[-1][1]
+    assert "injected stale-goal reset failure" in state.navigation_diagnostic
+    assert decisions
+    decision = decisions[-1]
+    assert decision.base_disposition is ros_nodes_module.CandidateDisposition.REJECTED_INVALID
+    assert publish_authorizations == [False]
+    assert len(node.publishers["/cmd_vel"].messages) == cmd_vel_before
+
+
+def test_control_tick_publish_failure_revokes_previous_navigation_true() -> None:
+    node = _node(observe_only=False, enable_official_publish=True)
+    controller, results = _start_internal_navigation_with_control_feedback(node)
+    node.publishers["/cmd_vel"].fail = True
+    node._control_tick()
+    assert results[-1] == (NOW, False)
+    assert not controller._control_granted_since_checkpoint
+    elapsed = controller._execution_elapsed_ns
+    controller.record_control_result(NOW + 10_000, False)
+    assert controller._execution_elapsed_ns == elapsed
+
+
+def test_control_tick_pi05_takeover_revokes_previous_navigation_true() -> None:
+    node = _node(observe_only=False, enable_official_publish=True)
+    controller, results = _start_internal_navigation_with_control_feedback(node)
+    node._policy_control_config = SimpleNamespace(
+        enabled=True, enable_actuation=True, publish_authorized=True
+    )
+    node._policy_control.take = lambda **_kwargs: PolicyControlDecision(
+        True,
+        base_command=BaseCommand(0.1, 0.0, NOW, NOW + 100),
+    )
+
+    node._control_tick()
+
+    assert results[-1] == (NOW, False)
+    assert not controller._control_granted_since_checkpoint
+    elapsed = controller._execution_elapsed_ns
+    controller.record_control_result(NOW + 10_000, False)
+    assert controller._execution_elapsed_ns == elapsed
 
 
 @pytest.mark.parametrize(
@@ -3221,6 +3546,89 @@ def test_arm_execution_control_result_requires_mux_acceptance_and_publish_succes
     )
     assert _arm_execution_control_granted(
         **common, fsm_status=status, mux_decision=accepted_decision,
+        published=True,
+    )
+
+
+def _navigation_grant_case(
+    *,
+    phase: GlobalPhase = GlobalPhase.NAV_TO_PICK,
+    command: BaseCommand | None = None,
+    source: str = "base_command",
+    now_ns: int = NOW,
+) -> tuple[FSMStatus, BaseCommand | None, object]:
+    status = FSMStatus(1, phase, LocalPhase.IDLE, 0, False, "", now_ns)
+    candidate = command if command is not None else BaseCommand(
+        10.0, 1.0, now_ns, now_ns + 100
+    )
+    _, decision = ActionMux().compose_with_decision(
+        candidate, None, _joints(), status, now_ns, base_source=source
+    )
+    return status, candidate, decision
+
+
+def test_navigation_control_result_accepts_internal_clipped_full_publish() -> None:
+    status, command, decision = _navigation_grant_case()
+    assert decision.clipped_mask[0]
+    assert _navigation_control_granted(
+        fsm_status=status,
+        base_command=command,
+        mux_decision=decision,
+        now_ns=NOW,
+        internal_publish_authorized=True,
+        published=True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("case", "phase", "command", "source", "authorized", "published"),
+    [
+        ("observe_or_disabled", GlobalPhase.NAV_TO_PICK, None, "base_command", False, False),
+        ("publish_failure", GlobalPhase.NAV_TO_PICK, None, "base_command", True, False),
+        ("pi05", GlobalPhase.NAV_TO_PICK, None, "pi05_policy_control", True, True),
+        ("non_navigation", GlobalPhase.SEARCH_TARGET, None, "base_command", True, True),
+        ("stale", GlobalPhase.NAV_TO_PICK, BaseCommand(0.1, 0.0, NOW, NOW), "base_command", True, True),
+        ("invalid", GlobalPhase.NAV_TO_PICK, BaseCommand(0.0, 0.0, NOW, NOW + 1, False, "bad"), "base_command", True, True),
+        ("safe_hold", GlobalPhase.SAFE_HOLD, None, "base_command", True, True),
+    ],
+)
+def test_navigation_control_result_rejects_incomplete_control_chain(
+    case: str,
+    phase: GlobalPhase,
+    command: BaseCommand | None,
+    source: str,
+    authorized: bool,
+    published: bool,
+) -> None:
+    del case
+    status, candidate, decision = _navigation_grant_case(
+        phase=phase, command=command, source=source
+    )
+    assert not _navigation_control_granted(
+        fsm_status=status,
+        base_command=candidate,
+        mux_decision=decision,
+        now_ns=NOW,
+        internal_publish_authorized=authorized,
+        published=published,
+    )
+
+
+def test_navigation_control_result_rejects_safety_override_decision() -> None:
+    status, command, decision = _navigation_grant_case()
+    overridden = replace(
+        decision,
+        commanded_mask=(False, False, *decision.commanded_mask[2:]),
+        clipped_mask=(False, False, *decision.clipped_mask[2:]),
+        safety_override_mask=(True, True, *decision.safety_override_mask[2:]),
+        base_disposition=ros_nodes_module.CandidateDisposition.SAFETY_OVERRIDDEN,
+    )
+    assert not _navigation_control_granted(
+        fsm_status=status,
+        base_command=command,
+        mux_decision=overridden,
+        now_ns=NOW,
+        internal_publish_authorized=True,
         published=True,
     )
 

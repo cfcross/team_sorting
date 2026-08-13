@@ -257,6 +257,81 @@ class NavigationController:
         self._settled_samples = 0
         self._last_settled_odom_timestamp_ns: int | None = None
         self._arrival_latched = False
+        self._execution_elapsed_ns = 0
+        self._clock_checkpoint_ns: int | None = None
+        self._control_granted_since_checkpoint = False
+        self._goal_terminal = False
+
+    def reset(self) -> None:
+        """取消当前导航生命周期；不生成命令，也不代表机器人已经停止。"""
+
+        self._active_goal_key = None
+        self._reset_settled_confirmation()
+        self._arrival_latched = False
+        self._execution_elapsed_ns = 0
+        self._clock_checkpoint_ns = None
+        self._control_granted_since_checkpoint = False
+        self._goal_terminal = False
+
+    def _activate_goal(
+        self, goal_key: tuple[object, ...], timestamp_ns: int
+    ) -> None:
+        """原子建立新目标的停稳确认和control-aware执行预算。"""
+
+        self._active_goal_key = goal_key
+        self._reset_settled_confirmation()
+        self._arrival_latched = False
+        self._execution_elapsed_ns = 0
+        self._clock_checkpoint_ns = timestamp_ns
+        self._control_granted_since_checkpoint = False
+        self._goal_terminal = False
+
+    def _advance_execution_clock(self, timestamp_ns: int) -> None:
+        """只结算上个检查点之后已明确获准控制的区间。"""
+
+        checkpoint_ns = self._clock_checkpoint_ns
+        if checkpoint_ns is None:
+            self._clock_checkpoint_ns = timestamp_ns
+            return
+        if timestamp_ns < checkpoint_ns:
+            self._control_granted_since_checkpoint = False
+            raise ValueError("导航控制权回报时间不得倒退")
+        if self._control_granted_since_checkpoint and not self._goal_terminal:
+            self._execution_elapsed_ns += timestamp_ns - checkpoint_ns
+        self._clock_checkpoint_ns = timestamp_ns
+
+    def record_control_result(
+        self, timestamp_ns: int, control_granted: bool
+    ) -> None:
+        """记录同周期内部导航候选的仲裁与正式发布结果。
+
+        ``True`` 只表示内部 Navigation ``BaseCommand`` 在该周期通过 ActionMux、FULL
+        授权和本地 ROS publish 调用；不表示 Server 接收、机器人运动或导航成功。
+        非法输入会撤销授权并抛出 ``ValueError``，未知区间不会计入执行预算。
+        """
+
+        try:
+            timestamp = self._timestamp(timestamp_ns, "timestamp_ns")
+        except ValueError:
+            self._control_granted_since_checkpoint = False
+            raise
+        if type(control_granted) is not bool:
+            self._control_granted_since_checkpoint = False
+            checkpoint_ns = self._clock_checkpoint_ns
+            if checkpoint_ns is None or timestamp >= checkpoint_ns:
+                self._clock_checkpoint_ns = timestamp
+            raise ValueError("control_granted必须是严格bool")
+        self._advance_execution_clock(timestamp)
+        self._control_granted_since_checkpoint = bool(
+            control_granted
+            and self._active_goal_key is not None
+            and not self._goal_terminal
+        )
+
+    def _revoke_control_without_timestamp(self) -> None:
+        """在没有可信时间戳时保守撤权，不结算或移动执行时钟。"""
+
+        self._control_granted_since_checkpoint = False
 
     def build_pick_goal(
         self, task: TaskSpec, target: ObjectEstimate3D, base: BaseState, timestamp_ns: int
@@ -391,15 +466,6 @@ class NavigationController:
             if goal.frame_id != base.frame_id:
                 raise ValueError("NavGoal 与 BaseState frame 不一致")
             deadline = self._timestamp(goal.deadline_ns, "goal.deadline_ns")
-            if now >= deadline:
-                self._reset_settled_confirmation()
-                return self._stopped(
-                    goal.goal_id,
-                    now,
-                    "timeout",
-                    "导航目标已超过 deadline",
-                    valid=False,
-                )
             if len(goal.pose_xyyaw) != 3:
                 raise ValueError("goal.pose_xyyaw 必须包含三项")
             goal_x, goal_y = _read_xy(goal.pose_xyyaw, "goal.pose_xyyaw")
@@ -421,9 +487,20 @@ class NavigationController:
                 goal.deadline_ns,
             )
             if goal_key != self._active_goal_key:
-                self._active_goal_key = goal_key
+                self._activate_goal(goal_key, now)
+            else:
+                self._advance_execution_clock(now)
+            if self._execution_elapsed_ns >= self._config.goal_timeout_ns:
                 self._reset_settled_confirmation()
-                self._arrival_latched = False
+                self._goal_terminal = True
+                self._control_granted_since_checkpoint = False
+                return self._stopped(
+                    goal.goal_id,
+                    now,
+                    "timeout",
+                    "导航有效控制预算已达到 goal_timeout_ns",
+                    valid=False,
+                )
 
             # 第二阶段：所有输入确认可靠后，再计算位置误差和最终姿态误差。
             base_x, base_y = _read_xy(base.position_xyz, "base.position_xyz")
@@ -489,6 +566,8 @@ class NavigationController:
                             ),
                         )
                     self._arrival_latched = True
+                    self._goal_terminal = True
+                    self._control_granted_since_checkpoint = False
                     return (
                         BaseCommand(
                             0.0, 0.0, now, now + self._config.command_ttl_ns
@@ -552,6 +631,8 @@ class NavigationController:
         except (TypeError, ValueError, OverflowError) as exc:
             # 非法输入或非有限计算结果统一转成无效零速候选，交给 ActionMux 安全仲裁。
             self._reset_settled_confirmation()
+            self._goal_terminal = True
+            self._control_granted_since_checkpoint = False
             goal_id = goal.goal_id if isinstance(goal, NavGoal) else ""
             safe_now = (
                 timestamp_ns
