@@ -50,6 +50,172 @@ def _finite_real(value: object, field_name: str) -> float:
     return converted
 
 
+def _strict_finite_float(value: object, field_name: str) -> float:
+    """校验静态场景标量，只接受内建 ``int/float`` 且拒绝 ``bool``。"""
+
+    if type(value) not in (int, float):
+        raise ValueError(f"{field_name}必须是严格int或float有限数")
+    try:
+        converted = float(value)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError(f"{field_name}必须是严格int或float有限数") from exc
+    if not math.isfinite(converted):
+        raise ValueError(f"{field_name}必须是严格int或float有限数")
+    return converted
+
+
+@dataclass(frozen=True)
+class _StaticAABB:
+    """调用方已确认同一平面内的私有闭合静态边界，四项单位均为米。"""
+
+    min_x: float
+    min_y: float
+    max_x: float
+    max_y: float
+
+    def __post_init__(self) -> None:
+        for name in ("min_x", "min_y", "max_x", "max_y"):
+            object.__setattr__(
+                self,
+                name,
+                _strict_finite_float(getattr(self, name), f"_StaticAABB.{name}"),
+            )
+        if self.min_x >= self.max_x:
+            raise ValueError("_StaticAABB.min_x必须小于max_x")
+        if self.min_y >= self.max_y:
+            raise ValueError("_StaticAABB.min_y必须小于max_y")
+
+
+def _inflate_aabb(bounds: _StaticAABB, inflation_m: float) -> _StaticAABB:
+    """将闭合静态AABB向四侧膨胀指定米数，不注入任何安全默认值。"""
+
+    if not isinstance(bounds, _StaticAABB):
+        raise ValueError("bounds必须是_StaticAABB")
+    if type(inflation_m) not in (int, float):
+        raise ValueError("inflation_m必须是非负有限数")
+    try:
+        inflation = float(inflation_m)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError("inflation_m必须是非负有限数") from exc
+    if not math.isfinite(inflation) or inflation < 0.0:
+        raise ValueError("inflation_m必须是非负有限数")
+    expanded = (
+        bounds.min_x - inflation,
+        bounds.min_y - inflation,
+        bounds.max_x + inflation,
+        bounds.max_y + inflation,
+    )
+    if not all(math.isfinite(value) for value in expanded):
+        raise ValueError("膨胀AABB在当前浮点精度下无法表示")
+    if inflation > 0.0 and not (
+        expanded[0] < bounds.min_x
+        and expanded[1] < bounds.min_y
+        and expanded[2] > bounds.max_x
+        and expanded[3] > bounds.max_y
+    ):
+        raise ValueError("膨胀AABB边界在当前浮点精度下无法表示")
+    return _StaticAABB(expanded[0], expanded[1], expanded[2], expanded[3])
+
+
+def _strict_xy(point_xy: object, field_name: str) -> tuple[float, float]:
+    """读取恰好二维的内建数值坐标，不附加frame或修改输入。"""
+
+    if type(point_xy) not in (tuple, list):
+        raise ValueError(f"{field_name}必须恰好包含两个严格int或float有限数")
+    try:
+        if len(point_xy) != 2:  # type: ignore[arg-type]
+            raise ValueError(f"{field_name}必须恰好包含两个严格int或float有限数")
+        x_value = point_xy[0]  # type: ignore[index]
+        y_value = point_xy[1]  # type: ignore[index]
+    except (TypeError, KeyError, IndexError, OverflowError) as exc:
+        raise ValueError(
+            f"{field_name}必须恰好包含两个严格int或float有限数"
+        ) from exc
+    return (
+        _strict_finite_float(x_value, f"{field_name}.x"),
+        _strict_finite_float(y_value, f"{field_name}.y"),
+    )
+
+
+def _point_intersects_aabb(point_xy: object, bounds: _StaticAABB) -> bool:
+    """判断同一平面内的点是否落在闭合AABB内部或边界上。"""
+
+    if not isinstance(bounds, _StaticAABB):
+        raise ValueError("bounds必须是_StaticAABB")
+    point_x, point_y = _strict_xy(point_xy, "point_xy")
+    return (
+        bounds.min_x <= point_x <= bounds.max_x
+        and bounds.min_y <= point_y <= bounds.max_y
+    )
+
+
+def _segment_intersects_aabb_values(
+    start_xy: tuple[float, float],
+    end_xy: tuple[float, float],
+    bounds: _StaticAABB,
+) -> bool:
+    """对已验证坐标执行闭合线段与AABB的解析区间裁剪。"""
+
+    interval_min = 0.0
+    interval_max = 1.0
+    for start, end, lower, upper in (
+        (start_xy[0], end_xy[0], bounds.min_x, bounds.max_x),
+        (start_xy[1], end_xy[1], bounds.min_y, bounds.max_y),
+    ):
+        delta = end - start
+        if not math.isfinite(delta):
+            raise ValueError("线段差值在当前浮点精度下无法表示")
+        if delta == 0.0:
+            if start < lower or start > upper:
+                return False
+            continue
+        lower_delta = lower - start
+        upper_delta = upper - start
+        if not math.isfinite(lower_delta) or not math.isfinite(upper_delta):
+            raise ValueError("线段裁剪在当前浮点精度下无法表示")
+        first = lower_delta / delta
+        second = upper_delta / delta
+        if not math.isfinite(first) or not math.isfinite(second):
+            raise ValueError("线段裁剪在当前浮点精度下无法表示")
+        entry = min(first, second)
+        exit_ = max(first, second)
+        interval_min = max(interval_min, entry)
+        interval_max = min(interval_max, exit_)
+        if interval_min > interval_max:
+            return False
+    return True
+
+
+def _segment_intersects_aabb(
+    start_xy: object, end_xy: object, bounds: _StaticAABB
+) -> bool:
+    """判断闭合线段是否穿过、接触或位于同一平面的闭合AABB。"""
+
+    if not isinstance(bounds, _StaticAABB):
+        raise ValueError("bounds必须是_StaticAABB")
+    start = _strict_xy(start_xy, "start_xy")
+    end = _strict_xy(end_xy, "end_xy")
+    return _segment_intersects_aabb_values(start, end, bounds)
+
+
+def _segment_intersects_any_aabb(
+    start_xy: object,
+    end_xy: object,
+    obstacles: object,
+) -> bool:
+    """按输入顺序判断闭合线段是否接触任一私有静态AABB。"""
+
+    start = _strict_xy(start_xy, "start_xy")
+    end = _strict_xy(end_xy, "end_xy")
+    if not isinstance(obstacles, (tuple, list)) or any(
+        not isinstance(bounds, _StaticAABB) for bounds in obstacles
+    ):
+        raise ValueError("obstacles必须是_StaticAABB序列")
+    return any(
+        _segment_intersects_aabb_values(start, end, bounds) for bounds in obstacles
+    )
+
+
 def _nonnegative_int(value: object, field_name: str) -> int:
     """校验纳秒时长等非负整数配置，拒绝 bool 和隐式浮点截断。"""
 

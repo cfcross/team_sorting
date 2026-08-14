@@ -24,6 +24,7 @@ MMK2Kdl 适配与规划骨架；同时静态检查少量 config/launch 约定。
 """
 
 import math
+from collections.abc import Mapping, Sequence
 from dataclasses import fields, replace
 from pathlib import Path
 import sys
@@ -61,6 +62,11 @@ from team_sorting.navigation import (
     Bounds3D,
     NavigationConfig,
     NavigationController,
+    _StaticAABB,
+    _inflate_aabb,
+    _point_intersects_aabb,
+    _segment_intersects_aabb,
+    _segment_intersects_any_aabb,
     classify_slot_type,
     distance_xy,
     wrap_to_pi,
@@ -498,6 +504,347 @@ def test_distance_xy_uses_first_two_finite_coordinates(
 def test_distance_xy_rejects_invalid_sequences(first: object, second: object) -> None:
     with pytest.raises(ValueError):
         distance_xy(first, second)  # type: ignore[arg-type]
+
+
+def test_static_aabb_is_private_frozen_and_normalizes_numeric_values() -> None:
+    bounds = _StaticAABB(-2, -1.5, 3, 4.5)
+
+    assert (bounds.min_x, bounds.min_y, bounds.max_x, bounds.max_y) == (
+        -2.0,
+        -1.5,
+        3.0,
+        4.5,
+    )
+    assert all(
+        type(value) is float
+        for value in (bounds.min_x, bounds.min_y, bounds.max_x, bounds.max_y)
+    )
+    with pytest.raises(AttributeError):
+        bounds.min_x = -3.0  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    ("values", "failure"),
+    [
+        ((True, 0.0, 1.0, 1.0), "min_x"),
+        ((np.float64(0.0), 0.0, 1.0, 1.0), "min_x"),
+        ((10**400, 0.0, 1.0, 1.0), "min_x"),
+        ((0.0, False, 1.0, 1.0), "min_y"),
+        ((0.0, 0.0, "1.0", 1.0), "max_x"),
+        ((0.0, 0.0, 1.0, None), "max_y"),
+        ((math.nan, 0.0, 1.0, 1.0), "min_x"),
+        ((0.0, -math.inf, 1.0, 1.0), "min_y"),
+        ((0.0, 0.0, math.inf, 1.0), "max_x"),
+        ((0.0, 0.0, 1.0, math.nan), "max_y"),
+        ((1.0, 0.0, 1.0, 1.0), "min_x必须小于max_x"),
+        ((2.0, 0.0, 1.0, 1.0), "min_x必须小于max_x"),
+        ((0.0, 1.0, 1.0, 1.0), "min_y必须小于max_y"),
+        ((0.0, 2.0, 1.0, 1.0), "min_y必须小于max_y"),
+    ],
+)
+def test_static_aabb_rejects_invalid_or_degenerate_bounds(
+    values: tuple[object, object, object, object], failure: str
+) -> None:
+    with pytest.raises(ValueError, match=failure):
+        _StaticAABB(*values)  # type: ignore[arg-type]
+
+
+def test_inflate_aabb_expands_every_closed_boundary_without_hidden_constant() -> None:
+    original = _StaticAABB(-2.875, 0.37, -2.465, 1.186)
+
+    unchanged = _inflate_aabb(original, 0)
+    inflated = _inflate_aabb(original, 0.5154080786132004)
+
+    assert unchanged == original
+    assert unchanged is not original
+    assert inflated == _StaticAABB(
+        -3.3904080786132003,
+        -0.14540807861320038,
+        -1.9495919213867996,
+        1.7014080786132002,
+    )
+    assert original == _StaticAABB(-2.875, 0.37, -2.465, 1.186)
+
+
+@pytest.mark.parametrize(
+    "inflation",
+    [
+        True,
+        False,
+        np.float64(0.05),
+        "0.05",
+        None,
+        10**400,
+        -1.0e-12,
+        math.nan,
+        math.inf,
+        -math.inf,
+    ],
+)
+def test_inflate_aabb_rejects_invalid_inflation(inflation: object) -> None:
+    with pytest.raises(ValueError, match="inflation_m必须是非负有限数"):
+        _inflate_aabb(_StaticAABB(0.0, 0.0, 1.0, 1.0), inflation)  # type: ignore[arg-type]
+
+
+def test_inflate_aabb_rejects_wrong_boundary_type_and_numeric_overflow() -> None:
+    with pytest.raises(ValueError, match="bounds必须是_StaticAABB"):
+        _inflate_aabb((0.0, 0.0, 1.0, 1.0), 0.1)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="当前浮点精度"):
+        _inflate_aabb(_StaticAABB(-1.0e308, -1.0, 1.0e308, 1.0), 1.0e308)
+
+
+@pytest.mark.parametrize(
+    ("bounds", "inflation"),
+    [
+        (_StaticAABB(-1.0, -1.0, 1.0, 1.0), 5e-324),
+        (_StaticAABB(-1.0e308, -1.0, 1.0, 1.0), 1.0),
+    ],
+)
+def test_inflate_aabb_rejects_unrepresentable_boundary_expansion(
+    bounds: _StaticAABB, inflation: float
+) -> None:
+    with pytest.raises(ValueError, match="当前浮点精度"):
+        _inflate_aabb(bounds, inflation)
+
+
+@pytest.mark.parametrize(
+    "point",
+    [
+        (0.5, 0.5),
+        (0.0, 0.5),
+        (1.0, 0.5),
+        (0.5, 0.0),
+        (0.5, 1.0),
+        (0.0, 0.0),
+        (1.0, 1.0),
+    ],
+)
+def test_point_intersects_aabb_uses_closed_boundaries(
+    point: tuple[float, float]
+) -> None:
+    assert _point_intersects_aabb(point, _StaticAABB(0.0, 0.0, 1.0, 1.0))
+
+
+@pytest.mark.parametrize(
+    "point",
+    [
+        (-5e-324, 0.5),
+        (1.0000000000000002, 0.5),
+        (0.5, -5e-324),
+        (0.5, 1.0000000000000002),
+    ],
+)
+def test_point_intersects_aabb_rejects_points_immediately_outside(
+    point: tuple[float, float]
+) -> None:
+    assert not _point_intersects_aabb(point, _StaticAABB(0.0, 0.0, 1.0, 1.0))
+
+
+@pytest.mark.parametrize(
+    "point",
+    [
+        None,
+        1.0,
+        "01",
+        (),
+        (0.0,),
+        (0.0, 0.0, 0.0),
+        (True, 0.0),
+        (np.float64(0.0), 0.0),
+        ("0.0", 0.0),
+        (10**400, 0.0),
+        (math.nan, 0.0),
+        (0.0, math.inf),
+    ],
+)
+def test_point_intersects_aabb_rejects_invalid_exact_xy(point: object) -> None:
+    with pytest.raises(ValueError, match="point_xy"):
+        _point_intersects_aabb(point, _StaticAABB(0.0, 0.0, 1.0, 1.0))  # type: ignore[arg-type]
+
+
+def test_point_intersects_aabb_requires_private_bounds() -> None:
+    with pytest.raises(ValueError, match="bounds必须是_StaticAABB"):
+        _point_intersects_aabb((0.5, 0.5), (0.0, 0.0, 1.0, 1.0))  # type: ignore[arg-type]
+
+
+def test_point_intersects_aabb_accepts_builtin_list_without_mutating_it() -> None:
+    point = [0.25, 0.75]
+
+    assert _point_intersects_aabb(point, _StaticAABB(0.0, 0.0, 1.0, 1.0))
+    assert point == [0.25, 0.75]
+
+
+def test_point_intersects_aabb_rejects_non_builtin_xy_containers_stably() -> None:
+    class _TupleSubclass(tuple):
+        pass
+
+    class _ListSubclass(list):
+        pass
+
+    class _CustomSequence(Sequence[float]):
+        def __len__(self) -> int:
+            return 2
+
+        def __getitem__(self, index: int) -> float:
+            return (0.25, 0.75)[index]
+
+    class _CustomMapping(Mapping[int, float]):
+        def __iter__(self):
+            return iter((0, 1))
+
+        def __len__(self) -> int:
+            return 2
+
+        def __getitem__(self, key: int) -> float:
+            return (0.25, 0.75)[key]
+
+    class _BadLength:
+        def __len__(self) -> int:
+            raise RuntimeError("不得调用自定义len")
+
+    class _BadIndex:
+        def __len__(self) -> int:
+            return 2
+
+        def __getitem__(self, _index: int) -> float:
+            raise RuntimeError("不得调用自定义getitem")
+
+    bounds = _StaticAABB(0.0, 0.0, 1.0, 1.0)
+    for point in (
+        b"01",
+        {0: 0.25, 1: 0.75},
+        (value for value in (0.25, 0.75)),
+        {0.25, 0.75},
+        _CustomSequence(),
+        _CustomMapping(),
+        _TupleSubclass((0.25, 0.75)),
+        _ListSubclass((0.25, 0.75)),
+        _BadLength(),
+        _BadIndex(),
+    ):
+        with pytest.raises(ValueError, match="point_xy"):
+            _point_intersects_aabb(point, bounds)
+
+
+@pytest.mark.parametrize(
+    ("start", "end"),
+    [
+        ((-1.0, 0.5), (2.0, 0.5)),
+        ((0.5, -1.0), (0.5, 2.0)),
+        ((-1.0, -1.0), (2.0, 2.0)),
+        ((0.25, 0.25), (0.75, 0.75)),
+        ((-1.0, 0.0), (2.0, 0.0)),
+        ((-1.0, -1.0), (0.0, 0.0)),
+        ((0.5, 0.5), (0.5, 0.5)),
+    ],
+)
+def test_segment_intersects_aabb_detects_crossing_inside_tangent_and_degenerate(
+    start: tuple[float, float], end: tuple[float, float]
+) -> None:
+    bounds = _StaticAABB(0.0, 0.0, 1.0, 1.0)
+    assert _segment_intersects_aabb(start, end, bounds)
+    assert _segment_intersects_aabb(end, start, bounds)
+
+
+@pytest.mark.parametrize(
+    ("start", "end"),
+    [
+        ((-1.0, 1.0000000000000002), (2.0, 1.0000000000000002)),
+        ((-1.0, 2.0), (2.0, 2.0)),
+        ((-1.0, -1.0), (-0.5, -0.5)),
+        ((2.0, 0.0), (2.0, 1.0)),
+        ((-1.0, -1.0), (-1.0, -1.0)),
+    ],
+)
+def test_segment_intersects_aabb_rejects_parallel_near_miss_and_degenerate_outside(
+    start: tuple[float, float], end: tuple[float, float]
+) -> None:
+    bounds = _StaticAABB(0.0, 0.0, 1.0, 1.0)
+    assert not _segment_intersects_aabb(start, end, bounds)
+    assert not _segment_intersects_aabb(end, start, bounds)
+
+
+def test_segment_intersects_aabb_validates_both_points_and_finite_arithmetic() -> None:
+    bounds = _StaticAABB(0.0, 0.0, 1.0, 1.0)
+    with pytest.raises(ValueError, match="start_xy"):
+        _segment_intersects_aabb((True, 0.0), (1.0, 1.0), bounds)
+    with pytest.raises(ValueError, match="end_xy"):
+        _segment_intersects_aabb((0.0, 0.0), (1.0, math.inf), bounds)
+    with pytest.raises(ValueError, match="当前浮点精度"):
+        _segment_intersects_aabb((-1.0e308, 0.5), (1.0e308, 0.5), bounds)
+
+
+def test_segment_intersects_any_aabb_handles_empty_order_and_invalid_members() -> None:
+    segment = ((-1.0, 0.5), (2.0, 0.5))
+    miss = _StaticAABB(4.0, 4.0, 5.0, 5.0)
+    hit = _StaticAABB(0.0, 0.0, 1.0, 1.0)
+
+    assert not _segment_intersects_any_aabb(*segment, ())
+    assert _segment_intersects_any_aabb(*segment, (miss, hit))
+    assert _segment_intersects_any_aabb(*segment, (hit, miss))
+    with pytest.raises(ValueError, match="obstacles必须是_StaticAABB序列"):
+        _segment_intersects_any_aabb(*segment, (miss, object()))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="obstacles必须是_StaticAABB序列"):
+        _segment_intersects_any_aabb(*segment, (object(), hit))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="obstacles必须是_StaticAABB序列"):
+        _segment_intersects_any_aabb(*segment, "not-obstacles")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="start_xy"):
+        _segment_intersects_any_aabb((True, 0.5), segment[1], ())
+
+
+def test_segment_intersects_any_aabb_rejects_invalid_member_after_hit() -> None:
+    segment = ((-1.0, 0.5), (2.0, 0.5))
+    hit = _StaticAABB(0.0, 0.0, 1.0, 1.0)
+
+    with pytest.raises(ValueError, match="obstacles必须是_StaticAABB序列"):
+        _segment_intersects_any_aabb(*segment, (hit, object()))  # type: ignore[arg-type]
+
+
+@pytest.fixture
+def official_inflated_static_obstacles() -> tuple[_StaticAABB, ...]:
+    inflation = 0.5154080786132004
+    raw_obstacles = (
+        _StaticAABB(-2.96, -0.40, -2.90, 2.90),
+        _StaticAABB(0.40, -0.40, 0.46, 2.90),
+        _StaticAABB(-2.93, -0.43, 0.43, -0.37),
+        _StaticAABB(-2.93, 2.87, 0.43, 2.93),
+        _StaticAABB(-2.875, 0.370, -2.465, 1.186),
+        _StaticAABB(-1.370, 1.915, 0.290, 2.715),
+    )
+    return tuple(_inflate_aabb(bounds, inflation) for bounds in raw_obstacles)
+
+
+def test_official_static_aabb_fixture_rejects_known_invalid_stands(
+    official_inflated_static_obstacles: tuple[_StaticAABB, ...],
+) -> None:
+    obstacles = official_inflated_static_obstacles
+
+    assert not any(
+        _point_intersects_aabb((-0.70, 0.55), bounds) for bounds in obstacles
+    )
+    for stand in (
+        (-0.8926687370800100, 1.6096780539400557),
+        (-0.3603468208092485, 1.6277456647398847),
+        (-0.5946292898982682, 1.7024921417376913),
+        (-2.0341434247175547, 0.7076086532826956),
+    ):
+        assert any(_point_intersects_aabb(stand, bounds) for bounds in obstacles)
+
+
+def test_official_static_aabb_fixture_checks_segments_across_all_obstacles(
+    official_inflated_static_obstacles: tuple[_StaticAABB, ...],
+) -> None:
+    start = (-0.70, 0.55)
+
+    assert not _segment_intersects_any_aabb(
+        start, (-0.80, 0.55), official_inflated_static_obstacles
+    )
+    assert _segment_intersects_any_aabb(
+        start,
+        (-2.0341434247175547, 0.7076086532826956),
+        official_inflated_static_obstacles,
+    )
 
 
 @pytest.mark.parametrize(
