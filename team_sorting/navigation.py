@@ -170,6 +170,48 @@ def distance_xy(first_xyz: tuple[float, ...], second_xyz: tuple[float, ...]) -> 
     return _finite_real(math.hypot(delta_x, delta_y), "XY距离")
 
 
+def _stand_pose_from_direction(
+    target_xy: object,
+    direction_xy: object,
+    standoff_m: object,
+) -> tuple[float, float, float]:
+    """由已确认的站位到目标方向计算平面站位，不解析任何业务方向语义。"""
+
+    target_x, target_y = _read_xy(target_xy, "target_xy")
+    direction_x, direction_y = _read_xy(direction_xy, "direction_xy")
+    try:
+        if len(target_xy) != 2 or len(direction_xy) != 2:  # type: ignore[arg-type]
+            raise ValueError("target_xy和direction_xy必须严格包含XY两项")
+    except TypeError as exc:
+        raise ValueError("target_xy和direction_xy必须严格包含XY两项") from exc
+    direction_norm = _finite_real(
+        math.hypot(direction_x, direction_y), "direction_xy长度"
+    )
+    if direction_norm <= 1e-9:
+        raise ValueError("direction_xy长度过小，无法确定站位方向")
+    standoff = _finite_real(standoff_m, "standoff_m")
+    if standoff <= 0.0:
+        raise ValueError("standoff_m必须大于零")
+    unit_x = _finite_real(direction_x / direction_norm, "站位方向X分量")
+    unit_y = _finite_real(direction_y / direction_norm, "站位方向Y分量")
+    goal_x = _finite_real(target_x - standoff * unit_x, "站位X坐标")
+    goal_y = _finite_real(target_y - standoff * unit_y, "站位Y坐标")
+    facing_x = _finite_real(target_x - goal_x, "目标朝向X分量")
+    facing_y = _finite_real(target_y - goal_y, "目标朝向Y分量")
+    actual_distance = _finite_real(
+        math.hypot(facing_x, facing_y), "实际站位退让距离"
+    )
+    if actual_distance <= 1e-9 or not math.isclose(
+        actual_distance,
+        standoff,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
+        raise ValueError("请求站位在当前浮点精度下无法表示")
+    goal_yaw = wrap_to_pi(math.atan2(facing_y, facing_x))
+    return goal_x, goal_y, goal_yaw
+
+
 @dataclass(frozen=True)
 class Bounds3D:
     """用于粗粒度槽位分类的轴对齐三维区域。
@@ -743,18 +785,9 @@ class NavigationController:
         distance = _finite_real(math.hypot(dx, dy), "目标与底盘距离")
         if distance <= 1e-9:
             raise ValueError("底盘与目标中心重合，无法确定安全退让方向")
-        offset_x = _finite_real(
-            self._config.standoff_m * dx / distance, "站位X退让量"
+        return _stand_pose_from_direction(
+            (target_x, target_y), (dx, dy), self._config.standoff_m
         )
-        offset_y = _finite_real(
-            self._config.standoff_m * dy / distance, "站位Y退让量"
-        )
-        goal_x = _finite_real(target_x - offset_x, "站位X坐标")
-        goal_y = _finite_real(target_y - offset_y, "站位Y坐标")
-        facing_x = _finite_real(target_x - goal_x, "目标朝向X分量")
-        facing_y = _finite_real(target_y - goal_y, "目标朝向Y分量")
-        goal_yaw = _finite_real(math.atan2(facing_y, facing_x), "站位yaw")
-        return goal_x, goal_y, goal_yaw
 
     @staticmethod
     def _finite_vector(values: tuple[float, ...], field_name: str) -> None:

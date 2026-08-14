@@ -61,6 +61,7 @@ from team_sorting.navigation import (
     Bounds3D,
     NavigationConfig,
     NavigationController,
+    _stand_pose_from_direction,
     classify_slot_type,
     distance_xy,
     wrap_to_pi,
@@ -620,6 +621,158 @@ def test_navigation_pick_goal_stands_off_and_faces_object() -> None:
             target.position_xyz[0] - goal.pose_xyyaw[0],
         )
     )
+
+
+def test_stand_pose_wraps_negative_x_to_minus_pi() -> None:
+    controller = NavigationController()
+    target = ObjectEstimate3D(
+        "pink", (-2.0, 0.0, 0.8), 0.9, "odom", 1_000_000_000
+    )
+
+    goal = controller.build_pick_goal(
+        _nav_task(), target, _nav_base(), 1_000_000_000
+    )
+
+    assert goal.pose_xyyaw[2] == -math.pi
+    assert -math.pi <= goal.pose_xyyaw[2] < math.pi
+
+
+def test_stand_pose_normalizes_direction_and_preserves_standoff() -> None:
+    target = (2.0, -3.0)
+    first = _stand_pose_from_direction(target, (3.0, 4.0), 0.6)
+    scaled = _stand_pose_from_direction(target, (30.0, 40.0), 0.6)
+
+    assert first == pytest.approx(scaled)
+    assert distance_xy(first, target) == pytest.approx(0.6)
+    assert first[2] == pytest.approx(
+        wrap_to_pi(math.atan2(target[1] - first[1], target[0] - first[0]))
+    )
+
+
+def test_stand_pose_yaw_uses_actual_represented_facing_vector() -> None:
+    target = (1000.1, -999.7)
+    direction = (2.0, 3.0)
+    goal_x, goal_y, yaw = _stand_pose_from_direction(target, direction, 0.6)
+    actual_dx = target[0] - goal_x
+    actual_dy = target[1] - goal_y
+    expected_actual_yaw = wrap_to_pi(math.atan2(actual_dy, actual_dx))
+    direct_input_yaw = wrap_to_pi(math.atan2(direction[1], direction[0]))
+
+    assert expected_actual_yaw != direct_input_yaw
+    assert yaw == expected_actual_yaw
+    assert -math.pi <= yaw < math.pi
+    assert math.isclose(
+        math.hypot(actual_dx, actual_dy), 0.6, rel_tol=0.0, abs_tol=1e-12
+    )
+
+
+def test_stand_pose_rejects_unrepresentable_standoff_from_complete_cancellation() -> None:
+    with pytest.raises(ValueError, match="浮点精度|无法表示"):
+        _stand_pose_from_direction((1e308, 0.0), (1.0, 0.0), 0.6)
+
+
+def test_stand_pose_rejects_unrepresentable_standoff_from_partial_precision_loss() -> None:
+    with pytest.raises(ValueError, match="浮点精度|无法表示"):
+        _stand_pose_from_direction((1e12, 0.0), (1.0, 0.0), 0.6)
+
+
+def test_stand_pose_accepts_representable_standoff_at_large_coordinate() -> None:
+    goal = _stand_pose_from_direction((1e12, 0.0), (1.0, 0.0), 0.5)
+
+    assert goal == (1e12 - 0.5, 0.0, 0.0)
+    assert distance_xy(goal, (1e12, 0.0)) == 0.5
+
+
+@pytest.mark.parametrize("direction", [(0.0, 0.0), (1e-9, 0.0), (0.0, -1e-10)])
+def test_stand_pose_rejects_zero_and_tiny_direction(
+    direction: tuple[float, float],
+) -> None:
+    with pytest.raises(ValueError, match="方向|direction"):
+        _stand_pose_from_direction((0.0, 0.0), direction, 0.6)
+
+
+@pytest.mark.parametrize(
+    "direction",
+    [
+        (math.nan, 0.0),
+        (math.inf, 0.0),
+        (-math.inf, 0.0),
+        (True, 0.0),
+        None,
+        (1.0,),
+        (1.0, 2.0, 3.0),
+        "12",
+    ],
+)
+def test_stand_pose_rejects_invalid_direction(direction: object) -> None:
+    with pytest.raises(ValueError):
+        _stand_pose_from_direction((0.0, 0.0), direction, 0.6)
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        (math.nan, 0.0),
+        (math.inf, 0.0),
+        (True, 0.0),
+        None,
+        (1.0,),
+        (1.0, 2.0, 3.0),
+        "12",
+    ],
+)
+def test_stand_pose_rejects_invalid_target(target: object) -> None:
+    with pytest.raises(ValueError):
+        _stand_pose_from_direction(target, (1.0, 0.0), 0.6)
+
+
+@pytest.mark.parametrize("standoff", [math.nan, math.inf, -math.inf, True, 0.0, -0.1])
+def test_stand_pose_rejects_invalid_standoff(standoff: object) -> None:
+    with pytest.raises(ValueError, match="standoff_m"):
+        _stand_pose_from_direction((0.0, 0.0), (1.0, 0.0), standoff)
+
+
+@pytest.mark.parametrize(
+    "direction",
+    [
+        (1.0, 0.0),
+        (1.0, 1.0),
+        (0.0, 1.0),
+        (-1.0, 1.0),
+        (-1.0, 0.0),
+        (-1.0, -1.0),
+        (0.0, -1.0),
+        (1.0, -1.0),
+    ],
+)
+def test_stand_pose_yaw_is_strictly_wrapped_for_axes_and_quadrants(
+    direction: tuple[float, float],
+) -> None:
+    goal = _stand_pose_from_direction((0.0, 0.0), direction, 0.6)
+    assert -math.pi <= goal[2] < math.pi
+    assert goal[2] == pytest.approx(wrap_to_pi(math.atan2(direction[1], direction[0])))
+
+
+def test_pick_and_place_keep_entry_base_direction_and_nav_goal_contract() -> None:
+    controller = NavigationController()
+    base = _nav_base(x=1.0, y=1.0)
+    task = _nav_task(place=(2.0, 0.0, 0.5))
+    target = ObjectEstimate3D(
+        "pink", (2.0, 0.0, 0.8), 0.9, "odom", 1_000_000_000
+    )
+
+    pick = controller.build_pick_goal(task, target, base, 1_000_000_000)
+    place = controller.build_place_goal(task, base, 1_000_000_000)
+    expected = _stand_pose_from_direction((2.0, 0.0), (1.0, -1.0), 0.6)
+
+    assert pick.pose_xyyaw == pytest.approx(expected)
+    assert place.pose_xyyaw == pytest.approx(expected)
+    assert (pick.goal_type, pick.frame_id) == ("pick", "odom")
+    assert (place.goal_type, place.frame_id) == ("place", "odom")
+    for goal in (pick, place):
+        assert goal.position_tolerance == 0.05
+        assert goal.yaw_tolerance == 0.10
+        assert goal.deadline_ns == 31_000_000_000
 
 
 def test_navigation_pick_goal_rejects_mismatched_class_and_coincident_base() -> None:
