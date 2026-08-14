@@ -28,6 +28,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import fields, replace
 from pathlib import Path
 import sys
+import time
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -64,6 +65,7 @@ from team_sorting.navigation import (
     NavigationController,
     _StaticAABB,
     _inflate_aabb,
+    _plan_static_aabb_route,
     _point_intersects_aabb,
     _segment_intersects_aabb,
     _segment_intersects_any_aabb,
@@ -801,6 +803,307 @@ def test_segment_intersects_any_aabb_rejects_invalid_member_after_hit() -> None:
         _segment_intersects_any_aabb(*segment, (hit, object()))  # type: ignore[arg-type]
 
 
+def test_plan_static_aabb_route_returns_goal_for_empty_direct_route() -> None:
+    assert _plan_static_aabb_route((0.0, 0.0), (1.0, 1.0), (), 0.1, 0) == (
+        (1.0, 1.0),
+    )
+
+
+def test_plan_static_aabb_route_keeps_safe_direct_and_equal_goal_routes_minimal() -> None:
+    obstacle = _StaticAABB(3.0, 3.0, 4.0, 4.0)
+
+    assert _plan_static_aabb_route((0.0, 0.0), (1.0, 1.0), (obstacle,), 0.1, 3) == (
+        (1.0, 1.0),
+    )
+    assert _plan_static_aabb_route((0.5, 0.5), (0.5, 0.5), (), 0.1, 0) == (
+        (0.5, 0.5),
+    )
+    occupied = (_StaticAABB(0.0, 0.0, 1.0, 1.0),)
+    assert _plan_static_aabb_route((0.5, 0.5), (0.5, 0.5), occupied, 0.1, 2) is None
+
+
+def test_plan_static_aabb_route_selects_safe_lexicographic_shortest_detour() -> None:
+    start = (-1.0, 0.5)
+    goal = (2.0, 0.5)
+    obstacles = (_StaticAABB(0.0, 0.0, 1.0, 1.0),)
+
+    route = _plan_static_aabb_route(start, goal, obstacles, 0.1, 2)
+
+    assert route == ((-0.1, -0.1), (1.1, -0.1), goal)
+    assert route[-1] == goal
+    assert len(route[:-1]) == 2
+    assert all(
+        not _point_intersects_aabb(waypoint, obstacles[0])
+        for waypoint in route[:-1]
+    )
+    previous = start
+    for point in route:
+        assert not _segment_intersects_any_aabb(previous, point, obstacles)
+        previous = point
+
+
+def test_plan_static_aabb_route_is_repeatable_and_obstacle_order_independent() -> None:
+    start = (-2.0, 0.0)
+    goal = (4.0, 0.0)
+    obstacles = (
+        _StaticAABB(0.0, -1.0, 1.0, 1.0),
+        _StaticAABB(2.0, -2.0, 3.0, 0.5),
+    )
+
+    expected = _plan_static_aabb_route(start, goal, obstacles, 0.1, 2)
+
+    assert expected is not None
+    assert len(expected[:-1]) == 2
+    assert _plan_static_aabb_route(start, goal, obstacles, 0.1, 2) == expected
+    assert _plan_static_aabb_route(start, goal, tuple(reversed(obstacles)), 0.1, 2) == expected
+    assert _plan_static_aabb_route(start, goal, (*obstacles, obstacles[0]), 0.1, 2) == expected
+
+
+def test_plan_static_aabb_route_large_valid_graph_is_bounded_and_deterministic() -> None:
+    start = (-2.0, 0.0)
+    goal = (2.0, 0.0)
+    obstacles = (_StaticAABB(0.0, -0.5, 0.5, 0.5),) + tuple(
+        _StaticAABB(10.0 * index, 10.0, 10.0 * index + 1.0, 11.0)
+        for index in range(1, 8)
+    )
+
+    started = time.monotonic()
+    route = _plan_static_aabb_route(start, goal, obstacles, 0.1, 24)
+    elapsed_s = time.monotonic() - started
+
+    assert elapsed_s < 2.0
+    assert route is not None
+    assert route[-1] == goal
+    assert len(route[:-1]) <= 24
+    assert len(route) == len(tuple(dict.fromkeys(route)))
+    previous = start
+    for point in route:
+        assert not _segment_intersects_any_aabb(previous, point, obstacles)
+        previous = point
+    assert _plan_static_aabb_route(start, goal, obstacles, 0.1, 24) == route
+    assert _plan_static_aabb_route(start, goal, tuple(reversed(obstacles)), 0.1, 24) == route
+
+
+def test_plan_static_aabb_route_caps_mathematical_limit_at_candidate_count() -> None:
+    start = (-2.0, 0.0)
+    goal = (2.0, 0.0)
+    obstacles = (_StaticAABB(0.0, -0.5, 0.5, 0.5),) + tuple(
+        _StaticAABB(10.0 * index, 10.0, 10.0 * index + 1.0, 11.0)
+        for index in range(1, 8)
+    )
+    candidate_count = 4 * len(obstacles)
+
+    assert _plan_static_aabb_route(start, goal, obstacles, 0.1, 1000) == (
+        _plan_static_aabb_route(start, goal, obstacles, 0.1, candidate_count)
+    )
+
+
+def test_plan_static_aabb_route_enforces_intermediate_waypoint_limit() -> None:
+    start = (-1.0, 0.5)
+    goal = (2.0, 0.5)
+    obstacles = (_StaticAABB(0.0, 0.0, 1.0, 1.0),)
+
+    assert _plan_static_aabb_route(start, goal, obstacles, 0.1, 0) is None
+    assert _plan_static_aabb_route(start, goal, obstacles, 0.1, 1) is None
+    assert _plan_static_aabb_route(start, goal, obstacles, 0.1, 2) is not None
+    assert _plan_static_aabb_route(start, (-0.5, 0.5), obstacles, 0.1, 0) == (
+        (-0.5, 0.5),
+    )
+
+
+@pytest.mark.parametrize("limit", [True, False, -1, 1.0, "1", None, np.int64(1)])
+def test_plan_static_aabb_route_rejects_invalid_waypoint_limit(limit: object) -> None:
+    with pytest.raises(ValueError, match="max_intermediate_waypoints"):
+        _plan_static_aabb_route((0.0, 0.0), (1.0, 1.0), (), 0.1, limit)
+
+
+@pytest.mark.parametrize(
+    "margin",
+    [0, -0.1, True, False, math.nan, math.inf, -math.inf, "0.1", None, np.float64(0.1)],
+)
+def test_plan_static_aabb_route_rejects_invalid_margin(margin: object) -> None:
+    with pytest.raises(ValueError, match="waypoint_margin_m"):
+        _plan_static_aabb_route((0.0, 0.0), (1.0, 1.0), (), margin, 0)
+
+
+@pytest.mark.parametrize(
+    ("bounds", "margin"),
+    [
+        (_StaticAABB(-1.0, -1.0, 1.0, 1.0), 5e-324),
+        (_StaticAABB(-1.0e308, -1.0, 1.0, 1.0), 1.0),
+        (_StaticAABB(-1.0e308, -1.0, 1.0e308, 1.0), 1.0e308),
+    ],
+)
+def test_plan_static_aabb_route_rejects_unrepresentable_candidates(
+    bounds: _StaticAABB, margin: float
+) -> None:
+    with pytest.raises(ValueError, match="当前浮点精度"):
+        _plan_static_aabb_route((0.0, 10.0), (1.0, 10.0), (bounds,), margin, 0)
+
+
+def test_plan_static_aabb_route_accepts_representable_large_candidates() -> None:
+    obstacle = _StaticAABB(1.0e12, 100.0, 1.0e12 + 0.5, 101.0)
+
+    assert _plan_static_aabb_route((0.0, 0.0), (1.0, 0.0), (obstacle,), 0.5, 0) == (
+        (1.0, 0.0),
+    )
+
+
+@pytest.mark.parametrize(
+    "obstacles",
+    [
+        [],
+        set(),
+        {},
+        (item for item in ()),
+        "",
+        tuple(),
+    ],
+)
+def test_plan_static_aabb_route_requires_builtin_obstacle_tuple(
+    obstacles: object,
+) -> None:
+    if type(obstacles) is tuple:
+        class _TupleSubclass(tuple):
+            pass
+
+        obstacles = _TupleSubclass(obstacles)
+    with pytest.raises(ValueError, match="obstacles"):
+        _plan_static_aabb_route((0.0, 0.0), (1.0, 1.0), obstacles, 0.1, 0)
+
+
+def test_plan_static_aabb_route_prevalidates_every_obstacle_and_input_in_order() -> None:
+    hit = _StaticAABB(0.0, 0.0, 1.0, 1.0)
+    with pytest.raises(ValueError, match="start_xy"):
+        _plan_static_aabb_route((True, 0.0), (math.nan, 0.0), (object(),), 0.0, -1)
+    with pytest.raises(ValueError, match="goal_xy"):
+        _plan_static_aabb_route((0.0, 0.0), (math.nan, 0.0), (object(),), 0.0, -1)
+    with pytest.raises(ValueError, match="obstacles成员"):
+        _plan_static_aabb_route((-1.0, 0.5), (2.0, 0.5), (hit, object()), 0.1, 2)
+    with pytest.raises(ValueError, match="obstacles成员"):
+        _plan_static_aabb_route((-1.0, 0.5), (2.0, 0.5), (object(), hit), 0.1, 2)
+    with pytest.raises(ValueError, match="waypoint_margin_m"):
+        _plan_static_aabb_route((0.0, 0.0), (1.0, 1.0), (), 0.0, -1)
+    with pytest.raises(ValueError, match="max_intermediate_waypoints"):
+        _plan_static_aabb_route((0.0, 0.0), (1.0, 1.0), (), 0.1, -1)
+
+
+@pytest.mark.parametrize(
+    ("start", "goal"),
+    [
+        ((math.nan, 0.0), (1.0, 1.0)),
+        ((0.0, 0.0), (math.inf, 1.0)),
+        ({0: 0.0, 1: 0.0}, (1.0, 1.0)),
+        ((0.0, 0.0), [1.0]),
+    ],
+)
+def test_plan_static_aabb_route_rejects_invalid_xy_inputs(
+    start: object, goal: object
+) -> None:
+    with pytest.raises(ValueError):
+        _plan_static_aabb_route(start, goal, (), 0.1, 0)
+
+
+def test_plan_static_aabb_route_rejects_occupied_start_or_goal_without_moving_them() -> None:
+    obstacle = (_StaticAABB(0.0, 0.0, 1.0, 1.0),)
+    outside = (-1.0, 0.5)
+    for occupied in ((0.5, 0.5), (0.0, 0.5), (1.0, 1.0)):
+        assert _plan_static_aabb_route(occupied, outside, obstacle, 0.1, 3) is None
+        assert _plan_static_aabb_route(outside, occupied, obstacle, 0.1, 3) is None
+
+
+def test_plan_static_aabb_route_rejects_corner_touch_edge_following_and_tangent() -> None:
+    obstacle = (_StaticAABB(0.0, 0.0, 1.0, 1.0),)
+
+    assert _plan_static_aabb_route((-1.0, -1.0), (0.0, 0.0), obstacle, 0.1, 0) is None
+    assert _plan_static_aabb_route((-1.0, 0.0), (2.0, 0.0), obstacle, 0.1, 0) is None
+    assert _plan_static_aabb_route((-1.0, 1.0), (2.0, 1.0), obstacle, 0.1, 0) is None
+    assert _plan_static_aabb_route((-1.0, -0.1), (2.0, -0.1), obstacle, 0.1, 0) == (
+        (2.0, -0.1),
+    )
+
+
+def test_plan_static_aabb_route_returns_none_for_closed_static_enclosure() -> None:
+    obstacles = (
+        _StaticAABB(-2.0, -2.0, -1.0, 2.0),
+        _StaticAABB(1.0, -2.0, 2.0, 2.0),
+        _StaticAABB(-1.0, -2.0, 1.0, -1.0),
+        _StaticAABB(-1.0, 1.0, 1.0, 2.0),
+    )
+
+    assert _plan_static_aabb_route((0.0, 0.0), (3.0, 0.0), obstacles, 0.1, 8) is None
+
+
+@pytest.mark.parametrize(
+    ("start", "goal"),
+    [
+        ((-1.0e308, 0.0), (1.0e308, 0.0)),
+        ((0.0, 0.0), (1.3e308, 1.3e308)),
+    ],
+)
+def test_plan_static_aabb_route_rejects_unrepresentable_route_distance(
+    start: tuple[float, float], goal: tuple[float, float]
+) -> None:
+    with pytest.raises(ValueError, match="当前浮点精度"):
+        _plan_static_aabb_route(start, goal, (), 0.1, 0)
+
+
+def test_plan_static_aabb_route_rejects_unrepresentable_accumulated_length() -> None:
+    obstacle = (_StaticAABB(-1.0, -8.0e307, 1.0, 8.0e307),)
+
+    with pytest.raises(ValueError, match="路线.*(无法表示|严格累计)"):
+        _plan_static_aabb_route(
+            (-8.0e307, 0.0),
+            (8.0e307, 0.0),
+            obstacle,
+            1.0e292,
+            2,
+        )
+
+
+@pytest.mark.parametrize("waypoint_limit", [2, 4])
+def test_plan_static_aabb_route_rejects_positive_length_accumulation_cancellation(
+    waypoint_limit: int,
+) -> None:
+    obstacles = (_StaticAABB(0.0, -0.01, 0.01, 0.01),)
+
+    with pytest.raises(ValueError, match="路线.*当前浮点精度.*累计"):
+        _plan_static_aabb_route(
+            (-1.0e16, 0.0),
+            (1.0, 0.0),
+            obstacles,
+            0.01,
+            waypoint_limit,
+        )
+
+
+def test_plan_static_aabb_route_normal_detour_has_strictly_increasing_length() -> None:
+    start = (-1.0, 0.5)
+    obstacles = (_StaticAABB(0.0, 0.0, 1.0, 1.0),)
+    route = _plan_static_aabb_route(start, (2.0, 0.5), obstacles, 0.1, 2)
+
+    assert route is not None
+    total = 0.0
+    previous = start
+    for point in route:
+        segment_length = math.hypot(point[0] - previous[0], point[1] - previous[1])
+        updated_total = total + segment_length
+        assert segment_length > 0.0
+        assert updated_total > total
+        total = updated_total
+        previous = point
+
+
+def test_plan_static_aabb_route_does_not_modify_input_tuples() -> None:
+    start = (-1.0, 0.5)
+    goal = (2.0, 0.5)
+    obstacles = (_StaticAABB(0.0, 0.0, 1.0, 1.0),)
+    snapshot = (start, goal, obstacles)
+
+    assert _plan_static_aabb_route(start, goal, obstacles, 0.1, 2) is not None
+    assert (start, goal, obstacles) == snapshot
+
+
 @pytest.fixture
 def official_inflated_static_obstacles() -> tuple[_StaticAABB, ...]:
     inflation = 0.5154080786132004
@@ -813,6 +1116,9 @@ def official_inflated_static_obstacles() -> tuple[_StaticAABB, ...]:
         _StaticAABB(-1.370, 1.915, 0.290, 2.715),
     )
     return tuple(_inflate_aabb(bounds, inflation) for bounds in raw_obstacles)
+
+
+TEST_ONLY_WAYPOINT_MARGIN_M = 0.01
 
 
 def test_official_static_aabb_fixture_rejects_known_invalid_stands(
@@ -845,6 +1151,48 @@ def test_official_static_aabb_fixture_checks_segments_across_all_obstacles(
         (-2.0341434247175547, 0.7076086532826956),
         official_inflated_static_obstacles,
     )
+
+
+def test_official_static_route_fixture_keeps_return_route_and_rejects_invalid_goals(
+    official_inflated_static_obstacles: tuple[_StaticAABB, ...],
+) -> None:
+    start = (-0.70, 0.55)
+
+    assert _plan_static_aabb_route(
+        start,
+        (-0.80, 0.55),
+        official_inflated_static_obstacles,
+        TEST_ONLY_WAYPOINT_MARGIN_M,
+        0,
+    ) == ((-0.80, 0.55),)
+    for invalid_goal in (
+        (-0.8926687370800100, 1.6096780539400557),
+        (-0.3603468208092485, 1.6277456647398847),
+        (-0.5946292898982682, 1.7024921417376913),
+        (-2.0341434247175547, 0.7076086532826956),
+    ):
+        assert (
+            _plan_static_aabb_route(
+                start,
+                invalid_goal,
+                official_inflated_static_obstacles,
+                TEST_ONLY_WAYPOINT_MARGIN_M,
+                8,
+            )
+            is None
+        )
+
+
+def test_official_static_route_fixture_records_narrow_gap_without_traversability_claim(
+    official_inflated_static_obstacles: tuple[_StaticAABB, ...],
+) -> None:
+    west_wall, east_wall, south_wall, north_wall, shelf, table = (
+        official_inflated_static_obstacles
+    )
+    del west_wall, east_wall, south_wall, north_wall
+
+    assert len(official_inflated_static_obstacles) == 6
+    assert table.min_x - shelf.max_x == pytest.approx(0.0641838427735992)
 
 
 @pytest.mark.parametrize(

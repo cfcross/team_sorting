@@ -216,6 +216,193 @@ def _segment_intersects_any_aabb(
     )
 
 
+def _plan_static_aabb_route(
+    start_xy: object,
+    goal_xy: object,
+    obstacles: object,
+    waypoint_margin_m: object,
+    max_intermediate_waypoints: object,
+) -> tuple[tuple[float, float], ...] | None:
+    """在已膨胀静态AABB间选择确定性的最短折线路线。"""
+
+    start = _strict_xy(start_xy, "start_xy")
+    goal = _strict_xy(goal_xy, "goal_xy")
+    if type(obstacles) is not tuple:
+        raise ValueError("obstacles必须是内建tuple")
+    if any(not isinstance(bounds, _StaticAABB) for bounds in obstacles):
+        raise ValueError("obstacles成员必须是_StaticAABB")
+    obstacles = tuple(
+        sorted(
+            obstacles,
+            key=lambda bounds: (
+                bounds.min_x,
+                bounds.min_y,
+                bounds.max_x,
+                bounds.max_y,
+            ),
+        )
+    )
+    margin = _strict_finite_float(waypoint_margin_m, "waypoint_margin_m")
+    if margin <= 0.0:
+        raise ValueError("waypoint_margin_m必须严格大于0")
+    if type(max_intermediate_waypoints) is not int:
+        raise ValueError("max_intermediate_waypoints必须是非负内建int")
+    if max_intermediate_waypoints < 0:
+        raise ValueError("max_intermediate_waypoints必须是非负内建int")
+    waypoint_limit = max_intermediate_waypoints
+
+    raw_candidates: list[tuple[float, float]] = []
+    for bounds in obstacles:
+        min_x = bounds.min_x - margin
+        min_y = bounds.min_y - margin
+        max_x = bounds.max_x + margin
+        max_y = bounds.max_y + margin
+        if not all(math.isfinite(value) for value in (min_x, min_y, max_x, max_y)):
+            raise ValueError("waypoint候选在当前浮点精度下无法表示")
+        if not (
+            min_x < bounds.min_x
+            and min_y < bounds.min_y
+            and max_x > bounds.max_x
+            and max_y > bounds.max_y
+        ):
+            raise ValueError("waypoint margin在当前浮点精度下无法真实外移")
+        raw_candidates.extend(
+            (
+                (min_x, min_y),
+                (min_x, max_y),
+                (max_x, min_y),
+                (max_x, max_y),
+            )
+        )
+
+    ordered_candidates = sorted(raw_candidates)
+    candidates: list[tuple[float, float]] = []
+    for candidate in ordered_candidates:
+        if candidates and candidate == candidates[-1]:
+            continue
+        if candidate == start or candidate == goal:
+            continue
+        if any(_point_intersects_aabb(candidate, bounds) for bounds in obstacles):
+            continue
+        candidates.append(candidate)
+
+    if any(_point_intersects_aabb(start, bounds) for bounds in obstacles):
+        return None
+    if any(_point_intersects_aabb(goal, bounds) for bounds in obstacles):
+        return None
+
+    def _segment_length(
+        first: tuple[float, float], second: tuple[float, float]
+    ) -> float:
+        dx = second[0] - first[0]
+        dy = second[1] - first[1]
+        if not math.isfinite(dx) or not math.isfinite(dy):
+            raise ValueError("路线坐标差在当前浮点精度下无法表示")
+        length = math.hypot(dx, dy)
+        if not math.isfinite(length):
+            raise ValueError("路线段长度在当前浮点精度下无法表示")
+        return length
+
+    if start == goal:
+        if _segment_intersects_any_aabb(start, goal, obstacles):
+            raise ValueError("内部相同起终点与障碍物相交")
+        _segment_length(start, goal)
+        return (goal,)
+
+    nodes = (start, goal, *candidates)
+    adjacency: list[list[tuple[int, float]]] = [[] for _ in nodes]
+    for first_index in range(len(nodes)):
+        for second_index in range(first_index + 1, len(nodes)):
+            if _segment_intersects_any_aabb(
+                nodes[first_index], nodes[second_index], obstacles
+            ):
+                continue
+            length = _segment_length(nodes[first_index], nodes[second_index])
+            if length <= 0.0:
+                raise ValueError("不同节点路线段长度在当前浮点精度下无法可靠表示")
+            adjacency[first_index].append((second_index, length))
+            adjacency[second_index].append((first_index, length))
+    for neighbors in adjacency:
+        neighbors.sort(key=lambda item: nodes[item[0]])
+
+    def _validate_route(
+        route: tuple[tuple[float, float], ...]
+    ) -> tuple[tuple[float, float], ...]:
+        if not route or route[-1] != goal:
+            raise ValueError("内部路线未以goal结束")
+        intermediates = route[:-1]
+        if len(intermediates) > waypoint_limit:
+            raise ValueError("内部路线超过waypoint上限")
+        if any(point == start for point in intermediates):
+            raise ValueError("内部路线重复start")
+        if len(route) != len(tuple(dict.fromkeys(route))):
+            raise ValueError("内部路线包含重复点或环")
+        for point in route:
+            _strict_xy(point, "route_point")
+        for point in intermediates:
+            if any(_point_intersects_aabb(point, bounds) for bounds in obstacles):
+                raise ValueError("内部waypoint位于障碍物内")
+        if any(_point_intersects_aabb(goal, bounds) for bounds in obstacles):
+            raise ValueError("内部goal位于障碍物内")
+        total = 0.0
+        previous = start
+        for point in route:
+            if _segment_intersects_any_aabb(previous, point, obstacles):
+                raise ValueError("内部路线段与障碍物相交")
+            segment_length = _segment_length(previous, point)
+            if segment_length <= 0.0:
+                raise ValueError("返回路线段长度在当前浮点精度下无法可靠表示")
+            updated_total = total + segment_length
+            if not math.isfinite(updated_total) or updated_total <= total:
+                raise ValueError("正路线段长度在当前浮点精度下无法严格累计")
+            total = updated_total
+            previous = point
+        return route
+
+    if any(neighbor == 1 for neighbor, _length in adjacency[0]):
+        return _validate_route((goal,))
+    if waypoint_limit == 0:
+        return None
+
+    effective_limit = min(waypoint_limit, len(candidates))
+    best_key: tuple[float, tuple[tuple[float, float], ...]] | None = None
+    best_route: tuple[tuple[float, float], ...] | None = None
+
+    states: dict[int, tuple[float, tuple[tuple[float, float], ...]]] = {
+        0: (0.0, ())
+    }
+    for used_intermediate_count in range(effective_limit + 1):
+        next_states: dict[int, tuple[float, tuple[tuple[float, float], ...]]] = {}
+        for node_index, (prefix_length, intermediate_points) in states.items():
+            for neighbor_index, edge_length in adjacency[node_index]:
+                if neighbor_index == 0:
+                    continue
+                if edge_length <= 0.0:
+                    raise ValueError("路线图边长在当前浮点精度下无法可靠表示")
+                total_length = prefix_length + edge_length
+                if not math.isfinite(total_length) or total_length <= prefix_length:
+                    raise ValueError("正路线段长度在当前浮点精度下无法严格累计")
+                if neighbor_index == 1:
+                    key = (total_length, intermediate_points)
+                    if best_key is None or key < best_key:
+                        best_key = key
+                        best_route = (*intermediate_points, goal)
+                    continue
+                if used_intermediate_count >= effective_limit:
+                    continue
+                candidate_points = (*intermediate_points, nodes[neighbor_index])
+                candidate_key = (total_length, candidate_points)
+                existing = next_states.get(neighbor_index)
+                if existing is None or candidate_key < existing:
+                    next_states[neighbor_index] = candidate_key
+        states = next_states
+        if not states:
+            break
+    if best_route is None:
+        return None
+    return _validate_route(best_route)
+
+
 def _nonnegative_int(value: object, field_name: str) -> int:
     """校验纳秒时长等非负整数配置，拒绝 bool 和隐式浮点截断。"""
 
