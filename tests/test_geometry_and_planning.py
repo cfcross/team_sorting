@@ -64,6 +64,9 @@ from team_sorting.navigation import (
     NavigationConfig,
     NavigationController,
     _StaticAABB,
+    _StaticObstacle,
+    _StaticRouteConfig,
+    _StaticRouteNavigator,
     _inflate_aabb,
     _plan_static_aabb_route,
     _point_intersects_aabb,
@@ -1301,6 +1304,128 @@ def _unchecked_nav_goal(x: object, y: float, yaw: float) -> NavGoal:
     ):
         object.__setattr__(goal, name, value)
     return goal
+
+
+def _overlapping_waypoint_navigator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[_StaticRouteNavigator, NavGoal]:
+    """构造容差区重叠路线；官方fixture的固定间距无法覆盖该生命周期边界。"""
+
+    route = ((0.0, 0.0), (0.04, 0.0), (0.06, 0.0))
+    monkeypatch.setattr(
+        "team_sorting.navigation._plan_static_aabb_route",
+        lambda *_args: route,
+    )
+    navigator = _StaticRouteNavigator(
+        NavigationController(),
+        _StaticRouteConfig(
+            frame_id="odom",
+            inflation_radius_m=0.1,
+            waypoint_margin_m=0.01,
+            max_intermediate_waypoints=8,
+            static_obstacles=(
+                _StaticObstacle("far", _StaticAABB(10.0, 10.0, 11.0, 11.0)),
+            ),
+        ),
+    )
+    final_goal = NavGoal(
+        "overlap-final",
+        "pick",
+        (0.06, 0.0, 0.0),
+        "odom",
+        0.05,
+        0.1,
+        31_000_000_000,
+    )
+    navigator.plan_route(_nav_base(x=-1.0), final_goal, 1_000_000_000)
+    return navigator, final_goal
+
+
+def test_static_route_consumes_each_odom_timestamp_for_at_most_one_progress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    navigator, final_goal = _overlapping_waypoint_navigator(monkeypatch)
+    first_sample = _nav_base(x=0.02, stamp=1_000_000_000)
+
+    _, first = navigator.update(first_sample, navigator.current_goal, 1_000_000_000)
+    assert navigator.current_index == 1
+    assert navigator._last_progress_odom_timestamp_ns == 1_000_000_000
+    assert first.state == "moving" and not first.success
+    assert not navigator.waiting_for_new_odom
+
+    _, repeated = navigator.update(
+        first_sample, navigator.current_goal, 1_000_000_001
+    )
+    assert navigator.current_index == 1
+    assert navigator._last_progress_odom_timestamp_ns == 1_000_000_000
+    assert repeated.state == "moving" and not repeated.success
+    assert navigator.waiting_for_new_odom
+
+    newer_sample = replace(first_sample, timestamp_ns=1_000_000_001)
+    _, advanced = navigator.update(
+        newer_sample, navigator.current_goal, 1_000_000_001
+    )
+    assert navigator.current_index == 2
+    assert navigator.current_goal is final_goal
+    assert navigator._last_progress_odom_timestamp_ns == 1_000_000_001
+    assert advanced.state == "moving" and not advanced.success
+    assert not navigator.waiting_for_new_odom
+
+
+def test_static_route_repeated_odom_cannot_complete_final_goal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    navigator, final_goal = _overlapping_waypoint_navigator(monkeypatch)
+    sample = _nav_base(x=0.02, stamp=1_000_000_000)
+    navigator.update(sample, navigator.current_goal, 1_000_000_000)
+    sample = replace(sample, timestamp_ns=1_000_000_001)
+    navigator.update(sample, navigator.current_goal, 1_000_000_001)
+
+    _, repeated = navigator.update(sample, final_goal, 1_000_000_002)
+    assert navigator.current_index == 2
+    assert repeated.state == "moving" and not repeated.success
+
+    statuses = []
+    for timestamp_ns in (1_000_000_002, 1_000_000_003, 1_000_000_004):
+        fresh = _nav_base(x=0.06, stamp=timestamp_ns)
+        _, status = navigator.update(fresh, final_goal, timestamp_ns)
+        statuses.append(status)
+    assert [status.success for status in statuses] == [False, False, True]
+    assert navigator._last_progress_odom_timestamp_ns == 1_000_000_004
+
+
+def test_static_route_rejects_odom_older_than_consumed_progress_without_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    navigator, _ = _overlapping_waypoint_navigator(monkeypatch)
+    sample = _nav_base(x=0.02, stamp=1_000_000_000)
+    navigator.update(sample, navigator.current_goal, 1_000_000_000)
+
+    with pytest.raises(ValueError, match="Odom.*倒退"):
+        navigator.update(
+            replace(sample, timestamp_ns=999_999_999),
+            navigator.current_goal,
+            1_000_000_001,
+        )
+    assert navigator.current_index == 1
+    assert navigator._last_progress_odom_timestamp_ns == 1_000_000_000
+    assert not navigator.waiting_for_new_odom
+
+
+def test_static_route_reset_and_new_plan_clear_consumed_odom(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    navigator, final_goal = _overlapping_waypoint_navigator(monkeypatch)
+    sample = _nav_base(x=0.02, stamp=1_000_000_000)
+    navigator.update(sample, navigator.current_goal, 1_000_000_000)
+    assert navigator._last_progress_odom_timestamp_ns == 1_000_000_000
+
+    navigator.reset()
+    assert navigator._last_progress_odom_timestamp_ns is None
+    assert not navigator.waiting_for_new_odom
+    navigator.plan_route(_nav_base(x=-1.0), final_goal, 1_000_000_010)
+    assert navigator._last_progress_odom_timestamp_ns is None
+    assert not navigator.waiting_for_new_odom
 
 
 def test_navigation_pick_goal_stands_off_and_faces_object() -> None:

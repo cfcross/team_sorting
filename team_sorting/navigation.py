@@ -13,8 +13,8 @@
 Z 轴角速度 ``w``（rad/s），不是左右轮速。本模块不得复制官方轮速换算，也不负责
 YOLO、机械臂 IK、全局 FSM 判断或 ROS 发布。
 
-    当前实现包含基础站位生成和单周期比例控制；它不进行全局路径搜索、障碍物规划或
-    坐标变换。``NavigationStatus`` 必须根据实际 Odom 判断，不能用命令生成代替到达。
+当前实现包含基础站位、静态AABB安全路线和单周期比例控制；它不进行动态重规划、
+坐标变换或ROS发布。``NavigationStatus`` 必须根据实际 Odom 判断，不能用命令生成代替到达。
 """
 
 from __future__ import annotations
@@ -1139,3 +1139,353 @@ class NavigationController:
             ),
             NavigationStatus(goal_id, state, 0.0, 0.0, False, reason, timestamp_ns),
         )
+
+
+@dataclass(frozen=True)
+class _StaticObstacle:
+    """带稳定诊断名称的私有odom静态障碍物。"""
+
+    name: str
+    bounds: _StaticAABB
+
+    def __post_init__(self) -> None:
+        if type(self.name) is not str or not self.name.strip():
+            raise ValueError("静态障碍物name必须是非空字符串")
+        if not isinstance(self.bounds, _StaticAABB):
+            raise ValueError("静态障碍物bounds必须是_StaticAABB")
+        object.__setattr__(self, "name", self.name.strip())
+
+
+@dataclass(frozen=True)
+class _StaticRouteConfig:
+    """3.5静态路线的显式私有配置；输入障碍物尚未膨胀。"""
+
+    frame_id: str
+    inflation_radius_m: float
+    waypoint_margin_m: float
+    max_intermediate_waypoints: int
+    static_obstacles: tuple[_StaticObstacle, ...]
+
+    def __post_init__(self) -> None:
+        if self.frame_id != _ODOM_FRAME_ID or type(self.frame_id) is not str:
+            raise ValueError("静态路线frame_id必须精确为odom")
+        inflation = _strict_finite_float(
+            self.inflation_radius_m, "inflation_radius_m"
+        )
+        margin = _strict_finite_float(self.waypoint_margin_m, "waypoint_margin_m")
+        if inflation <= 0.0 or margin <= 0.0:
+            raise ValueError("inflation_radius_m和waypoint_margin_m必须严格大于0")
+        if (
+            type(self.max_intermediate_waypoints) is not int
+            or self.max_intermediate_waypoints < 0
+        ):
+            raise ValueError("max_intermediate_waypoints必须是非负内建int")
+        if type(self.static_obstacles) is not tuple or not self.static_obstacles:
+            raise ValueError("static_obstacles必须是非空内建tuple")
+        if any(not isinstance(item, _StaticObstacle) for item in self.static_obstacles):
+            raise ValueError("static_obstacles成员必须是_StaticObstacle")
+        names = tuple(item.name for item in self.static_obstacles)
+        if len(set(names)) != len(names):
+            raise ValueError("static_obstacles名称不得重复")
+        object.__setattr__(self, "inflation_radius_m", inflation)
+        object.__setattr__(self, "waypoint_margin_m", margin)
+
+    def inflated_obstacles(self) -> tuple[_StaticAABB, ...]:
+        return tuple(
+            _inflate_aabb(item.bounds, self.inflation_radius_m)
+            for item in self.static_obstacles
+        )
+
+
+@dataclass(frozen=True)
+class _StaticRoutePlan:
+    """不可变的分段路线；最终元素必须复用原始3.4 NavGoal对象。"""
+
+    final_goal_key: tuple[object, ...]
+    goals: tuple[NavGoal, ...]
+    route_points: tuple[tuple[float, float], ...]
+    generation: int
+
+
+class _StaticRouteNavigator:
+    """在单个NavigationController上增加私有静态路线和整路径共享预算。"""
+
+    def __init__(
+        self,
+        controller: NavigationController,
+        config: _StaticRouteConfig,
+    ) -> None:
+        if not isinstance(controller, NavigationController):
+            raise TypeError("controller必须是NavigationController")
+        if not isinstance(config, _StaticRouteConfig):
+            raise TypeError("config必须是_StaticRouteConfig")
+        self._controller = controller
+        self._config = config
+        self._generation = 0
+        self.reset()
+
+    @property
+    def plan(self) -> _StaticRoutePlan | None:
+        return self._plan
+
+    @property
+    def current_goal(self) -> NavGoal | None:
+        if self._plan is None:
+            return None
+        if not 0 <= self._current_index < len(self._plan.goals):
+            raise ValueError("静态路线waypoint索引非法")
+        return self._plan.goals[self._current_index]
+
+    @property
+    def current_index(self) -> int:
+        return self._current_index
+
+    @property
+    def final_goal(self) -> NavGoal | None:
+        return None if self._plan is None else self._plan.goals[-1]
+
+    @property
+    def diagnostic(self) -> str:
+        return self._diagnostic
+
+    @property
+    def waiting_for_new_odom(self) -> bool:
+        return self._waiting_for_new_odom
+
+    @property
+    def progressed_this_update(self) -> bool:
+        return self._progressed_this_update
+
+    def build_pick_goal(
+        self,
+        task: TaskSpec,
+        target: ObjectEstimate3D,
+        base: BaseState,
+        timestamp_ns: int,
+    ) -> NavGoal:
+        return self._controller.build_pick_goal(task, target, base, timestamp_ns)
+
+    def build_place_goal(
+        self, task: TaskSpec, base: BaseState, timestamp_ns: int
+    ) -> NavGoal:
+        return self._controller.build_place_goal(task, base, timestamp_ns)
+
+    def build_return_goal(self, base: BaseState, timestamp_ns: int) -> NavGoal:
+        return self._controller.build_return_goal(base, timestamp_ns)
+
+    @staticmethod
+    def _goal_key(goal: NavGoal) -> tuple[object, ...]:
+        return (
+            goal.goal_id,
+            goal.goal_type,
+            goal.pose_xyyaw,
+            goal.frame_id,
+            goal.position_tolerance,
+            goal.yaw_tolerance,
+            goal.deadline_ns,
+            goal.valid,
+            goal.failure_reason,
+        )
+
+    def reset(self) -> None:
+        self._controller.reset()
+        self._plan: _StaticRoutePlan | None = None
+        self._current_index = 0
+        self._last_progress_odom_timestamp_ns: int | None = None
+        self._waiting_for_new_odom = False
+        self._progressed_this_update = False
+        self._path_elapsed_ns = 0
+        self._path_checkpoint_ns: int | None = None
+        self._control_granted_since_checkpoint = False
+        self._path_terminal = False
+        self._diagnostic = ""
+
+    def _advance_path_clock(self, timestamp_ns: int) -> None:
+        now = NavigationController._timestamp(timestamp_ns, "timestamp_ns")
+        checkpoint = self._path_checkpoint_ns
+        if checkpoint is None:
+            self._path_checkpoint_ns = now
+            return
+        if now < checkpoint:
+            self._control_granted_since_checkpoint = False
+            raise ValueError("整路径控制权回报时间不得倒退")
+        if self._control_granted_since_checkpoint and not self._path_terminal:
+            self._path_elapsed_ns += now - checkpoint
+        self._path_checkpoint_ns = now
+
+    def record_control_result(self, timestamp_ns: int, control_granted: bool) -> None:
+        if type(control_granted) is not bool:
+            self._control_granted_since_checkpoint = False
+            raise ValueError("control_granted必须是严格bool")
+        self._advance_path_clock(timestamp_ns)
+        self._control_granted_since_checkpoint = bool(
+            control_granted and self._plan is not None and not self._path_terminal
+        )
+        self._controller.record_control_result(timestamp_ns, control_granted)
+
+    def _revoke_control_without_timestamp(self) -> None:
+        self._control_granted_since_checkpoint = False
+        self._controller._revoke_control_without_timestamp()
+
+    def _odom_can_advance_route(self, base: BaseState) -> bool:
+        """一个Odom反馈身份最多允许一次路线进度变化。"""
+
+        odom_timestamp_ns = NavigationController._timestamp(
+            base.timestamp_ns, "base.timestamp_ns"
+        )
+        consumed = self._last_progress_odom_timestamp_ns
+        if consumed is None:
+            return True
+        if odom_timestamp_ns < consumed:
+            raise ValueError("路线进度Odom.timestamp_ns相对已消费反馈倒退")
+        return odom_timestamp_ns > consumed
+
+    def plan_route(
+        self, base: BaseState, final_goal: NavGoal, timestamp_ns: int
+    ) -> _StaticRoutePlan:
+        now = NavigationController._timestamp(timestamp_ns, "timestamp_ns")
+        self._controller._validate_base(base, now, require_fresh=True)
+        if base.frame_id != self._config.frame_id:
+            raise ValueError("静态路线起点必须是odom BaseState")
+        if not isinstance(final_goal, NavGoal) or not final_goal.valid:
+            raise ValueError("静态路线最终NavGoal无效")
+        if final_goal.frame_id != self._config.frame_id:
+            raise ValueError("静态路线最终NavGoal必须位于odom")
+        if len(final_goal.pose_xyyaw) != 3:
+            raise ValueError("静态路线最终NavGoal.pose_xyyaw必须包含三项")
+        start = _strict_xy(base.position_xyz[:2], "静态路线起点")
+        goal = _strict_xy(final_goal.pose_xyyaw[:2], "静态路线终点")
+        _finite_real(final_goal.pose_xyyaw[2], "静态路线最终yaw")
+        inflated = self._config.inflated_obstacles()
+        route = _plan_static_aabb_route(
+            start,
+            goal,
+            inflated,
+            self._config.waypoint_margin_m,
+            self._config.max_intermediate_waypoints,
+        )
+        if route is None:
+            raise ValueError(
+                "无确定性安全静态路线；起点或3.4最终目标可能位于膨胀障碍物内"
+            )
+        if not route or route[-1] != goal or len(set(route)) != len(route):
+            raise ValueError("静态路线结果为空、未保留最终目标或含重复点")
+        goals: list[NavGoal] = []
+        self._generation += 1
+        for index, point in enumerate(route):
+            if index == len(route) - 1:
+                goals.append(final_goal)
+                continue
+            next_point = route[index + 1]
+            yaw = wrap_to_pi(math.atan2(next_point[1] - point[1], next_point[0] - point[0]))
+            goals.append(
+                NavGoal(
+                    goal_id=(
+                        f"route-{self._generation}-{final_goal.goal_id}-waypoint-{index}"
+                    ),
+                    goal_type="intermediate",
+                    pose_xyyaw=(point[0], point[1], yaw),
+                    frame_id=self._config.frame_id,
+                    position_tolerance=self._controller._config.position_tolerance_m,
+                    yaw_tolerance=self._controller._config.yaw_tolerance_rad,
+                    deadline_ns=final_goal.deadline_ns,
+                )
+            )
+        plan = _StaticRoutePlan(
+            final_goal_key=self._goal_key(final_goal),
+            goals=tuple(goals),
+            route_points=route,
+            generation=self._generation,
+        )
+        self.reset()
+        self._plan = plan
+        self._path_checkpoint_ns = now
+        return plan
+
+    def update(
+        self, base: BaseState, expected_goal: NavGoal, timestamp_ns: int
+    ) -> tuple[BaseCommand, NavigationStatus]:
+        now = NavigationController._timestamp(timestamp_ns, "timestamp_ns")
+        self._controller._validate_base(base, now, require_fresh=True)
+        if base.frame_id != self._config.frame_id:
+            raise ValueError("静态路线运行BaseState必须位于odom")
+        if self._plan is None:
+            raise ValueError("静态路线尚未规划")
+        if self._goal_key(self._plan.goals[-1]) != self._plan.final_goal_key:
+            raise ValueError("静态路线最终目标身份已损坏")
+        current = self.current_goal
+        if current is None or expected_goal is not current:
+            raise ValueError("活动NavGoal与静态路线当前段不一致")
+        self._waiting_for_new_odom = False
+        self._progressed_this_update = False
+        odom_can_advance = self._odom_can_advance_route(base)
+        self._advance_path_clock(now)
+        if self._path_elapsed_ns >= self._controller._config.goal_timeout_ns:
+            self._path_terminal = True
+            self._control_granted_since_checkpoint = False
+            self._diagnostic = "整条静态路径有效控制预算达到goal_timeout_ns"
+            return self._controller._stopped(
+                current.goal_id, now, "timeout", self._diagnostic, valid=False
+            )
+        if not odom_can_advance:
+            self._waiting_for_new_odom = True
+            distance = distance_xy(base.position_xyz, current.pose_xyyaw)
+            return (
+                BaseCommand(
+                    0.0,
+                    0.0,
+                    now,
+                    now + self._controller._config.command_ttl_ns,
+                ),
+                NavigationStatus(
+                    current.goal_id,
+                    "moving",
+                    distance,
+                    0.0,
+                    False,
+                    "等待timestamp严格更新的Odom后再推进静态路线",
+                    now,
+                ),
+            )
+        if self._current_index < len(self._plan.goals) - 1:
+            distance = distance_xy(base.position_xyz, current.pose_xyyaw)
+            if distance <= current.position_tolerance:
+                self._current_index += 1
+                self._controller.reset()
+                next_goal = self.current_goal
+                assert next_goal is not None
+                self._last_progress_odom_timestamp_ns = base.timestamp_ns
+                self._progressed_this_update = True
+                return (
+                    BaseCommand(
+                        0.0,
+                        0.0,
+                        now,
+                        now + self._controller._config.command_ttl_ns,
+                    ),
+                    NavigationStatus(
+                        next_goal.goal_id,
+                        "moving",
+                        distance,
+                        0.0,
+                        False,
+                        "中间waypoint到达，仅推进静态路线索引",
+                        now,
+                    ),
+                )
+        command, status = self._controller.update(base, current, now)
+        if status.state in {"failed", "timeout"}:
+            self._waiting_for_new_odom = False
+            self._path_terminal = True
+            self._control_granted_since_checkpoint = False
+            self._diagnostic = status.failure_reason
+        elif (
+            self._current_index == len(self._plan.goals) - 1
+            and status.success
+            and status.state == "arrived"
+        ):
+            self._waiting_for_new_odom = False
+            self._last_progress_odom_timestamp_ns = base.timestamp_ns
+            self._path_terminal = True
+            self._control_granted_since_checkpoint = False
+        return command, status

@@ -141,6 +141,21 @@ Candidate 已执行、已发布或已被机器人采用。
 `NavigationStatus` 串联；非导航阶段仍生成底盘零速候选，且不生成主动17维关节保持候选。
 默认 observe-only 全局门仍禁止把 `FinalAction` 发布到官方控制话题。
 
+3.5-D1新增了私有的`INITIAL_ZERO_POSE`反馈判定器和严格显式配置：只有包含真实完整
+`JointState.velocity`的17维反馈才能累计连续停稳证据，空velocity不得补零冒充停稳。
+目标全零姿态、位置/速度容差及连续周期数均为`TEAM_PROVISIONAL`，官方仿真恢复后必须
+重新标定。导航组装层现已用该私有判定结果门控静态路线：姿态未连续确认时不会取得
+base FULL授权，确认后才会规划并逐段执行膨胀AABB安全路线；中间waypoint不推进FSM，
+最终NavGoal保持3.4原合同，整条路线共享导航控制预算。当前分支仍不会发送主动回零命令，
+也没有manipulation-only准备授权；此外公共RobotJointState尚无velocity真实性标志，导航
+不能区分官方真实零速度与通用mapper的缺失补零，因此生产组装保持
+`BLOCKED_BY_EXTERNAL_POSTURE_FEEDBACK`。机器人不在INITIAL_ZERO_POSE时同样以
+`BLOCKED_BY_EXTERNAL_POSTURE_EXECUTION`保持失败关闭。静态障碍物、0.05m附加余量和
+0.01m waypoint margin均为TEAM_PROVISIONAL，动态障碍物与重规划留给3.6。自动化测试
+已完成（full pytest 2233 passed、compileall PASS），但动态官方仿真仍未执行；生产仍因
+velocity真实性标志和主动INITIAL_ZERO_POSE接口缺失而失败关闭，不能描述为完整动态3.5
+已经验证通过。
+
 ## 4. 三个 ROS2 节点
 
 ROS 2 节点可以理解为一个独立运行、通过话题交换消息的程序。本仓库只有三个节点入口，

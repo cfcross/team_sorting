@@ -233,6 +233,59 @@ navigation:
   settled_required_cycles: 3               # 不同Odom帧的连续停稳周期数
   settled_max_odom_gap_ns: 200000000       # ns
 
+# 3.5静态安全路线专属配置。AABB顺序为[min_x,min_y,max_x,max_y]，单位m，frame=odom。
+# collision来自已审计的官方offline场景；world与odom仅在该offline中数值对齐。
+# inflation=官方初始零姿态整机旋转包络0.46540807861320044m + 团队临时余量0.05m。
+# waypoint margin和余量均为TEAM_PROVISIONAL，官方仿真恢复后必须复标。
+navigation_safety:
+  frame_id: odom
+  inflation_radius_m: 0.5154080786132004
+  waypoint_margin_m: 0.01
+  max_intermediate_waypoints: 8
+  static_obstacles:
+    - {name: west_wall, bounds: [-2.960, -0.400, -2.900, 2.900]}
+    - {name: east_wall, bounds: [0.400, -0.400, 0.460, 2.900]}
+    - {name: south_wall, bounds: [-2.930, -0.430, 0.430, -0.370]}
+    - {name: north_wall, bounds: [-2.930, 2.870, 0.430, 2.930]}
+    - {name: shelf, bounds: [-2.875, 0.370, -2.465, 1.186]}
+    - {name: table, bounds: [-1.370, 1.915, 0.290, 2.715]}
+
+# 3.5-D1 INITIAL_ZERO_POSE私有反馈判定合同。以下数值均为TEAM_PROVISIONAL，
+# 官方仿真恢复后必须重新标定。本节当前只验证真实JointState position/velocity并累计
+# 连续反馈证据，不生成回零命令、不开放底盘FULL授权，也不启用生产路线。
+# obstacle additional_clearance_m=0.05属于二维静态碰撞膨胀，与这里的关节容差无关。
+navigation_posture:
+  mode: initial_zero_pose
+  # 顺序严格对应interfaces.JOINT_NAMES；当前获批姿态为官方initial/reset全零向量。
+  target:
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+  joint_state_max_age_ns: 150000000
+  max_feedback_gap_ns: 200000000
+  settled_required_cycles: 3
+  slide_tolerance_m: 0.005
+  head_tolerance_rad: 0.02
+  arm_tolerance_rad: 0.02
+  gripper_tolerance: 0.01
+  slide_velocity_tolerance_mps: 0.01
+  angular_velocity_tolerance_radps: 0.02
+  gripper_velocity_tolerance_per_s: 0.01
+
 # 当前官方 offline 场景的初始 source-slot 唯一定义。world==odom 只适用于该官方离线
 # bridge；这些中心仅在SEARCH_TARGET/REFINE_TARGET选择尚未抓取的source target时消费，
 # 不能作为物体整个任务生命周期的全局位置gate。颜色经官方随机shuffle分配到slot，因此
