@@ -214,11 +214,15 @@ def _config(
 
 def _node(
     head_tracking_overrides: dict[str, Any] | None = None,
+    *,
+    navigation_safety_enabled: bool = True,
     **control_overrides: bool,
 ) -> Any:
     ros = _ros()
+    config = _config(head_tracking_overrides, **control_overrides)
+    config["navigation_safety"]["enabled"] = navigation_safety_enabled
     return _create_team_client_node(ros)(
-        _config(head_tracking_overrides, **control_overrides), ros
+        config, ros
     )
 
 
@@ -279,6 +283,94 @@ def _activate_trusted_navigation_posture(node: Any, now_ns: int = NOW) -> None:
             replace(_joints(), timestamp_ns=now_ns - offset), now_ns - offset
         )
     assert state is _NavigationPostureState.ACTIVE
+
+
+@pytest.mark.parametrize(
+    "phase",
+    (GlobalPhase.NAV_TO_PICK, GlobalPhase.NAV_TO_PLACE, GlobalPhase.RETURN_END),
+)
+def test_default_disabled_navigation_uses_stage_31_to_33_path_without_posture_gate(
+    phase: GlobalPhase,
+) -> None:
+    ros = _ros()
+    node = _create_team_client_node(ros)(_config(), ros)
+    assert node._navigation_safety_enabled is False
+    assert type(node._navigation) is NavigationController
+    assert node._navigation_posture is None
+
+    goal = NavGoal(
+        f"{phase.value}-baseline", "baseline", (0.4, 0.0, 0.0), "odom",
+        0.05, 0.1, NOW + 1_000,
+    )
+    calls: list[tuple[BaseState, NavGoal, int]] = []
+
+    def update(
+        base: BaseState, supplied_goal: NavGoal, timestamp_ns: int
+    ) -> tuple[BaseCommand, NavigationStatus]:
+        calls.append((base, supplied_goal, timestamp_ns))
+        return (
+            BaseCommand(0.1, -0.2, timestamp_ns, timestamp_ns + 100),
+            NavigationStatus(
+                supplied_goal.goal_id, "moving", 0.4, -0.2, False, "", timestamp_ns
+            ),
+        )
+
+    node._navigation.update = update
+    node._runtime_wiring.active_nav_goal = goal
+    snapshot = SensorSnapshot(_task(), _base(), _joints(), (), NOW, True)
+    status = FSMStatus(1, phase, LocalPhase.IDLE, 0, False, "", NOW)
+
+    command, manipulation = node._compute_candidate_commands(snapshot, status, NOW)
+
+    assert manipulation is None
+    assert command is not None and command.valid
+    assert (command.v, command.w) == pytest.approx((0.1, -0.2))
+    assert calls == [(snapshot.base, goal, NOW)]
+    assert "POSTURE" not in node._runtime_wiring.navigation_diagnostic
+
+
+@pytest.mark.parametrize(
+    "phase",
+    (GlobalPhase.NAV_TO_PICK, GlobalPhase.NAV_TO_PLACE, GlobalPhase.RETURN_END),
+)
+def test_default_disabled_phase_entry_builds_original_single_active_goal(
+    phase: GlobalPhase,
+) -> None:
+    ros = _ros()
+    node = _create_team_client_node(ros)(_config(), ros)
+    if phase is GlobalPhase.NAV_TO_PICK:
+        node._runtime_wiring.search_target = _estimate("baseline-target", 0.9)
+    snapshot = SensorSnapshot(_task(), _base(), _joints(), (), NOW, True)
+    status = FSMStatus(1, phase, LocalPhase.IDLE, 0, False, "", NOW)
+
+    assert node._handle_phase_entry(snapshot, status, None, NOW)
+
+    state = node._runtime_wiring
+    assert isinstance(state.active_nav_goal, NavGoal)
+    assert state.final_nav_goal is None
+    assert state.navigation_preparation_state == "IDLE"
+    assert state.navigation_route_generation is None
+
+
+def test_enabled_navigation_still_fails_closed_without_trusted_posture_feedback() -> None:
+    node = _node(navigation_safety_enabled=True)
+    assert node._navigation_safety_enabled is True
+    assert node._navigation_posture is not None
+    node._runtime_wiring.final_nav_goal = NavGoal(
+        "guarded", "pick", (0.4, 0.0, 0.0), "odom", 0.05, 0.1, NOW + 1_000
+    )
+    snapshot = SensorSnapshot(_task(), _base(), _joints(), (), NOW, True)
+    status = FSMStatus(
+        1, GlobalPhase.NAV_TO_PICK, LocalPhase.IDLE, 0, False, "", NOW
+    )
+
+    command, _ = node._compute_candidate_commands(snapshot, status, NOW)
+
+    assert command is not None and command.valid
+    assert (command.v, command.w) == (0.0, 0.0)
+    assert "BLOCKED_BY_EXTERNAL_POSTURE_FEEDBACK" in (
+        node._runtime_wiring.navigation_diagnostic
+    )
 
 
 def _task() -> TaskSpec:

@@ -141,20 +141,22 @@ Candidate 已执行、已发布或已被机器人采用。
 `NavigationStatus` 串联；非导航阶段仍生成底盘零速候选，且不生成主动17维关节保持候选。
 默认 observe-only 全局门仍禁止把 `FinalAction` 发布到官方控制话题。
 
-3.5-D1新增了私有的`INITIAL_ZERO_POSE`反馈判定器和严格显式配置：只有包含真实完整
-`JointState.velocity`的17维反馈才能累计连续停稳证据，空velocity不得补零冒充停稳。
-目标全零姿态、位置/速度容差及连续周期数均为`TEAM_PROVISIONAL`，官方仿真恢复后必须
-重新标定。导航组装层现已用该私有判定结果门控静态路线：姿态未连续确认时不会取得
-base FULL授权，确认后才会规划并逐段执行膨胀AABB安全路线；中间waypoint不推进FSM，
-最终NavGoal保持3.4原合同，整条路线共享导航控制预算。当前分支仍不会发送主动回零命令，
-也没有manipulation-only准备授权；此外公共RobotJointState尚无velocity真实性标志，导航
-不能区分官方真实零速度与通用mapper的缺失补零，因此生产组装保持
-`BLOCKED_BY_EXTERNAL_POSTURE_FEEDBACK`。机器人不在INITIAL_ZERO_POSE时同样以
-`BLOCKED_BY_EXTERNAL_POSTURE_EXECUTION`保持失败关闭。静态障碍物、0.05m附加余量和
-0.01m waypoint margin均为TEAM_PROVISIONAL，动态障碍物与重规划留给3.6。自动化测试
-已完成（full pytest 2233 passed、compileall PASS），但动态官方仿真仍未执行；生产仍因
-velocity真实性标志和主动INITIAL_ZERO_POSE接口缺失而失败关闭，不能描述为完整动态3.5
-已经验证通过。
+3.5静态安全路线由严格布尔`navigation_safety.enabled`显式门控，正式配置默认`false`。
+关闭时节点构造并调用Stage 3.1–3.3原始`NavigationController`路径，不要求posture反馈、
+不读取静态AABB来规划路线，也不启用多段生命周期或whole-path共享预算。打开时才启用
+私有posture gate、膨胀AABB、deterministic waypoint、多段NavGoal、whole-path budget和
+repeated-Odom防重复推进；原有fail-closed合同不放松，中间waypoint不推进FSM，只有最终
+NavGoal可推进FSM，SAFE_HOLD保留路线索引和预算。
+
+当前`INITIAL_ZERO_POSE`只保留为`TEAM_PROVISIONAL`、optional模式，不是正式默认冻结
+策略；批准的未来方向是`DYNAMIC_FROM_JOINT_STATE`，但正式JointState/official collision
+geometry输入尚未获批，因此本仓库只记录方向，不伪造动态footprint实现。enabled模式仍
+要求可溯源的真实velocity；缺少真实性时保持`BLOCKED_BY_EXTERNAL_POSTURE_FEEDBACK`，
+且不会发送主动回零命令。静态障碍物几何、0.5154080786132004m inflation（含0.05m附加
+clearance）、0.01m waypoint margin、8个中间点上限、所有posture目标/容差/周期，以及
+当前`navigation.standoff_m=0.60`均为`TEAM_PROVISIONAL`，不是official frozen、calibrated
+或production-safe数值。动态官方仿真与最终3.4站位仍未闭环，Stage 3.5状态保持
+`PASS_WITH_EXTERNAL_DEPENDENCIES`。
 
 ## 4. 三个 ROS2 节点
 
@@ -600,6 +602,9 @@ orphan 规则见
 | `perception.estimator_3d.object_local_size_xyz_m.*` | `[0.24, 0.16, 0.19]` | 官方模型确认的物体局部坐标系完整XYZ尺寸；只用于`size_xyz_m`，不推断姿态 |
 | `perception.estimator_3d.pose_refinement.*` | `enabled: false`，其余见默认配置 | 框内点云深度带、最少点数、连续帧数及位置/角度/尺寸误差门限；均为待真实相机标定的团队初值，正式联调前默认关闭 |
 | `navigation.*` | 见默认配置 | `NavigationConfig` 的完整显式映射；米、弧度、m/s、rad/s 与 ns 参数均为待官方仿真实测标定的保守初值 |
+| `navigation_safety.enabled` | `false` | 严格bool；关闭时保持Stage 3.1–3.3原始生产路径，打开后才启用TEAM_PROVISIONAL静态安全路线 |
+| `navigation_safety.*`（除enabled） | 见默认配置 | TEAM_PROVISIONAL静态AABB、inflation、waypoint margin和中间点上限；不是正式安全标定 |
+| `navigation_posture.*` | 见默认配置 | TEAM_PROVISIONAL optional `INITIAL_ZERO_POSE`反馈模式；未来批准方向为尚未实现的`DYNAMIC_FROM_JOINT_STATE` |
 | `recorder.enabled` | `false` | 默认不启动记录 |
 | `recorder.record_rosbag` | `true` | 启动 Recorder 时同时管理 rosbag |
 | `recorder.root_dir` | `./team_sorting_dataset` | Recorder schema v1 dataset root；旧扁平目录不自动迁移 |

@@ -91,6 +91,7 @@ from team_sorting.ros_nodes import (
     _estimates_from_vision,
     _estimates_to_vision,
     _navigation_config_from_config,
+    _navigation_safety_enabled_from_config,
     _perception_pipeline_from_config,
     _source_slot_config_from_config,
     _select_target_estimate,
@@ -2215,6 +2216,19 @@ def test_navigation_config_mapping_rejects_missing_and_unknown_fields() -> None:
     unknown["navigation"]["hidden_default"] = 1
     with pytest.raises(ValueError, match="hidden_default"):
         _navigation_config_from_config(unknown)
+
+
+def test_navigation_safety_is_explicitly_disabled_by_default() -> None:
+    assert _navigation_safety_enabled_from_config(_project_config()) is False
+
+
+@pytest.mark.parametrize("enabled", [0, 1, "false", None])
+def test_navigation_safety_enabled_requires_strict_bool(enabled: object) -> None:
+    config = _project_config()
+    config["navigation_safety"]["enabled"] = enabled
+
+    with pytest.raises(ValueError, match="enabled.*bool"):
+        _navigation_safety_enabled_from_config(config)
 
 
 @pytest.mark.parametrize(

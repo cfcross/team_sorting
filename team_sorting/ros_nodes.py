@@ -198,6 +198,7 @@ class _RuntimeWiringState:
     navigation_route_generation: Optional[int] = None
     navigation_waiting_for_new_odom: bool = False
     navigation_progressed_this_update: bool = False
+    navigation_safety_enabled: bool = False
     planned_grasp_context: Optional[GraspContext] = None
     confirmed_grasp_context: Optional[GraspContext] = None
     active_pick_trajectory: Optional[JointTrajectory] = None
@@ -505,12 +506,17 @@ def _internal_fsm_publish_authorization(
         and base_command.valid
         and now_ns < base_command.valid_until_ns
         and manipulation_command is None
-        and isinstance(runtime_wiring, _RuntimeWiringState)
-        and runtime_wiring.navigation_preparation_state == "READY"
-        and isinstance(runtime_wiring.final_nav_goal, NavGoal)
-        and isinstance(runtime_wiring.active_nav_goal, NavGoal)
-        and runtime_wiring.navigation_route_generation is not None
-        and not runtime_wiring.navigation_waiting_for_new_odom
+        and (
+            not isinstance(runtime_wiring, _RuntimeWiringState)
+            or not runtime_wiring.navigation_safety_enabled
+            or (
+                runtime_wiring.navigation_preparation_state == "READY"
+                and isinstance(runtime_wiring.final_nav_goal, NavGoal)
+                and isinstance(runtime_wiring.active_nav_goal, NavGoal)
+                and runtime_wiring.navigation_route_generation is not None
+                and not runtime_wiring.navigation_waiting_for_new_odom
+            )
+        )
     )
     if (
         base_active
@@ -1192,13 +1198,18 @@ def _load_config() -> dict[str, Any]:
     except ValueError as exc:
         raise RuntimeError(f"导航配置无效 {path}: {exc}") from exc
     try:
-        _navigation_posture_config_from_config(data)
-    except ValueError as exc:
-        raise RuntimeError(f"导航姿态配置无效 {path}: {exc}") from exc
-    try:
-        _static_route_config_from_config(data)
+        navigation_safety_enabled = _navigation_safety_enabled_from_config(data)
     except ValueError as exc:
         raise RuntimeError(f"导航静态安全配置无效 {path}: {exc}") from exc
+    if navigation_safety_enabled:
+        try:
+            _navigation_posture_config_from_config(data)
+        except ValueError as exc:
+            raise RuntimeError(f"导航姿态配置无效 {path}: {exc}") from exc
+        try:
+            _static_route_config_from_config(data)
+        except ValueError as exc:
+            raise RuntimeError(f"导航静态安全配置无效 {path}: {exc}") from exc
     _validated_action_dispatch_topic(data.get("topics"))
     return data
 
@@ -1271,6 +1282,20 @@ def _navigation_posture_config_from_config(
     )
 
 
+def _navigation_safety_enabled_from_config(config: Mapping[str, Any]) -> bool:
+    """读取Stage 3.5私有开关；只接受显式严格bool。"""
+
+    if not isinstance(config, Mapping):
+        raise ValueError("config必须是Mapping")
+    section = config.get("navigation_safety")
+    if not isinstance(section, Mapping):
+        raise ValueError("config.navigation_safety必须是Mapping")
+    enabled = section.get("enabled")
+    if type(enabled) is not bool:
+        raise ValueError("navigation_safety.enabled必须是严格bool")
+    return enabled
+
+
 def _static_route_config_from_config(config: Mapping[str, Any]) -> _StaticRouteConfig:
     """严格读取导航专属静态场景；不从slot或停车容差推导安全边界。"""
 
@@ -1280,6 +1305,7 @@ def _static_route_config_from_config(config: Mapping[str, Any]) -> _StaticRouteC
     if not isinstance(section, Mapping):
         raise ValueError("config.navigation_safety必须是Mapping")
     expected = {
+        "enabled",
         "frame_id",
         "inflation_radius_m",
         "waypoint_margin_m",
@@ -1292,6 +1318,7 @@ def _static_route_config_from_config(config: Mapping[str, Any]) -> _StaticRouteC
             "navigation_safety字段不完整："
             f"缺失={sorted(expected - actual)}，未知={sorted(actual - expected)}"
         )
+    _navigation_safety_enabled_from_config(config)
     raw_obstacles = section["static_obstacles"]
     if type(raw_obstacles) is not list or not raw_obstacles:
         raise ValueError("navigation_safety.static_obstacles必须是非空内建list")
@@ -1475,20 +1502,29 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
 
             # 业务对象只在节点初始化时构造一次；navigation必须完整显式映射，不能
             # 偷偷采用NavigationConfig的模块默认值并宣称导航可用。
-            self._navigation: Optional[_StaticRouteNavigator] = None
+            self._navigation: Optional[NavigationController | _StaticRouteNavigator] = None
             self._navigation_posture: Optional[_NavigationPostureTracker] = None
             # RobotJointState当前没有velocity来源/有效性标志；通用mapper可能按既有合同
             # 将缺失velocity补零。导航不得把无法溯源的零值当成真实停稳证据。
             self._navigation_velocity_feedback_trusted = False
+            self._navigation_safety_enabled = False
             self._navigation_unavailable_reason = ""
             try:
                 navigation_config = _navigation_config_from_config(config)
-                posture_config = _navigation_posture_config_from_config(config)
-                route_config = _static_route_config_from_config(config)
-                self._navigation = _StaticRouteNavigator(
-                    NavigationController(navigation_config), route_config
+                self._navigation_safety_enabled = (
+                    _navigation_safety_enabled_from_config(config)
                 )
-                self._navigation_posture = _NavigationPostureTracker(posture_config)
+                self._runtime_wiring.navigation_safety_enabled = (
+                    self._navigation_safety_enabled
+                )
+                controller = NavigationController(navigation_config)
+                if self._navigation_safety_enabled:
+                    posture_config = _navigation_posture_config_from_config(config)
+                    route_config = _static_route_config_from_config(config)
+                    self._navigation = _StaticRouteNavigator(controller, route_config)
+                    self._navigation_posture = _NavigationPostureTracker(posture_config)
+                else:
+                    self._navigation = controller
             except (TypeError, ValueError) as exc:
                 self._navigation_unavailable_reason = str(exc)
 
@@ -2230,7 +2266,7 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                                 state.search_target = state.active_target
                             if state.search_target is None:
                                 raise ValueError("NAV_TO_PICK缺少SEARCH锁定目标")
-                            state.final_nav_goal = self._navigation.build_pick_goal(
+                            built_goal = self._navigation.build_pick_goal(
                                 snapshot.task,
                                 state.search_target,
                                 snapshot.base,
@@ -2239,20 +2275,26 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                         elif phase is GlobalPhase.NAV_TO_PLACE:
                             if snapshot.task is None:
                                 raise ValueError("NAV_TO_PLACE缺少当前TaskSpec")
-                            state.final_nav_goal = self._navigation.build_place_goal(
+                            built_goal = self._navigation.build_place_goal(
                                 snapshot.task, snapshot.base, now_ns
                             )
                         else:
-                            state.final_nav_goal = self._navigation.build_return_goal(
+                            built_goal = self._navigation.build_return_goal(
                                 snapshot.base, now_ns
                             )
-                        if not state.final_nav_goal.valid:
+                        if not built_goal.valid:
                             raise ValueError(
-                                state.final_nav_goal.failure_reason
+                                built_goal.failure_reason
                                 or "NavigationController生成无效NavGoal"
                             )
-                        state.active_nav_goal = None
-                        state.navigation_preparation_state = "WAITING_FOR_POSTURE"
+                        if self._navigation_safety_enabled:
+                            state.final_nav_goal = built_goal
+                            state.active_nav_goal = None
+                            state.navigation_preparation_state = "WAITING_FOR_POSTURE"
+                        else:
+                            state.active_nav_goal = built_goal
+                            state.final_nav_goal = None
+                            state.navigation_preparation_state = "IDLE"
                         state.phase_entry_failure_reason = ""
                     except (TypeError, ValueError, RuntimeError) as exc:
                         state.active_nav_goal = None
@@ -3364,7 +3406,7 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 GlobalPhase.RETURN_END,
             }
             if snapshot.joints is None or not snapshot.joints.valid:
-                if navigation_phase:
+                if navigation_phase and self._navigation_safety_enabled:
                     reason = "缺少新鲜有效JointState，导航姿态失败关闭"
                     self._runtime_wiring.navigation_preparation_state = "FAILED"
                     self._runtime_wiring.navigation_waiting_for_new_odom = False
@@ -3402,6 +3444,32 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                     state.navigation_preparation_state = "FAILED"
                     state.navigation_diagnostic = reason
                     return BaseCommand(0.0, 0.0, now_ns, now_ns, False, reason), None
+                if not self._navigation_safety_enabled:
+                    if not isinstance(state.active_nav_goal, NavGoal):
+                        reason = "缺少活动NavGoal"
+                        state.navigation_diagnostic = reason
+                        return BaseCommand(
+                            0.0, 0.0, now_ns, now_ns, False, reason
+                        ), None
+                    if snapshot.base is None or not snapshot.base.valid:
+                        reason = "缺少新鲜有效Odom，导航失败关闭"
+                        state.navigation_diagnostic = reason
+                        return BaseCommand(
+                            0.0, 0.0, now_ns, now_ns, False, reason
+                        ), None
+                    try:
+                        command, navigation_status = self._navigation.update(
+                            snapshot.base, state.active_nav_goal, now_ns
+                        )
+                    except (TypeError, ValueError, RuntimeError) as exc:
+                        reason = f"NavigationController.update异常：{exc}"
+                        state.navigation_diagnostic = reason
+                        return BaseCommand(
+                            0.0, 0.0, now_ns, now_ns, False, reason
+                        ), None
+                    state.last_navigation_status = navigation_status
+                    state.navigation_diagnostic = navigation_status.failure_reason
+                    return command, None
                 if self._navigation_posture is None:
                     reason = "导航姿态评估器不可用"
                     state.navigation_preparation_state = "FAILED"
@@ -4062,7 +4130,10 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
                 manipulation_source=manipulation_source,
                 runtime_wiring=self._runtime_wiring,
             )
-            if self._runtime_wiring.navigation_progressed_this_update:
+            if (
+                self._navigation_safety_enabled
+                and self._runtime_wiring.navigation_progressed_this_update
+            ):
                 # 中间waypoint推进周期可以正式发布显式零速停车命令，但前提仍是
                 # 本周期真实底盘候选已被ActionMux接受。拒绝结果必须在正式发布前
                 # 撤销FULL，随后由导航私有失败路径锁存并清理旧路线。
@@ -4144,7 +4215,8 @@ def _create_team_client_node(ros: SimpleNamespace) -> type:
             if navigation_control_granted:
                 self._record_navigation_control_result(now_ns, True)
             elif (
-                self._publish_enabled
+                self._navigation_safety_enabled
+                and self._publish_enabled
                 and status.global_phase
                 in {
                     GlobalPhase.NAV_TO_PICK,

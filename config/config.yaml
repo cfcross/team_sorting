@@ -233,11 +233,14 @@ navigation:
   settled_required_cycles: 3               # 不同Odom帧的连续停稳周期数
   settled_max_odom_gap_ns: 200000000       # ns
 
-# 3.5静态安全路线专属配置。AABB顺序为[min_x,min_y,max_x,max_y]，单位m，frame=odom。
+# 3.5静态安全路线专属配置，默认关闭；disabled时不进入姿态/AABB/waypoint/多段路线。
+# 以下全部几何/膨胀/waypoint数值均为TEAM_PROVISIONAL，不是production-safe冻结值。
+# AABB顺序为[min_x,min_y,max_x,max_y]，单位m，frame=odom。
 # collision来自已审计的官方offline场景；world与odom仅在该offline中数值对齐。
 # inflation=官方初始零姿态整机旋转包络0.46540807861320044m + 团队临时余量0.05m。
 # waypoint margin和余量均为TEAM_PROVISIONAL，官方仿真恢复后必须复标。
 navigation_safety:
+  enabled: false
   frame_id: odom
   inflation_radius_m: 0.5154080786132004
   waypoint_margin_m: 0.01
@@ -250,7 +253,10 @@ navigation_safety:
     - {name: shelf, bounds: [-2.875, 0.370, -2.465, 1.186]}
     - {name: table, bounds: [-1.370, 1.915, 0.290, 2.715]}
 
-# 3.5-D1 INITIAL_ZERO_POSE私有反馈判定合同。以下数值均为TEAM_PROVISIONAL，
+# 3.5-D1 INITIAL_ZERO_POSE私有、optional反馈判定模式。该模式为TEAM_PROVISIONAL，
+# 不是正式默认冻结策略；批准的未来方向是DYNAMIC_FROM_JOINT_STATE，但当前缺少正式
+# JointState/official collision geometry输入，尚未实现且不得伪造。
+# 以下数值均为TEAM_PROVISIONAL，
 # 官方仿真恢复后必须重新标定。本节当前只验证真实JointState position/velocity并累计
 # 连续反馈证据，不生成回零命令、不开放底盘FULL授权，也不启用生产路线。
 # obstacle additional_clearance_m=0.05属于二维静态碰撞膨胀，与这里的关节容差无关。

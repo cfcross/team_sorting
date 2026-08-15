@@ -1,4 +1,4 @@
-"""导航前 INITIAL_ZERO_POSE 的纯反馈判定。
+"""导航前 TEAM_PROVISIONAL、optional INITIAL_ZERO_POSE 的纯反馈判定。
 
 本模块只验证已经取得的 ``RobotJointState``，不生成关节命令、底盘命令、FSM事件或
 发布授权。所有符号保持私有；ROS组装层只消费判定事实来门控导航，不在此模块回零。
@@ -75,7 +75,7 @@ def _strict_feedback_vector(values: object, name: str) -> tuple[float, ...]:
 
 @dataclass(frozen=True)
 class _NavigationPostureConfig:
-    """3.5-D1私有显式配置；不提供隐藏默认值。"""
+    """3.5-D1 TEAM_PROVISIONAL optional配置；不提供隐藏默认值。"""
 
     mode: str
     target: tuple[float, ...]
@@ -145,7 +145,7 @@ class _NavigationPostureState(Enum):
 
 
 class _NavigationPostureTracker:
-    """只根据不同timestamp的真实反馈累计INITIAL_ZERO_POSE证据。"""
+    """只根据不同timestamp的真实反馈累计provisional零姿态证据。"""
 
     def __init__(self, config: _NavigationPostureConfig) -> None:
         if not isinstance(config, _NavigationPostureConfig):
