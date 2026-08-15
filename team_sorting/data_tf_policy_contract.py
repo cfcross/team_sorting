@@ -19,7 +19,7 @@ from .recorder_contract import load_recorder_contract
 SCHEMA_NAME = "team_sorting.data_tf_policy"
 SCHEMA_VERSION = 1
 POLICY_ID = "data_tf_policy_v1"
-INTERFACE_SHA256 = "a86548b2a43581af70b8d585d523a06bb97a8d96e1fe52950097b12d061fdaea"
+INTERFACE_SHA256 = "ff95b964723e0b681427245f503d0e18322f133e1254cbbc1c1681a443bc1922"
 RECORDER_SHA256 = "e7965c34a38c11d551d9943d8d614c05bc8e28e186432ad5ff4d0eed243225cf"
 _RELATIVE_PATH = Path("config") / "contracts" / "data_tf_policy_v1.json"
 _INTERFACE_RELATIVE_PATH = "config/contracts/interface_v1.json"

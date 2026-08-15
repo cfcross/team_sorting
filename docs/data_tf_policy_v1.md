@@ -18,7 +18,7 @@ B3A不修改Recorder运行逻辑，不增加TF录制，不实现压缩、降频�
 
 | 契约 | schema | version | SHA-256 |
 |---|---|---:|---|
-| `config/contracts/interface_v1.json` | `team_sorting.interface` | 1 | `a86548b2a43581af70b8d585d523a06bb97a8d96e1fe52950097b12d061fdaea` |
+| `config/contracts/interface_v1.json` | `team_sorting.interface` | 1 | `ff95b964723e0b681427245f503d0e18322f133e1254cbbc1c1681a443bc1922` |
 | `config/contracts/recorder_schema_v1.json` | `team_sorting.recorder` | 1 | `e7965c34a38c11d551d9943d8d614c05bc8e28e186432ad5ff4d0eed243225cf` |
 
 ## 3. raw与derived双轨

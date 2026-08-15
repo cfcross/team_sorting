@@ -7,7 +7,7 @@
     "path": "config/contracts/interface_v1.json",
     "schema_name": "team_sorting.interface",
     "schema_version": 1,
-    "frozen_sha256": "a86548b2a43581af70b8d585d523a06bb97a8d96e1fe52950097b12d061fdaea"
+    "frozen_sha256": "ff95b964723e0b681427245f503d0e18322f133e1254cbbc1c1681a443bc1922"
   },
   "recorder_contract": {
     "path": "config/contracts/recorder_schema_v1.json",

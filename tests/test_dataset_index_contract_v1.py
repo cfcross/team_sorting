@@ -20,11 +20,11 @@ from team_sorting.dataset_index_contract import (
 ROOT = Path(__file__).resolve().parents[1]
 CONTRACT = ROOT / "config/contracts/dataset_index_v1.json"
 DEPENDENCIES = {
-    "interface_v1.json": "a86548b2a43581af70b8d585d523a06bb97a8d96e1fe52950097b12d061fdaea",
+    "interface_v1.json": "ff95b964723e0b681427245f503d0e18322f133e1254cbbc1c1681a443bc1922",
     "recorder_schema_v1.json": "e7965c34a38c11d551d9943d8d614c05bc8e28e186432ad5ff4d0eed243225cf",
-    "data_tf_policy_v1.json": "982934579d816d67c63c1ff8938ea49c54982cf7d75472a58c00fe6a9cefae80",
+    "data_tf_policy_v1.json": "b80410a12f299503fddd63f0ee4da0a275e24a090df89b198afd3b876dee62dc",
 }
-EXPECTED_CONTRACT_SHA256 = "64493d8979e3fb545aa8b31624897a97900967731d30a0e3bf43c286148e785e"
+EXPECTED_CONTRACT_SHA256 = "8b92837afb3f984bf53909759372d25864f860d6ffdd339a2c74cc8a7b8ba3fd"
 
 
 def _payload() -> dict:

@@ -153,7 +153,8 @@ _ACTION_SPECS: tuple[
     ("left_arm", "rad", "absolute_position", -2.60, 2.60, -3.017, 3.017, 5, "lft_joint6", "runtime_verified", ""),
     (
         "left_arm", "dimensionless", "normalized_position", 0.0, 1.0, 0.0, 1.0,
-        6, "lft_gripper", "partially_verified", "0/1对应的实际开闭方向尚未实测。",
+        6, "lft_gripper", "runtime_verified",
+        "官方离线仿真已验证：open=1.0，closed=0.1。",
     ),
     ("right_arm", "rad", "absolute_position", -3.14, 2.089, -3.151, 2.089, 0, "rgt_joint1", "runtime_verified", ""),
     ("right_arm", "rad", "absolute_position", -2.50, 0.181, -2.963, 0.181, 1, "rgt_joint2", "runtime_verified", ""),
@@ -163,7 +164,8 @@ _ACTION_SPECS: tuple[
     ("right_arm", "rad", "absolute_position", -2.60, 2.60, -3.017, 3.017, 5, "rgt_joint6", "runtime_verified", ""),
     (
         "right_arm", "dimensionless", "normalized_position", 0.0, 1.0, 0.0, 1.0,
-        6, "rgt_gripper", "partially_verified", "0/1对应的实际开闭方向尚未实测。",
+        6, "rgt_gripper", "runtime_verified",
+        "官方离线仿真已验证：open=1.0，closed=0.1。",
     ),
 )
 
@@ -201,7 +203,6 @@ MMK2_CONTROLLER_MANIFEST_V1 = ControllerManifest(
     official_topics=_TOPICS,
     runtime_source="/tmp/material_competition_ros2_runtime.xml",
     unverified_facts=(
-        "gripper_open_close_direction",
         "server_command_watchdog",
         "controller_target_lock_and_restart_semantics",
         "publish_delivery_and_physical_execution",

@@ -63,6 +63,11 @@ def test_manifest_is_immutable_19d_and_uses_canonical_order() -> None:
     assert manifest.action_dim == len(manifest.actions) == 19
     assert manifest.runtime_source == "/tmp/material_competition_ros2_runtime.xml"
     assert "server_command_watchdog" in manifest.unverified_facts
+    assert "gripper_open_close_direction" not in manifest.unverified_facts
+    for index in (11, 18):
+        assert manifest.actions[index].verification_status == "runtime_verified"
+        assert "open=1.0" in manifest.actions[index].notes
+        assert "closed=0.1" in manifest.actions[index].notes
     assert tuple(item.index for item in manifest.actions) == tuple(range(19))
     assert tuple(item.name for item in manifest.actions) == ACTION_NAMES
     with pytest.raises(AttributeError):

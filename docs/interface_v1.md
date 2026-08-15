@@ -25,16 +25,16 @@
 | 8 | left_arm_joint_4 | left_arm[3] | absolute_position | rad | [-2.60,2.60] | [-3.012,3.012] | runtime_verified |
 | 9 | left_arm_joint_5 | left_arm[4] | absolute_position | rad | [-1.859,1.859] | [-1.859,1.859] | runtime_verified |
 | 10 | left_arm_joint_6 | left_arm[5] | absolute_position | rad | [-2.60,2.60] | [-3.017,3.017] | runtime_verified |
-| 11 | left_gripper | left_arm[6] | normalized_position | dimensionless | [0,1] | [0,1] | unresolved |
+| 11 | left_gripper | left_arm[6] | normalized_position | dimensionless | [0,1] | [0,1] | runtime_verified |
 | 12 | right_arm_joint_1 | right_arm[0] | absolute_position | rad | [-3.14,2.089] | [-3.151,2.089] | runtime_verified |
 | 13 | right_arm_joint_2 | right_arm[1] | absolute_position | rad | [-2.50,0.181] | [-2.963,0.181] | runtime_verified |
 | 14 | right_arm_joint_3 | right_arm[2] | absolute_position | rad | [-0.094,3.14] | [-0.094,3.161] | runtime_verified |
 | 15 | right_arm_joint_4 | right_arm[3] | absolute_position | rad | [-2.60,2.60] | [-3.012,3.012] | runtime_verified |
 | 16 | right_arm_joint_5 | right_arm[4] | absolute_position | rad | [-1.859,1.859] | [-1.859,1.859] | runtime_verified |
 | 17 | right_arm_joint_6 | right_arm[5] | absolute_position | rad | [-2.60,2.60] | [-3.017,3.017] | runtime_verified |
-| 18 | right_gripper | right_arm[6] | normalized_position | dimensionless | [0,1] | [0,1] | unresolved |
+| 18 | right_gripper | right_arm[6] | normalized_position | dimensionless | [0,1] | [0,1] | runtime_verified |
 
-`base_v/base_w` 分别进入 `Twist.linear.x/angular.z`，不是左右轮直接命令；官方接受的最大 `cmd_vel` 范围未知。位置轴的0不是停止，未控制的位置轴不得补零。夹爪只确认 `[0,1]` 范围，0/1开闭方向和有效夹持值未知。head-only 的精确训练命令只能取 dispatch payload。
+`base_v/base_w` 分别进入 `Twist.linear.x/angular.z`，不是左右轮直接命令；官方接受的最大 `cmd_vel` 范围未知。位置轴的0不是停止，未控制的位置轴不得补零。夹爪 `[0,1]` 范围及 `open=1.0`、`closed=0.1` 已在官方离线仿真验证；端点标定不证明任意物体的稳定夹持值。head-only 的精确训练命令只能取 dispatch payload。
 
 ## 3. 17维JointState契约
 
@@ -110,14 +110,14 @@ ROS边界可以去掉frame的一个前导`/`，因此Odom原始`/odom`与TF pare
 
 - 不得绕过ActionMux或直接发布五组官方控制话题。
 - 不得把未控制position维补零、把反馈当命令，或把publisher返回提升为执行确认。
-- 不得假定world等于odom、夹爪端点方向、官方cmd_vel上限或watchdog行为。
+- 不得假定world等于odom、夹爪端点能保证稳定夹持、官方cmd_vel上限或watchdog行为。
 - 不得把Recorder Segment称为Training Episode，或把settled count称为当前attempt号。
 - 不得从observe-only记录直接制造BC标签。
 - 不得创建仓库不存在的通用ActionCandidate或NavigationCommand来“补齐”契约。
 
 ## 11. UNRESOLVED事实
 
-机器契约保留11项：夹爪开闭方向、有效夹持值、官方cmd_vel接受范围、Server watchdog、Client重启后的controller target保持、Server接收确认、执行确认容差、world到odom关系、MMK2 FK输出frame、JointState effort单位、官方attempt开始身份。每项都含阻塞角色、所需测试和禁止假设；验证前不得填写经验值。
+机器契约保留10项：有效夹持值、官方cmd_vel接受范围、Server watchdog、Client重启后的controller target保持、Server接收确认、执行确认容差、world到odom关系、MMK2 FK输出frame、JointState effort单位、官方attempt开始身份。每项都含阻塞角色、所需测试和禁止假设；验证前不得填写经验值。
 
 ## 12. schema升级规则
 

@@ -11,7 +11,7 @@
     "official_cmd_vel_accepted_limits_status": "unresolved",
     "position_zero_is_stop": false,
     "uncontrolled_position_fill_zero_forbidden": true,
-    "gripper_open_close_direction_status": "unresolved",
+    "gripper_open_close_direction_status": "runtime_verified",
     "dimensions": [
       {
         "index": 0,
@@ -229,7 +229,7 @@
         "hold_semantics": "这是位置目标；0不是停止，未控制维度不得补零。保持诊断值来自新鲜实际JointState，实际命令以dispatch payload为准。",
         "training_label_semantics": "只有dispatched_action中非null的精确payload可作为命令标签候选。",
         "source_reference": "team_sorting.controller_manifest.MMK2_CONTROLLER_MANIFEST_V1; official MMK2 control MJCF",
-        "status": "unresolved"
+        "status": "runtime_verified"
       },
       {
         "index": 12,
@@ -355,7 +355,7 @@
         "hold_semantics": "这是位置目标；0不是停止，未控制维度不得补零。保持诊断值来自新鲜实际JointState，实际命令以dispatch payload为准。",
         "training_label_semantics": "只有dispatched_action中非null的精确payload可作为命令标签候选。",
         "source_reference": "team_sorting.controller_manifest.MMK2_CONTROLLER_MANIFEST_V1; official MMK2 control MJCF",
-        "status": "unresolved"
+        "status": "runtime_verified"
       }
     ]
   },
@@ -1506,17 +1506,6 @@
     ]
   },
   "unresolved": [
-    {
-      "key": "gripper_open_close_direction",
-      "status": "unresolved",
-      "why_unresolved": "MJCF only proves [0,1] ctrlrange, not physical direction",
-      "blocking_roles": [
-        "arm",
-        "data"
-      ],
-      "required_test": "observe commanded values and aperture/contact in official simulation",
-      "must_not_assume": "0=open or 1=open"
-    },
     {
       "key": "valid_gripping_value",
       "status": "unresolved",
