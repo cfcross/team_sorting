@@ -18,6 +18,7 @@ from team_sorting.competition_context import CompetitionContext
 from team_sorting.external_candidate import ExternalCandidateDecision
 from team_sorting.fsm import FSMEvent
 from team_sorting.navigation import NavigationConfig, NavigationController
+from team_sorting.navigation_posture import _NavigationPostureState
 from team_sorting.pi05_policy_control import PolicyControlDecision
 from team_sorting.interfaces import (
     ArmExecutionConfig,
@@ -213,11 +214,15 @@ def _config(
 
 def _node(
     head_tracking_overrides: dict[str, Any] | None = None,
+    *,
+    navigation_safety_enabled: bool = True,
     **control_overrides: bool,
 ) -> Any:
     ros = _ros()
+    config = _config(head_tracking_overrides, **control_overrides)
+    config["navigation_safety"]["enabled"] = navigation_safety_enabled
     return _create_team_client_node(ros)(
-        _config(head_tracking_overrides, **control_overrides), ros
+        config, ros
     )
 
 
@@ -264,6 +269,107 @@ def _base() -> BaseState:
         angular_velocity_xyz=(0.0, 0.0, 0.0),
         frame_id="odom",
         timestamp_ns=NOW,
+    )
+
+
+def _safe_nav_base(timestamp_ns: int = NOW) -> BaseState:
+    return replace(_base(), position_xyz=(-1.0, 1.0, 0.0), timestamp_ns=timestamp_ns)
+
+
+def _activate_trusted_navigation_posture(node: Any, now_ns: int = NOW) -> None:
+    node._navigation_velocity_feedback_trusted = True
+    for offset in (2, 1, 0):
+        state = node._navigation_posture.observe(
+            replace(_joints(), timestamp_ns=now_ns - offset), now_ns - offset
+        )
+    assert state is _NavigationPostureState.ACTIVE
+
+
+@pytest.mark.parametrize(
+    "phase",
+    (GlobalPhase.NAV_TO_PICK, GlobalPhase.NAV_TO_PLACE, GlobalPhase.RETURN_END),
+)
+def test_default_disabled_navigation_uses_stage_31_to_33_path_without_posture_gate(
+    phase: GlobalPhase,
+) -> None:
+    ros = _ros()
+    node = _create_team_client_node(ros)(_config(), ros)
+    assert node._navigation_safety_enabled is False
+    assert type(node._navigation) is NavigationController
+    assert node._navigation_posture is None
+
+    goal = NavGoal(
+        f"{phase.value}-baseline", "baseline", (0.4, 0.0, 0.0), "odom",
+        0.05, 0.1, NOW + 1_000,
+    )
+    calls: list[tuple[BaseState, NavGoal, int]] = []
+
+    def update(
+        base: BaseState, supplied_goal: NavGoal, timestamp_ns: int
+    ) -> tuple[BaseCommand, NavigationStatus]:
+        calls.append((base, supplied_goal, timestamp_ns))
+        return (
+            BaseCommand(0.1, -0.2, timestamp_ns, timestamp_ns + 100),
+            NavigationStatus(
+                supplied_goal.goal_id, "moving", 0.4, -0.2, False, "", timestamp_ns
+            ),
+        )
+
+    node._navigation.update = update
+    node._runtime_wiring.active_nav_goal = goal
+    snapshot = SensorSnapshot(_task(), _base(), _joints(), (), NOW, True)
+    status = FSMStatus(1, phase, LocalPhase.IDLE, 0, False, "", NOW)
+
+    command, manipulation = node._compute_candidate_commands(snapshot, status, NOW)
+
+    assert manipulation is None
+    assert command is not None and command.valid
+    assert (command.v, command.w) == pytest.approx((0.1, -0.2))
+    assert calls == [(snapshot.base, goal, NOW)]
+    assert "POSTURE" not in node._runtime_wiring.navigation_diagnostic
+
+
+@pytest.mark.parametrize(
+    "phase",
+    (GlobalPhase.NAV_TO_PICK, GlobalPhase.NAV_TO_PLACE, GlobalPhase.RETURN_END),
+)
+def test_default_disabled_phase_entry_builds_original_single_active_goal(
+    phase: GlobalPhase,
+) -> None:
+    ros = _ros()
+    node = _create_team_client_node(ros)(_config(), ros)
+    if phase is GlobalPhase.NAV_TO_PICK:
+        node._runtime_wiring.search_target = _estimate("baseline-target", 0.9)
+    snapshot = SensorSnapshot(_task(), _base(), _joints(), (), NOW, True)
+    status = FSMStatus(1, phase, LocalPhase.IDLE, 0, False, "", NOW)
+
+    assert node._handle_phase_entry(snapshot, status, None, NOW)
+
+    state = node._runtime_wiring
+    assert isinstance(state.active_nav_goal, NavGoal)
+    assert state.final_nav_goal is None
+    assert state.navigation_preparation_state == "IDLE"
+    assert state.navigation_route_generation is None
+
+
+def test_enabled_navigation_still_fails_closed_without_trusted_posture_feedback() -> None:
+    node = _node(navigation_safety_enabled=True)
+    assert node._navigation_safety_enabled is True
+    assert node._navigation_posture is not None
+    node._runtime_wiring.final_nav_goal = NavGoal(
+        "guarded", "pick", (0.4, 0.0, 0.0), "odom", 0.05, 0.1, NOW + 1_000
+    )
+    snapshot = SensorSnapshot(_task(), _base(), _joints(), (), NOW, True)
+    status = FSMStatus(
+        1, GlobalPhase.NAV_TO_PICK, LocalPhase.IDLE, 0, False, "", NOW
+    )
+
+    command, _ = node._compute_candidate_commands(snapshot, status, NOW)
+
+    assert command is not None and command.valid
+    assert (command.v, command.w) == (0.0, 0.0)
+    assert "BLOCKED_BY_EXTERNAL_POSTURE_FEEDBACK" in (
+        node._runtime_wiring.navigation_diagnostic
     )
 
 
@@ -1070,7 +1176,7 @@ def test_phase_entry_runs_once_per_phase_and_rearms_on_change() -> None:
     assert node._runtime_wiring.active_target is None
 
 
-def test_navigation_pick_goal_is_built_once_and_reused_for_every_update() -> None:
+def test_navigation_pick_final_goal_is_built_once_before_posture_feedback() -> None:
     node = _node()
     goal = NavGoal(
         "pick-goal", "pick", (0.4, 0.0, 0.0), "odom", 0.05, 0.1, NOW + 1_000
@@ -1112,12 +1218,15 @@ def test_navigation_pick_goal_is_built_once_and_reused_for_every_update() -> Non
 
     assert node._handle_phase_entry(snapshot, status, None, NOW)
     assert not node._handle_phase_entry(snapshot, status, None, NOW + 1)
-    assert node._runtime_wiring.active_nav_goal is goal
+    assert node._runtime_wiring.final_nav_goal is goal
+    assert node._runtime_wiring.active_nav_goal is None
     node._compute_candidate_commands(snapshot, status, NOW)
     node._compute_candidate_commands(snapshot, status, NOW + 1)
 
     assert len(calls["build"]) == 1
-    assert [call[1] for call in calls["update"]] == [goal, goal]
+    assert calls["update"] == []
+    assert node._runtime_wiring.navigation_preparation_state == "WAITING_FOR_POSTURE"
+    assert "BLOCKED_BY_EXTERNAL_POSTURE_FEEDBACK" in node._runtime_wiring.navigation_diagnostic
 
 
 @pytest.mark.parametrize(
@@ -1136,33 +1245,27 @@ def test_navigation_arrival_emits_matching_real_feedback_once(
     state.run_id = "run-1"
     state.task_id = 1
     state.attempt = 0
-    state.active_nav_goal = NavGoal(
-        "goal-a", "test", (0.0, 0.0, 0.0), "odom", 0.05, 0.1, NOW + 1_000
+    state.final_nav_goal = NavGoal(
+        "goal-a", "test", (-1.0, 1.0, 0.0), "odom", 0.05, 0.1, NOW + 1_000
     )
-
-    class ArrivedNavigation:
-        def update(
-            self, _base_state: BaseState, supplied_goal: NavGoal, timestamp_ns: int
-        ) -> tuple[BaseCommand, NavigationStatus]:
-            return (
-                BaseCommand(0.0, 0.0, timestamp_ns, timestamp_ns + 100),
-                NavigationStatus(
-                    supplied_goal.goal_id,
-                    "arrived",
-                    0.0,
-                    0.0,
-                    True,
-                    "",
-                    timestamp_ns,
-                ),
-            )
-
-    node._navigation = ArrivedNavigation()
-    snapshot = SensorSnapshot(_task(), _base(), _joints(), (), NOW, True)
+    state.navigation_preparation_state = "WAITING_FOR_POSTURE"
+    _activate_trusted_navigation_posture(node)
     status = FSMStatus(1, phase, LocalPhase.IDLE, 0, False, "", NOW)
 
-    first = node._run_current_phase(snapshot, status, None, NOW)
-    second = node._run_current_phase(snapshot, status, None, NOW)
+    results = []
+    for offset in range(3):
+        timestamp = NOW + offset
+        snapshot = SensorSnapshot(
+            _task(),
+            _safe_nav_base(timestamp),
+            replace(_joints(), timestamp_ns=timestamp),
+            (),
+            timestamp,
+            True,
+        )
+        results.append(node._run_current_phase(snapshot, status, None, timestamp))
+    first = results[-1]
+    second = node._run_current_phase(snapshot, status, None, NOW + 2)
 
     assert first[0] is not None and first[0].valid
     assert (first[0].v, first[0].w) == (0.0, 0.0)
@@ -1179,23 +1282,29 @@ def test_navigation_goal_identity_mismatch_fails_once_with_invalid_zero_base() -
     state.run_id = "run-1"
     state.task_id = 1
     state.attempt = 0
-    state.active_nav_goal = NavGoal(
-        "goal-a", "pick", (0.4, 0.0, 0.0), "odom", 0.05, 0.1, NOW + 1_000
+    state.final_nav_goal = NavGoal(
+        "goal-a", "pick", (-0.7, 0.55, 0.0), "odom", 0.05, 0.1, NOW + 1_000
     )
+    node._navigation_velocity_feedback_trusted = True
+    node._navigation_posture = SimpleNamespace(
+        observe=lambda *_args: _NavigationPostureState.ACTIVE,
+        active=True,
+        failure_reason="",
+    )
+    state.navigation_preparation_state = "WAITING_FOR_POSTURE"
 
-    class WrongGoalNavigation:
-        def update(
-            self, _base_state: BaseState, _goal: NavGoal, timestamp_ns: int
-        ) -> tuple[BaseCommand, NavigationStatus]:
-            return (
-                BaseCommand(0.2, 0.1, timestamp_ns, timestamp_ns + 100),
-                NavigationStatus(
-                    "other-goal", "moving", 1.0, 0.0, False, "", timestamp_ns
-                ),
-            )
+    def wrong_goal_update(
+        _base_state: BaseState, _goal: NavGoal, timestamp_ns: int
+    ) -> tuple[BaseCommand, NavigationStatus]:
+        return (
+            BaseCommand(0.2, 0.1, timestamp_ns, timestamp_ns + 100),
+            NavigationStatus(
+                "other-goal", "moving", 1.0, 0.0, False, "", timestamp_ns
+            ),
+        )
 
-    node._navigation = WrongGoalNavigation()
-    snapshot = SensorSnapshot(_task(), _base(), _joints(), (), NOW, True)
+    node._navigation.update = wrong_goal_update
+    snapshot = SensorSnapshot(_task(), _safe_nav_base(), _joints(), (), NOW, True)
     status = FSMStatus(1, GlobalPhase.NAV_TO_PICK, LocalPhase.IDLE, 0, False, "", NOW)
 
     first = node._run_current_phase(snapshot, status, None, NOW)
@@ -1208,7 +1317,7 @@ def test_navigation_goal_identity_mismatch_fails_once_with_invalid_zero_base() -
     assert second[2] is None
 
 
-def test_navigation_candidate_enters_action_mux_and_safe_hold_preserves_no_event() -> None:
+def test_navigation_untrusted_posture_feedback_keeps_zero_and_safe_hold_state() -> None:
     node = _node()
     state = node._runtime_wiring
     goal = NavGoal(
@@ -1247,7 +1356,8 @@ def test_navigation_candidate_enters_action_mux_and_safe_hold_preserves_no_event
     )
 
     assert command is not None and command.valid
-    assert action.values[:2] == pytest.approx((0.1, -0.2))
+    assert action.values[:2] == (0.0, 0.0)
+    assert "BLOCKED_BY_EXTERNAL_POSTURE_FEEDBACK" in state.navigation_diagnostic
 
     state.navigation_diagnostic = "latched"
     node._prepare_phase_transition(GlobalPhase.NAV_TO_PICK, GlobalPhase.SAFE_HOLD)
@@ -1275,6 +1385,13 @@ def test_navigation_bad_odom_fails_once_with_invalid_zero_base(
     state.active_nav_goal = NavGoal(
         "goal-a", "pick", (0.4, 0.0, 0.0), "odom", 0.05, 0.1, NOW + 1_000
     )
+    state.final_nav_goal = state.active_nav_goal
+    node._navigation_velocity_feedback_trusted = True
+    node._navigation_posture = SimpleNamespace(
+        observe=lambda *_args: _NavigationPostureState.ACTIVE,
+        active=True,
+        failure_reason="",
+    )
     base = (
         replace(_base(), timestamp_ns=NOW - 150_000_001)
         if bad_base == "stale"
@@ -1289,7 +1406,7 @@ def test_navigation_bad_odom_fails_once_with_invalid_zero_base(
     assert first[0] is not None and not first[0].valid
     assert (first[0].v, first[0].w) == (0.0, 0.0)
     assert first[2] is not None and first[2].event is FSMEvent.FAILURE
-    expected = "过期" if bad_base == "stale" else "frame"
+    expected = "过期" if bad_base == "stale" else "odom"
     assert expected in first[2].reason
     assert second[2] is None
 
@@ -1529,7 +1646,7 @@ def test_direct_navigation_terminal_transition_resets_lifecycle(
 
 def test_runtime_navigation_reset_is_repeatable() -> None:
     node = _node()
-    controller = node._navigation
+    controller = node._navigation._controller
     controller._active_goal_key = ("old-goal",)
     controller._execution_elapsed_ns = 50
     controller._control_granted_since_checkpoint = True
@@ -1966,27 +2083,352 @@ def test_real_search_feedback_advances_only_through_existing_event_adapter() -> 
     assert node._runtime_wiring.active_target.object_id == "stable:7"
 
 
-def test_control_tick_reports_same_cycle_navigation_publish_result() -> None:
+def test_navigation_missing_velocity_provenance_blocks_real_publish_chain() -> None:
     node = _node(observe_only=False, enable_official_publish=True)
     _prime_control_state(node)
     node._control_tick()
     node._on_instruction(_message(json.dumps(OFFICIAL_TASKS)))
     _feed_official_context(node, task=1, attempt=0)
-    node._latest_estimates = (_estimate("stable:7", 0.9, timestamp_ns=NOW),)
-    results: list[tuple[int, bool]] = []
-    original_record = node._navigation.record_control_result
-
-    def record(timestamp_ns: int, granted: bool) -> None:
-        results.append((timestamp_ns, granted))
-        original_record(timestamp_ns, granted)
-
-    node._navigation.record_control_result = record
+    node._latest_estimates = (_estimate("stable:blocked", 0.9, timestamp_ns=NOW),)
     node._control_tick()
     assert node._fsm.phase is GlobalPhase.NAV_TO_PICK
+    authorizations: list[bool] = []
+    original_publish = node._publish_final_action
+
+    def capture_publish(*args: object, **kwargs: object) -> bool:
+        authorizations.append(
+            bool(kwargs.get("internal_fsm_publish_authorized", False))
+        )
+        return original_publish(*args, **kwargs)
+
+    node._publish_final_action = capture_publish
+    cmd_vel_before = len(node.publishers["/cmd_vel"].messages)
     node._control_tick()
 
-    assert results[-1] == (NOW, True)
+    state = node._runtime_wiring
+    assert state.navigation_preparation_state == "WAITING_FOR_POSTURE"
+    assert "BLOCKED_BY_EXTERNAL_POSTURE_FEEDBACK" in state.navigation_diagnostic
+    assert authorizations == [False]
+    assert len(node.publishers["/cmd_vel"].messages) == cmd_vel_before
+    action = json.loads(node.publishers["/team/final_action"].messages[-1].data)
+    assert action["action"][0:2] == [0.0, 0.0]
+
+
+def test_control_tick_reports_same_cycle_navigation_publish_result() -> None:
+    node = _node(observe_only=False, enable_official_publish=True)
+    _, results = _start_internal_navigation_with_control_feedback(node)
+    assert results[-1] == (NOW + 2, True)
     assert _official_message_count(node) >= 5
+
+
+def test_intermediate_waypoint_advances_without_fsm_and_safe_hold_preserves_budget() -> None:
+    node = _node()
+    controller = node._navigation
+    final_goal = NavGoal(
+        "multi-final", "pick", (-1.8, 1.0, 0.25), "odom", 0.05, 0.1,
+        NOW + 30_000_000_000,
+    )
+    plan = controller.plan_route(
+        replace(_safe_nav_base(), position_xyz=(-2.3, 2.0, 0.0)), final_goal, NOW
+    )
+    assert len(plan.goals) >= 2
+    first_waypoint = plan.goals[0]
+    state = node._runtime_wiring
+    state.final_nav_goal = final_goal
+    state.active_nav_goal = first_waypoint
+    state.navigation_preparation_state = "READY"
+    state.navigation_route_generation = plan.generation
+    _activate_trusted_navigation_posture(node)
+    controller.record_control_result(NOW, True)
+    waypoint_base = replace(
+        _safe_nav_base(NOW + 10),
+        position_xyz=(first_waypoint.pose_xyyaw[0], first_waypoint.pose_xyyaw[1], 0.0),
+    )
+    snapshot = SensorSnapshot(
+        _task(), waypoint_base, replace(_joints(), timestamp_ns=NOW + 10), (),
+        NOW + 10, True,
+    )
+    status = FSMStatus(
+        1, GlobalPhase.NAV_TO_PICK, LocalPhase.IDLE, 0, False, "", NOW + 10
+    )
+
+    _, _, event = node._run_current_phase(snapshot, status, None, NOW + 10)
+
+    assert event is None, event.reason if event is not None else ""
+    assert controller.current_index == 1
+    assert controller._last_progress_odom_timestamp_ns == NOW + 10
+    assert controller.current_goal is state.active_nav_goal
+    assert controller._path_elapsed_ns == 10
+    _, _, repeated_event = node._run_current_phase(snapshot, status, None, NOW + 10)
+    assert repeated_event is None
+    assert controller.current_index == 1
+    assert controller._last_progress_odom_timestamp_ns == NOW + 10
+    plan_identity = controller.plan
+    node._prepare_phase_transition(GlobalPhase.NAV_TO_PICK, GlobalPhase.SAFE_HOLD)
+    controller.record_control_result(NOW + 10, False)
+    controller.record_control_result(NOW + 1_000, False)
+    node._prepare_phase_transition(GlobalPhase.SAFE_HOLD, GlobalPhase.NAV_TO_PICK)
+    assert controller.plan is plan_identity
+    assert controller.current_index == 1
+    assert controller._last_progress_odom_timestamp_ns == NOW + 10
+    assert controller._path_elapsed_ns == 10
+    waiting_snapshot = replace(
+        snapshot,
+        base=replace(waypoint_base, timestamp_ns=NOW + 1_000),
+        joints=replace(_joints(), timestamp_ns=NOW + 1_000),
+        timestamp_ns=NOW + 1_000,
+    )
+    command, _ = node._compute_candidate_commands(
+        waiting_snapshot, replace(status, timestamp_ns=NOW + 1_000), NOW + 1_000
+    )
+    assert command is not None and command.valid
+    assert (command.v, command.w) == (0.0, 0.0)
+    assert node._navigation_posture.settled_cycles == 1
+    assert state.navigation_preparation_state == "WAITING_FOR_POSTURE"
+    assert controller.plan is plan_identity and controller.current_index == 1
+    resumed_goal = controller.current_goal
+    assert resumed_goal is not None
+    for offset in (1_001, 1_002):
+        resumed_snapshot = replace(
+            snapshot,
+            base=replace(
+                waypoint_base,
+                position_xyz=(
+                    resumed_goal.pose_xyyaw[0],
+                    resumed_goal.pose_xyyaw[1],
+                    0.0,
+                ),
+                timestamp_ns=NOW + 10,
+            ),
+            joints=replace(_joints(), timestamp_ns=NOW + offset),
+            timestamp_ns=NOW + offset,
+        )
+        command, _ = node._compute_candidate_commands(
+            resumed_snapshot,
+            replace(status, timestamp_ns=NOW + offset),
+            NOW + offset,
+        )
+    assert command is not None and command.valid
+    assert (command.v, command.w) == (0.0, 0.0)
+    assert state.navigation_preparation_state == "READY"
+    assert controller.current_index == 1
+    assert controller._last_progress_odom_timestamp_ns == NOW + 10
+
+
+def test_repeated_odom_waiting_has_no_full_publish_or_path_budget() -> None:
+    node = _node(observe_only=False, enable_official_publish=True)
+    controller, results = _start_internal_navigation_with_control_feedback(node)
+    final_goal = NavGoal(
+        "waiting-final", "pick", (-1.8, 1.0, 0.25), "odom", 0.05, 0.1,
+        NOW + 30_000_000_000,
+    )
+    route_start = replace(
+        _safe_nav_base(NOW + 10), position_xyz=(-2.3, 2.0, 0.0)
+    )
+    plan = controller.plan_route(route_start, final_goal, NOW + 10)
+    assert len(plan.goals) >= 2
+    state = node._runtime_wiring
+    state.final_nav_goal = final_goal
+    state.active_nav_goal = plan.goals[0]
+    state.navigation_route_generation = plan.generation
+    state.navigation_preparation_state = "READY"
+    node.now_ns = NOW + 10
+    node._base_cache.put(route_start.timestamp_ns, route_start)
+    node._joint_cache.put(NOW + 10, replace(_joints(), timestamp_ns=NOW + 10))
+    node._control_tick()
+    assert controller.current_index == 0
+    assert results[-1] == (NOW + 10, True)
+
+    first_waypoint = plan.goals[0]
+    consumed_base = replace(
+        route_start,
+        position_xyz=(first_waypoint.pose_xyyaw[0], first_waypoint.pose_xyyaw[1], 0.0),
+        timestamp_ns=NOW + 11,
+    )
+    node.now_ns = NOW + 11
+    node._base_cache.put(consumed_base.timestamp_ns, consumed_base)
+    node._joint_cache.put(NOW + 11, replace(_joints(), timestamp_ns=NOW + 11))
+    node._control_tick()
+    assert controller.current_index == 1
+    assert results[-1] == (NOW + 11, False)
+
+    plan_identity = controller.plan
+    active_identity = state.active_nav_goal
+    final_identity = state.final_nav_goal
+    elapsed_before_wait = controller._path_elapsed_ns
+    cmd_vel_before_wait = len(node.publishers["/cmd_vel"].messages)
+    publish_authorizations: list[bool] = []
+    original_publish = node._publish_final_action
+
+    def capture_publish(*args: object, **kwargs: object) -> bool:
+        publish_authorizations.append(
+            bool(kwargs.get("internal_fsm_publish_authorized", False))
+        )
+        return original_publish(*args, **kwargs)
+
+    node._publish_final_action = capture_publish
+    node.now_ns = NOW + 20
+    node._base_cache.put(consumed_base.timestamp_ns, consumed_base)
+    node._joint_cache.put(NOW + 20, replace(_joints(), timestamp_ns=NOW + 20))
+    node._control_tick()
+
+    assert controller.waiting_for_new_odom
+    assert state.navigation_waiting_for_new_odom
+    assert state.navigation_preparation_state == "READY"
+    assert controller.plan is plan_identity
+    assert state.active_nav_goal is active_identity
+    assert state.final_nav_goal is final_identity
+    assert controller.current_index == 1
+    assert publish_authorizations == [False]
+    assert len(node.publishers["/cmd_vel"].messages) == cmd_vel_before_wait
+    assert results[-1] == (NOW + 20, False)
+    assert controller._path_elapsed_ns == elapsed_before_wait
+    assert node._fsm.phase is GlobalPhase.NAV_TO_PICK
+    assert not state.navigation_failure_submitted
+    assert "等待timestamp严格更新的Odom" in state.navigation_diagnostic
+
+    node.now_ns = NOW + 30
+    newer_base = replace(consumed_base, timestamp_ns=NOW + 12)
+    node._base_cache.put(newer_base.timestamp_ns, newer_base)
+    node._joint_cache.put(NOW + 30, replace(_joints(), timestamp_ns=NOW + 30))
+    node._control_tick()
+
+    assert not controller.waiting_for_new_odom
+    assert not state.navigation_waiting_for_new_odom
+    assert state.navigation_preparation_state == "READY"
+    assert controller.plan is plan_identity
+    assert state.final_nav_goal is final_identity
+    assert controller.current_index == 1
+    assert publish_authorizations[-1] is True
+    assert len(node.publishers["/cmd_vel"].messages) == cmd_vel_before_wait + 1
+    assert results[-2:] == [(NOW + 30, False), (NOW + 30, True)]
+    assert controller._path_elapsed_ns == elapsed_before_wait
+    assert node._fsm.phase is GlobalPhase.NAV_TO_PICK
+
+
+def _waypoint_progress_tick_fixture() -> tuple[Any, Any, list[tuple[int, bool]], Any]:
+    node = _node(observe_only=False, enable_official_publish=True)
+    controller, results = _start_internal_navigation_with_control_feedback(node)
+    final_goal = NavGoal(
+        "progress-final", "pick", (-1.8, 1.0, 0.25), "odom", 0.05, 0.1,
+        NOW + 30_000_000_000,
+    )
+    route_start = replace(
+        _safe_nav_base(NOW + 10), position_xyz=(-2.3, 2.0, 0.0)
+    )
+    plan = controller.plan_route(route_start, final_goal, NOW + 10)
+    assert len(plan.goals) >= 2
+    state = node._runtime_wiring
+    state.final_nav_goal = final_goal
+    state.active_nav_goal = plan.goals[0]
+    state.navigation_route_generation = plan.generation
+    state.navigation_preparation_state = "READY"
+    waypoint = plan.goals[0]
+    waypoint_base = replace(
+        route_start,
+        position_xyz=(waypoint.pose_xyyaw[0], waypoint.pose_xyyaw[1], 0.0),
+    )
+    return node, controller, results, waypoint_base
+
+
+def test_waypoint_progress_publish_failure_is_not_hidden() -> None:
+    node, controller, results, waypoint_base = _waypoint_progress_tick_fixture()
+    observed_progress: list[bool] = []
+    original_publish = node._publish_final_action
+
+    def capture_failed_publish(*args: object, **kwargs: object) -> bool:
+        observed_progress.append(
+            node._runtime_wiring.navigation_progressed_this_update
+        )
+        return original_publish(*args, **kwargs)
+
+    node._publish_final_action = capture_failed_publish
+    node.publishers["/cmd_vel"].fail = True
+    node.now_ns = NOW + 10
+    node._base_cache.put(waypoint_base.timestamp_ns, waypoint_base)
+    node._joint_cache.put(NOW + 10, replace(_joints(), timestamp_ns=NOW + 10))
+    node._control_tick()
+
+    state = node._runtime_wiring
+    assert observed_progress == [True]
+    assert results[-1] == (NOW + 10, False)
+    assert state.navigation_preparation_state == "FAILED"
+    assert controller.plan is None
+    assert state.active_nav_goal is None
+    assert not state.navigation_waiting_for_new_odom
+    assert not state.navigation_progressed_this_update
+    assert "发布失败" in state.navigation_diagnostic
+    assert not state.navigation_success_submitted
+
+    node.publishers["/cmd_vel"].fail = False
+    node.now_ns = NOW + 11
+    node._base_cache.put(
+        NOW + 11, replace(waypoint_base, timestamp_ns=NOW + 11)
+    )
+    node._joint_cache.put(NOW + 11, replace(_joints(), timestamp_ns=NOW + 11))
+    node._control_tick()
+    assert controller.plan is None
+
+
+def test_waypoint_progress_mux_rejection_is_not_hidden() -> None:
+    node, controller, results, waypoint_base = _waypoint_progress_tick_fixture()
+    cmd_vel_before = len(node.publishers["/cmd_vel"].messages)
+    original_compose = node._mux.compose_with_decision
+    original_publish = node._publish_final_action
+    publish_authorizations: list[bool] = []
+
+    def reject_real_base_candidate(*args: object, **kwargs: object) -> tuple[Any, Any]:
+        action, decision = original_compose(*args, **kwargs)
+        assert decision.base_disposition is ros_nodes_module.CandidateDisposition.ACCEPTED
+        return (
+            action,
+            replace(
+                decision,
+                base_disposition=ros_nodes_module.CandidateDisposition.REJECTED_INVALID,
+                commanded_mask=(False, False, *decision.commanded_mask[2:]),
+            ),
+        )
+
+    node._mux.compose_with_decision = reject_real_base_candidate
+
+    def capture_publish(*args: object, **kwargs: object) -> bool:
+        publish_authorizations.append(
+            bool(kwargs.get("internal_fsm_publish_authorized", False))
+        )
+        return original_publish(*args, **kwargs)
+
+    node._publish_final_action = capture_publish
+    node.now_ns = NOW + 10
+    node._base_cache.put(waypoint_base.timestamp_ns, waypoint_base)
+    node._joint_cache.put(NOW + 10, replace(_joints(), timestamp_ns=NOW + 10))
+    node._control_tick()
+
+    state = node._runtime_wiring
+    assert results[-1] == (NOW + 10, False)
+    assert state.navigation_preparation_state == "FAILED"
+    assert controller.plan is None
+    assert state.active_nav_goal is None
+    assert not state.navigation_waiting_for_new_odom
+    assert not state.navigation_progressed_this_update
+    assert publish_authorizations == [False]
+    assert len(node.publishers["/cmd_vel"].messages) == cmd_vel_before
+
+
+def test_invalid_joint_state_clears_navigation_runtime_progress_flags() -> None:
+    node = _node(observe_only=False, enable_official_publish=True)
+    _start_internal_navigation_with_control_feedback(node)
+    state = node._runtime_wiring
+    state.navigation_waiting_for_new_odom = True
+    state.navigation_progressed_this_update = True
+    invalid = replace(_joints(), valid=False, failure_reason="invalid joints")
+    node.now_ns = NOW + 10
+    node._base_cache.put(NOW + 10, _safe_nav_base(NOW + 10))
+    node._joint_cache.put(NOW + 10, replace(invalid, timestamp_ns=NOW + 10))
+    node._control_tick()
+
+    assert not state.navigation_waiting_for_new_odom
+    assert not state.navigation_progressed_this_update
+    assert state.navigation_preparation_state == "FAILED"
 
 
 def test_control_tick_early_return_revokes_navigation_control() -> None:
@@ -2007,7 +2449,8 @@ def test_control_tick_early_return_revokes_navigation_control() -> None:
 def test_control_tick_exception_after_previous_true_revokes_navigation_clock() -> None:
     node = _node(observe_only=False, enable_official_publish=True)
     _prime_control_state(node)
-    controller = node._navigation
+    controller = NavigationController(NavigationConfig(goal_timeout_ns=100))
+    node._navigation = controller
     controller._active_goal_key = ("active",)
     controller._clock_checkpoint_ns = NOW
     controller._control_granted_since_checkpoint = True
@@ -2033,8 +2476,8 @@ def test_control_tick_exception_after_previous_true_revokes_navigation_clock() -
 def test_control_tick_clock_exception_revokes_without_fabricating_timestamp() -> None:
     node = _node(observe_only=False, enable_official_publish=True)
     controller, results = _start_internal_navigation_with_control_feedback(node)
-    elapsed_before = controller._execution_elapsed_ns
-    checkpoint_before = controller._clock_checkpoint_ns
+    elapsed_before = controller._path_elapsed_ns
+    checkpoint_before = controller._path_checkpoint_ns
     clock_error = RuntimeError("injected clock read failure")
 
     def fail_clock() -> object:
@@ -2045,18 +2488,19 @@ def test_control_tick_clock_exception_revokes_without_fabricating_timestamp() ->
         node._control_tick()
 
     assert caught.value is clock_error
-    assert results[-1] == (NOW, True)
+    assert results[-1] == (NOW + 2, True)
     assert controller._control_granted_since_checkpoint is False
-    assert controller._execution_elapsed_ns == elapsed_before
-    assert controller._clock_checkpoint_ns == checkpoint_before
+    assert controller._path_elapsed_ns == elapsed_before
+    assert controller._path_checkpoint_ns == checkpoint_before
     controller.record_control_result(NOW + 10_000, False)
-    assert controller._execution_elapsed_ns == elapsed_before
+    assert controller._path_elapsed_ns == elapsed_before
 
 
 def _start_internal_navigation_with_control_feedback(
     node: Any,
 ) -> tuple[Any, list[tuple[int, bool]]]:
-    _prime_control_state(node)
+    node._base_cache.put(NOW, _safe_nav_base())
+    node._joint_cache.put(NOW, _joints())
     node._control_tick()
     node._on_instruction(_message(json.dumps(OFFICIAL_TASKS)))
     _feed_official_context(node, task=1, attempt=0)
@@ -2064,6 +2508,18 @@ def _start_internal_navigation_with_control_feedback(
     node._control_tick()
     assert node._fsm.phase is GlobalPhase.NAV_TO_PICK
     controller = node._navigation
+    original_build = controller.build_pick_goal
+
+    def build_safe_goal(*args: object, **kwargs: object) -> NavGoal:
+        built = original_build(*args, **kwargs)
+        return replace(
+            built,
+            pose_xyyaw=(-0.7, 0.55, built.pose_xyyaw[2]),
+            deadline_ns=NOW + 30_000_000_000,
+        )
+
+    controller.build_pick_goal = build_safe_goal
+    node._navigation_velocity_feedback_trusted = True
     results: list[tuple[int, bool]] = []
     original_record = controller.record_control_result
 
@@ -2072,8 +2528,16 @@ def _start_internal_navigation_with_control_feedback(
         original_record(timestamp_ns, granted)
 
     controller.record_control_result = record
-    node._control_tick()
-    assert results[-2:] == [(NOW, False), (NOW, True)]
+    for offset in range(3):
+        node.now_ns = NOW + offset
+        node._base_cache.put(NOW + offset, _safe_nav_base(NOW + offset))
+        node._joint_cache.put(
+            NOW + offset, replace(_joints(), timestamp_ns=NOW + offset)
+        )
+        node._control_tick()
+    assert results[-2:] == [(NOW + 2, False), (NOW + 2, True)]
+    assert controller.plan is not None
+    assert node._runtime_wiring.active_nav_goal is controller.current_goal
     return controller, results
 
 
@@ -2081,8 +2545,12 @@ def test_reset_failure_with_stale_goal_blocks_real_tick_authorization_and_publis
     node = _node(observe_only=False, enable_official_publish=True)
     controller, _ = _start_internal_navigation_with_control_feedback(node)
     state = node._runtime_wiring
-    stale_goal = state.active_nav_goal
-    assert stale_goal is not None
+    stale_active_goal = state.active_nav_goal
+    stale_final_goal = state.final_nav_goal
+    stale_plan = controller.plan
+    assert stale_active_goal is not None
+    assert stale_final_goal is not None
+    assert stale_plan is not None
     state.last_handled_phase = GlobalPhase.SEARCH_TARGET
     state.navigation_failure_submitted = False
     state.last_event_tick_ns = None
@@ -2131,13 +2599,14 @@ def test_reset_failure_with_stale_goal_blocks_real_tick_authorization_and_publis
     node._control_tick()
 
     assert build_calls["count"] == 0
-    assert state.active_nav_goal is stale_goal
+    assert state.active_nav_goal is stale_active_goal
+    assert state.final_nav_goal is stale_final_goal
+    assert controller.plan is stale_plan
     assert received_events and received_events[-1][0] is FSMEvent.FAILURE
     assert "injected stale-goal reset failure" in received_events[-1][1]
     assert "injected stale-goal reset failure" in state.navigation_diagnostic
     assert decisions
-    decision = decisions[-1]
-    assert decision.base_disposition is ros_nodes_module.CandidateDisposition.REJECTED_INVALID
+    assert decisions[-1].base_disposition is ros_nodes_module.CandidateDisposition.REJECTED_INVALID
     assert publish_authorizations == [False]
     assert len(node.publishers["/cmd_vel"].messages) == cmd_vel_before
 
@@ -2147,11 +2616,15 @@ def test_control_tick_publish_failure_revokes_previous_navigation_true() -> None
     controller, results = _start_internal_navigation_with_control_feedback(node)
     node.publishers["/cmd_vel"].fail = True
     node._control_tick()
-    assert results[-1] == (NOW, False)
+    assert results[-1] == (NOW + 2, False)
     assert not controller._control_granted_since_checkpoint
-    elapsed = controller._execution_elapsed_ns
+    assert node._runtime_wiring.navigation_preparation_state == "FAILED"
+    assert "发布失败" in node._runtime_wiring.navigation_diagnostic
+    assert controller.plan is None
+    assert node._runtime_wiring.active_nav_goal is None
+    elapsed = controller._path_elapsed_ns
     controller.record_control_result(NOW + 10_000, False)
-    assert controller._execution_elapsed_ns == elapsed
+    assert controller._path_elapsed_ns == elapsed
 
 
 def test_control_tick_pi05_takeover_revokes_previous_navigation_true() -> None:
@@ -2167,11 +2640,11 @@ def test_control_tick_pi05_takeover_revokes_previous_navigation_true() -> None:
 
     node._control_tick()
 
-    assert results[-1] == (NOW, False)
+    assert results[-1] == (NOW + 2, False)
     assert not controller._control_granted_since_checkpoint
-    elapsed = controller._execution_elapsed_ns
+    elapsed = controller._path_elapsed_ns
     controller.record_control_result(NOW + 10_000, False)
-    assert controller._execution_elapsed_ns == elapsed
+    assert controller._path_elapsed_ns == elapsed
 
 
 @pytest.mark.parametrize(
@@ -2501,6 +2974,15 @@ def test_internal_fsm_publish_authorization_is_pure_and_fail_closed() -> None:
     final_action, _ = ActionMux().compose_with_decision(
         base_command, None, _joints(), status, NOW
     )
+    goal = NavGoal(
+        "route-final", "pick", (0.0, 0.0, 0.0), "odom", 0.05, 0.1, NOW + 100
+    )
+    runtime = ros_nodes_module._RuntimeWiringState(
+        active_nav_goal=goal,
+        final_nav_goal=goal,
+        navigation_preparation_state="READY",
+        navigation_route_generation=1,
+    )
 
     assert _internal_fsm_publish_authorization(
         observe_only=False,
@@ -2512,6 +2994,7 @@ def test_internal_fsm_publish_authorization_is_pure_and_fail_closed() -> None:
         manipulation_command=None,
         final_action=final_action,
         now_ns=NOW,
+        runtime_wiring=runtime,
     )
     assert not _internal_fsm_publish_authorization(
         observe_only=True,
@@ -2549,6 +3032,7 @@ def test_internal_fsm_publish_authorization_is_pure_and_fail_closed() -> None:
         manipulation_command=None,
         final_action=zero_final_action,
         now_ns=NOW,
+        runtime_wiring=runtime,
     )
     assert not _internal_fsm_publish_authorization(
         observe_only=False,

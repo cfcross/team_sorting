@@ -141,6 +141,23 @@ Candidate 已执行、已发布或已被机器人采用。
 `NavigationStatus` 串联；非导航阶段仍生成底盘零速候选，且不生成主动17维关节保持候选。
 默认 observe-only 全局门仍禁止把 `FinalAction` 发布到官方控制话题。
 
+3.5静态安全路线由严格布尔`navigation_safety.enabled`显式门控，正式配置默认`false`。
+关闭时节点构造并调用Stage 3.1–3.3原始`NavigationController`路径，不要求posture反馈、
+不读取静态AABB来规划路线，也不启用多段生命周期或whole-path共享预算。打开时才启用
+私有posture gate、膨胀AABB、deterministic waypoint、多段NavGoal、whole-path budget和
+repeated-Odom防重复推进；原有fail-closed合同不放松，中间waypoint不推进FSM，只有最终
+NavGoal可推进FSM，SAFE_HOLD保留路线索引和预算。
+
+当前`INITIAL_ZERO_POSE`只保留为`TEAM_PROVISIONAL`、optional模式，不是正式默认冻结
+策略；批准的未来方向是`DYNAMIC_FROM_JOINT_STATE`，但正式JointState/official collision
+geometry输入尚未获批，因此本仓库只记录方向，不伪造动态footprint实现。enabled模式仍
+要求可溯源的真实velocity；缺少真实性时保持`BLOCKED_BY_EXTERNAL_POSTURE_FEEDBACK`，
+且不会发送主动回零命令。静态障碍物几何、0.5154080786132004m inflation（含0.05m附加
+clearance）、0.01m waypoint margin、8个中间点上限、所有posture目标/容差/周期，以及
+当前`navigation.standoff_m=0.60`均为`TEAM_PROVISIONAL`，不是official frozen、calibrated
+或production-safe数值。动态官方仿真与最终3.4站位仍未闭环，Stage 3.5状态保持
+`PASS_WITH_EXTERNAL_DEPENDENCIES`。
+
 ## 4. 三个 ROS2 节点
 
 ROS 2 节点可以理解为一个独立运行、通过话题交换消息的程序。本仓库只有三个节点入口，
@@ -585,6 +602,9 @@ orphan 规则见
 | `perception.estimator_3d.object_local_size_xyz_m.*` | `[0.24, 0.16, 0.19]` | 官方模型确认的物体局部坐标系完整XYZ尺寸；只用于`size_xyz_m`，不推断姿态 |
 | `perception.estimator_3d.pose_refinement.*` | `enabled: false`，其余见默认配置 | 框内点云深度带、最少点数、连续帧数及位置/角度/尺寸误差门限；均为待真实相机标定的团队初值，正式联调前默认关闭 |
 | `navigation.*` | 见默认配置 | `NavigationConfig` 的完整显式映射；米、弧度、m/s、rad/s 与 ns 参数均为待官方仿真实测标定的保守初值 |
+| `navigation_safety.enabled` | `false` | 严格bool；关闭时保持Stage 3.1–3.3原始生产路径，打开后才启用TEAM_PROVISIONAL静态安全路线 |
+| `navigation_safety.*`（除enabled） | 见默认配置 | TEAM_PROVISIONAL静态AABB、inflation、waypoint margin和中间点上限；不是正式安全标定 |
+| `navigation_posture.*` | 见默认配置 | TEAM_PROVISIONAL optional `INITIAL_ZERO_POSE`反馈模式；未来批准方向为尚未实现的`DYNAMIC_FROM_JOINT_STATE` |
 | `recorder.enabled` | `false` | 默认不启动记录 |
 | `recorder.record_rosbag` | `true` | 启动 Recorder 时同时管理 rosbag |
 | `recorder.root_dir` | `./team_sorting_dataset` | Recorder schema v1 dataset root；旧扁平目录不自动迁移 |
