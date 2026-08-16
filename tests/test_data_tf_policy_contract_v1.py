@@ -25,8 +25,8 @@ ROOT = Path(__file__).resolve().parents[1]
 CONTRACT_PATH = ROOT / "config" / "contracts" / "data_tf_policy_v1.json"
 INTERFACE_PATH = ROOT / "config" / "contracts" / "interface_v1.json"
 RECORDER_PATH = ROOT / "config" / "contracts" / "recorder_schema_v1.json"
-EXPECTED_POLICY_SHA256 = "982934579d816d67c63c1ff8938ea49c54982cf7d75472a58c00fe6a9cefae80"
-EXPECTED_INTERFACE_SHA256 = "a86548b2a43581af70b8d585d523a06bb97a8d96e1fe52950097b12d061fdaea"
+EXPECTED_POLICY_SHA256 = "b80410a12f299503fddd63f0ee4da0a275e24a090df89b198afd3b876dee62dc"
+EXPECTED_INTERFACE_SHA256 = "ff95b964723e0b681427245f503d0e18322f133e1254cbbc1c1681a443bc1922"
 EXPECTED_RECORDER_SHA256 = "e7965c34a38c11d551d9943d8d614c05bc8e28e186432ad5ff4d0eed243225cf"
 EXPECTED_TOPICS = {
     "/material/instruction": "std_msgs/msg/String",

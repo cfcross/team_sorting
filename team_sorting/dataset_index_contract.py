@@ -21,9 +21,9 @@ _TOP_KEYS = {
     "publication", "recovery_integrity", "source_validation", "topic_requirements", "qc_config", "cli_errors", "deferred",
 }
 _DEPENDENCIES = {
-    "interface": ("team_sorting.interface", 1, "a86548b2a43581af70b8d585d523a06bb97a8d96e1fe52950097b12d061fdaea"),
+    "interface": ("team_sorting.interface", 1, "ff95b964723e0b681427245f503d0e18322f133e1254cbbc1c1681a443bc1922"),
     "recorder": ("team_sorting.recorder", 1, "e7965c34a38c11d551d9943d8d614c05bc8e28e186432ad5ff4d0eed243225cf"),
-    "data_tf_policy": ("team_sorting.data_tf_policy", 1, "982934579d816d67c63c1ff8938ea49c54982cf7d75472a58c00fe6a9cefae80"),
+    "data_tf_policy": ("team_sorting.data_tf_policy", 1, "b80410a12f299503fddd63f0ee4da0a275e24a090df89b198afd3b876dee62dc"),
 }
 _EXACT_ARRAYS = {
     "build_inputs": ('schema_name','schema_version','indexer_name','indexer_version','implementation_identity','qc_config_sha256','source_artifact_relative_paths_and_sha256','dependency_contract_sha256'),

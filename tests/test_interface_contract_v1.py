@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 import pytest
+import yaml
 
 import team_sorting.interface_contract as interface_contract_module
 from team_sorting.controller_manifest import MMK2_CONTROLLER_MANIFEST_V1
@@ -192,13 +193,34 @@ def test_safe_and_runtime_ranges_match_controller_manifest() -> None:
     )
 
 
-def test_gripper_ranges_and_direction_remain_unresolved() -> None:
-    actions = _contract()["action_contract"]["dimensions"]
+def test_gripper_calibration_is_consistent_across_frozen_sources() -> None:
+    contract = _contract()
+    actions = contract["action_contract"]["dimensions"]
     for index in (11, 18):
         assert (actions[index]["safe_min"], actions[index]["safe_max"]) == (0, 1)
         assert actions[index]["unit"] == "dimensionless"
-        assert actions[index]["status"] == "unresolved"
-    assert _contract()["action_contract"]["gripper_open_close_direction_status"] == "unresolved"
+        assert actions[index]["status"] == "runtime_verified"
+        assert MMK2_CONTROLLER_MANIFEST_V1.actions[index].verification_status == "runtime_verified"
+    assert contract["action_contract"]["gripper_open_close_direction_status"] == "runtime_verified"
+
+    config = yaml.safe_load((ROOT / "config" / "config.yaml").read_text(encoding="utf-8"))
+    planning = config["arm_planning"]
+    assert planning["left_gripper_open"] == planning["right_gripper_open"] == 1.0
+    assert planning["left_gripper_closed"] == planning["right_gripper_closed"] == 0.1
+    assert planning["gripper_verified_in_official_environment"] is True
+    assert planning["enabled"] is False
+    assert config["control"]["observe_only"] is True
+    assert config["control"]["enable_official_publish"] is False
+    assert config["control"]["simulation_only"] is True
+
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    for fact in ("`open=1.0`", "`closed=0.1`", "`arm_planning.enabled` 仍为 `false`"):
+        assert fact in readme
+    assert "官方离线仿真已进一步验证" in readme
+
+    unresolved = {item["key"] for item in contract["unresolved"]}
+    assert "gripper_open_close_direction" not in unresolved
+    assert "valid_gripping_value" in unresolved
 
 
 def test_joint_missing_velocity_and_effort_warning_is_frozen() -> None:
@@ -294,7 +316,7 @@ def test_every_frozen_public_interface_has_a_version() -> None:
 
 def test_unresolved_items_have_evidence_and_fail_closed_fields() -> None:
     unresolved = _contract()["unresolved"]
-    assert len(unresolved) >= 11
+    assert len(unresolved) >= 10
     assert all(item["status"] == "unresolved" for item in unresolved)
     assert all(item["required_test"] and item["must_not_assume"] and item["blocking_roles"] for item in unresolved)
 

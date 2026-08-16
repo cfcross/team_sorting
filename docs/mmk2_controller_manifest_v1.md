@@ -51,8 +51,9 @@ actuator。五个 Server 订阅端均实测为 `RELIABLE / KEEP_LAST(5) / VOLATI
 
 ## 已实测与仍未知
 
-已实测：运行时 actuator 数量、顺序、`ctrlrange`、五个话题的类型和 Server 订阅 QoS。
-仍未知或未实测：夹爪 0/1 的实际开闭方向、Server watchdog、position target 的锁存与
+已实测：运行时 actuator 数量、顺序、`ctrlrange`、五个话题的类型和 Server 订阅 QoS；官方离线仿真已验证
+左右夹爪均为 `open=1.0`、`closed=0.1`。该端点标定不证明对任意物体的稳定夹持值。
+仍未知或未实测：Server watchdog、position target 的锁存与
 节点重启语义、ROS publish 后的 Server 接收以及物理执行确认。
 
 ## 四层动作事实不能混用
@@ -66,4 +67,3 @@ actuator。五个 Server 订阅端均实测为 `RELIABLE / KEEP_LAST(5) / VOLATI
 增加 dispatch telemetry。训练动作契约仍需后续增加 `commanded_mask`，区分主动命令、
 ActionMux 接受、发布使能、实际 publisher payload 与反馈保持快照；没有
 `ManipulationCommand` 时的 JointState 快照不能称为主动 17 维 hold。
-
