@@ -1037,6 +1037,60 @@ def test_summarize_complete_fields_and_rejects_out_of_order_feedback():
     assert "乱序" in bad["failure_reason"]
 
 
+def test_summarize_skips_duplicate_timestamp_reused_frames():
+    # Step A 修复对应：DDS 复用帧（重复时间戳）必须跳过（不计数也不清零），
+    # 不能误判为乱序而 break；仅严格倒退才是真乱序。
+    position = [0.1, 0.0, 0.0, *([0.0] * 6), 1.0, *([0.0] * 6), 1.0]
+
+    def sample(ts):
+        return {
+            "position": list(position), "velocity": [0.0] * 17, "effort": [0.0] * 17,
+            "joint_names": list(JOINT_NAMES), "timestamp_ns": ts,
+        }
+
+    payload = {
+        "seed": 7, "scenario": "table-side", "task": 1, "object": "track-1",
+        "stage": "pregrasp", "planned_target": position,
+        "controlled_mask": [True] * 17,
+        # 100 新, 100 复用, 200 新, 200 复用, 300 新 -> 仅 3 个新帧进容差
+        "feedback_samples": [sample(100), sample(100), sample(200), sample(200), sample(300)],
+        "tolerances": {"slide_m": 0.01, "arm_rad": 0.01, "gripper": 0.02},
+        "settle_cycles": 3, "command_timestamp_ns": 50, "timeout": False,
+    }
+    result = tool.summarize(payload)
+    assert result["execution_success"] is True
+    assert result["failure_reason"] == ""
+    assert result["stable_frames"] == 3  # 仅新帧计数，复用帧跳过（修复前此用例会误判乱序失败）
+
+
+def test_summarize_resets_stable_when_a_tick_leaves_tolerance():
+    position = [0.1, 0.0, 0.0, *([0.0] * 6), 1.0, *([0.0] * 6), 1.0]
+
+    def sample(ts, *, slide=0.1):
+        pos = list(position)
+        pos[0] = slide
+        return {
+            "position": pos, "velocity": [0.0] * 17, "effort": [0.0] * 17,
+            "joint_names": list(JOINT_NAMES), "timestamp_ns": ts,
+        }
+
+    payload = {
+        "seed": 7, "scenario": "table-side", "task": 1, "object": "track-1",
+        "stage": "pregrasp", "planned_target": position,
+        "controlled_mask": [True] * 17,
+        # 进容差, 进容差, 出容差(slide=0.5>0.01), 进容差 -> 出容差帧把 stable 清零
+        "feedback_samples": [sample(100), sample(200), sample(300, slide=0.5), sample(400)],
+        "tolerances": {"slide_m": 0.01, "arm_rad": 0.01, "gripper": 0.02},
+        "settle_cycles": 3, "command_timestamp_ns": 50, "timeout": False,
+    }
+    result = tool.summarize(payload)
+    # 末帧是新帧且进容差，但前一帧出容差已把 stable 清零，故仅末帧 stable=1
+    assert result["execution_success"] is False  # 未累计到 3 个连续新帧
+    assert result["stable_frames"] == 1
+    assert result["maximum_error"] == pytest.approx(0.4)  # |0.5 - 0.1|
+
+
+
 def test_cli_requires_plan_and_official_confirmation_flag(capsys):
     with pytest.raises(SystemExit):
         tool.build_parser().parse_args(["execute-one-stage", "--stage", "pregrasp"])
