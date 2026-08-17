@@ -153,15 +153,13 @@ arm_planning:
   joint_state_max_age_ns: null
   planned_context_max_age_ns: null
   confirmed_context_max_age_ns: null
-  # 4.4/4.5 几何位姿初值（2026-08-13 纯几何推导；retreat/lift/post_release 经 Codex 只读 KDL 实测修正）。
-  # 由 calibration/arm-v2 同步而来；retreat=0.06 因原 0.18 在 RETREAT 阶段几何不可达已降。
-  pregrasp_distance_m: 0.06
-  grasp_contact_offset_m: 0.01
-  lift_distance_m: 0.10            # Codex 实测候选（原初值 0.12）
-  retreat_distance_m: 0.06         # Codex 实测候选（原初值 0.18 在 RETREAT 不可达）
-  preplace_height_m: 0.08
-  release_offset_m: 0.0
-  post_release_retreat_distance_m: 0.10  # Codex 实测候选（原初值 0.15）
+  pregrasp_distance_m: null
+  grasp_contact_offset_m: null
+  lift_distance_m: null
+  retreat_distance_m: null
+  preplace_height_m: null
+  release_offset_m: null
+  post_release_retreat_distance_m: null
   settle_time_s: null
   max_slide_waypoint_delta_m: null
   max_arm_waypoint_delta_rad: null
