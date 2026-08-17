@@ -5826,6 +5826,15 @@ def test_arm_planning_config_yaml_is_calibrated() -> None:
             "left_gripper_closed",
             "right_gripper_open",
             "right_gripper_closed",
+            # 4.4/4.5 几何位姿初值（2026-08-13 已填，待官方容器仿真确认）；
+            # 其余 duration/age/max_waypoint_delta/settle_time 仍 null，validate_for_grasp/place 仍 fail-closed。
+            "pregrasp_distance_m",
+            "grasp_contact_offset_m",
+            "lift_distance_m",
+            "retreat_distance_m",
+            "preplace_height_m",
+            "release_offset_m",
+            "post_release_retreat_distance_m",
         }
     )
     with pytest.raises(ValueError):

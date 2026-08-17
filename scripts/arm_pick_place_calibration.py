@@ -4635,12 +4635,10 @@ def execute_one_stage(
         samples: list[dict[str, Any]] = []
         previous_feedback_timestamp_ns = start.timestamp_ns
         maximum_feedback_age_ns = int(params["feedback_max_age_s"] * 1_000_000_000)
+        # 注：planned_duration 为 None 时无法判定插值结束，退化为"全程插值 +
+        # 从首帧起即判定稳定"，行进途中机械臂不在容差内故 stable 自然保持 0。
         while True:
             elapsed = runtime.monotonic() - begin
-            if elapsed >= params["timeout_s"]:
-                base["timed_out"] = True
-                base["failure_classification"] = "TIMEOUT"
-                raise TimeoutError("单阶段执行超时")
             runtime.spin_control_period(1.0 / params["control_rate_hz"])
             base["control_tick_count"] += 1
             feedback = runtime.latest_joint_state()
@@ -4675,7 +4673,14 @@ def execute_one_stage(
             samples.append(sample)
             max_error = max(max_error, _joint_error(feedback.position, target))
             elapsed = runtime.monotonic() - begin
-            command = _interpolated_target(start.position, target, elapsed, params)
+            # 插值阶段结束后只发精确目标；插值中按最大速度线性插值（安全）。
+            interpolation_done = (
+                planned_duration is not None and elapsed >= planned_duration
+            )
+            command = (
+                target if interpolation_done
+                else _interpolated_target(start.position, target, elapsed, params)
+            )
             runtime.publish_joint_target(command)
             base["published_control"] = True
             active_evidence = _publisher_evidence(runtime, "control_tick", True)
@@ -4685,17 +4690,28 @@ def execute_one_stage(
                 raise RuntimeError("执行期间检测到真正外部机械臂控制Publisher")
             if any(count <= 0 for count in runtime.subscriber_counts().values()):
                 raise RuntimeError("执行期间官方机械臂controller订阅消失")
-            command_at_exact_target = command == target
-            if not reused_feedback:
-                stable = stable + 1 if _target_reached(
-                    feedback.position, target, params
-                ) and command_at_exact_target else 0
+            # Step A 修复（arm pick-place 标定 settle counter bug）：
+            # 稳定帧仅按"新时间戳 JointState 进容差"累计；复用帧跳过（不计数也不清零）；
+            # 去掉过严的 command==target 门限；插值未完成时不累计（避免行进途中
+            # 瞬时进容差被误判为到位）。
+            in_settle_phase = interpolation_done or planned_duration is None
+            if in_settle_phase and not reused_feedback:
+                if _target_reached(feedback.position, target, params):
+                    stable += 1
+                else:
+                    stable = 0
             if stable >= params["settle_cycles"]:
                 base["execution_success"] = True
                 base["valid"] = True
                 base["status"] = "SUCCESS"
                 base["settle_time_s"] = runtime.monotonic() - begin
                 break
+            # 超时边界：先处理最新反馈（已计入 stable）再判超时，避免最后一帧
+            # 到位却被超时检查吞掉。
+            if elapsed >= params["timeout_s"]:
+                base["timed_out"] = True
+                base["failure_classification"] = "TIMEOUT"
+                raise TimeoutError("单阶段执行超时")
     except KeyboardInterrupt:
         base["interrupted"] = True
         base["failure_classification"] = "INTERRUPTED"
@@ -5180,10 +5196,13 @@ def summarize(payload: Mapping[str, Any]) -> dict[str, Any]:
     failure = ""
     for sample in payload["feedback_samples"]:
         state = _joints(sample)
-        if state.timestamp_ns <= last_stamp:
-            failure = "JointState时间戳乱序或重复"
-            stable = 0
+        if state.timestamp_ns < last_stamp:
+            # 严格倒退才是真乱序；等于 last_stamp 属 DDS 复用帧（重复时间戳）
+            failure = "JointState时间戳乱序"
             break
+        if state.timestamp_ns == last_stamp:
+            # 复用帧：跳过（不计数也不清零），与实时执行循环 Step A 修复一致
+            continue
         last_stamp = state.timestamp_ns
         errors = [abs(state.position[i] - target[i]) for i in range(17) if mask[i]]
         max_error = max(max_error, max(errors, default=0.0))
